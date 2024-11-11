@@ -10,7 +10,8 @@ For more details, we refer readers to [README.pdf](README.pdf).
 
 ## Installation
 
-Ensuring `<ISABELLE-BASE-DIRECTORY>/bin` is in your `$PATH` environment, then run the following command
+Ensuring `<ISABELLE-BASE-DIRECTORY>/bin` is in your `$PATH` environment, then run the following commands
 ```
 isabelle components -u <THE-BASE-DIRECTORY-OF-OUR-PROGRAM>
+isabelle build Auto_Sledgehammer
 ```
