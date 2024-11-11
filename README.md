@@ -7,3 +7,10 @@ lemma foo: ‹(1::nat) + 2 = 3›
 ```
 
 For more details, we refer readers to [README.pdf](README.pdf).
+
+## Installation
+
+Ensuring `<ISABELLE-BASE-DIRECTORY>/bin` is in your `$PATH` environment, then run the following command
+```
+isabelle components -u <THE-BASE-DIRECTORY-OF-OUR-PROGRAM>
+```
