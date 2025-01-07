@@ -2,7 +2,7 @@
 
 signature PHI_CACHE_DB = sig
 
-type proof_id = Phi_ID.encoded_ID
+type proof_id = string
 type proof_cache = Time.time * string
 type cache = {proofs: proof_cache Symtab.table,
               async_tasks: Task_Queue.task list}

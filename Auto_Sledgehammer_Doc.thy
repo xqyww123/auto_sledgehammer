@@ -20,6 +20,9 @@ text \<open>Method \<open>auto_sledgehammer\<close> is a slightly smart wrapper 
 lemma foo: \<open>(1::nat) + 2 = 3\<close>
   by auto_sledgehammer
 
+lemma foo2: \<open>a * (x + y) = a * x + a * y\<close> for a :: nat
+  by auto_sledgehammer
+
 text \<open>
   This tactics first applies \<open>auto\<close> or \<open>clarsimp; ((rule conj)+)?\<close> to simplify and split the
   target proof goal into several subgoals. For each obtained subgoal, it applies Sledgehammer

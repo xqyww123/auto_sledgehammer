@@ -385,6 +385,35 @@ fun sledgehammer (ctxt,sequent) =
 
 fun auto'i id (ctxt,sequent) =
   let
+    val id = case id of SOME some => some
+                      | _ => Hasher.goal (ctxt,sequent)
+
+    val thy = Proof_Context.theory_of ctxt
+
+    fun try_cached_proof fallback =
+     (case Phi_Cache_DB.get_cached_proof thy id
+        of NONE => fallback true
+         | SOME (time,prf) =>
+            let val nprem = Thm.nprems_of sequent
+                val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
+             in (case eval_prf_str (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
+                   of (_, (_, sequent')) =>
+                      if Thm.nprems_of sequent' < nprem then sequent'
+                      else raise Auto_Fail Subgoal_unsolved )
+                handle Auto_Fail _ => fallback false
+            end )
+
+    fun update_cache hash (prf', (ctxt, sequent')) = (
+           tracing (
+              "Find proof (" ^ id ^ ", time: " ^ Value.print_time (fst prf') ^ "): " ^
+               (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
+           ) ;
+           Phi_Cache_DB.update_hash_cache hash prf';
+           Phi_Cache_DB.update_cached_proof thy (id, prf') ;
+           sequent')
+
+
+
     val classical_timeout = Config.get ctxt classical_prover_timeout
     fun find_proof () =
      (case Timeout.apply (Time.fromSeconds classical_timeout) (Timing.timing Seq.pull)
@@ -398,16 +427,27 @@ fun auto'i id (ctxt,sequent) =
         tracing "Proof search by default tactic times out. Invoking sledgehammer...";
         sledgehammer (ctxt, sequent) )
 
+    in try_cached_proof (fn no_cache' => (let
+          val hash = Hasher.goal (ctxt,sequent)
+          val (no_cache, prf_result') =
+                case Phi_Cache_DB.access_hash_cache hash
+                  of SOME (t, prf) =>
+                      let val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
+                       in ((false, SOME (
+                                  eval_prf_str (folerant_time t) prf (ctxt',sequent)))
+                           handle Auto_Fail _ => (false, NONE))
+                      end
+                   | NONE => (no_cache', NONE)
 
-     val (_, prf_result) = find_proof ()
-
-    in snd prf_result
-                    (*
-if no_cache
-          then (tracing ("Proof cache miss, " ^ id))
-          else (warning "The cached proof fails. Re-searching proofs...";
-                Phi_Cache_DB.invalidate_proof_cache (not no_cache) id thy) ;
-          find_proof ())) *)
+          val prf_result =
+                case prf_result' of SOME ret => ret
+                   | NONE => (if no_cache
+                              then (tracing ("Proof cache miss, " ^ id))
+                              else (warning "A cached proof fails. Re-searching proofs...";
+                                    Phi_Cache_DB.invalidate_proof_cache (not no_cache) id thy) ;
+                              find_proof ())
+           in update_cache hash prf_result
+          end ))
    end
 (* val proof = raw_sledgehammer stat *)
 
