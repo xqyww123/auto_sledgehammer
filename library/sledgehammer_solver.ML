@@ -341,6 +341,13 @@ fun funpow' (0: int) _ x = x
 
 fun sledgehammer override (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
+      fun note name ths ctxt = ctxt
+            |> Proof_Context.note_thms "" ((Binding.name name, []), [(Attrib.eval_thms ctxt ths, [])])
+            |> snd
+      val ctxt = ctxt
+              |> note "\<S>\<H>A" (#add override)
+              |> note "\<S>\<H>D" (#del override)
+
       val stat = Proof.theorem NONE (K I) [[(goal_term, [])]] ctxt
 
       fun eval_prf_strs_stat [] _ = raise Auto_Fail Application_Fails
@@ -375,9 +382,9 @@ fun sledgehammer override (ctxt,sequent) =
       fun rep_tries [] = raise Auto_Fail Application_Fails
         | rep_tries (f::L) = f () handle Auto_Fail _ => rep_tries L
       val prf = rep_tries [
-          (fn () => search_prf "auto simp add: \<phi>sledgehammer_simps"),
+          (fn () => search_prf "auto simp add: \<phi>sledgehammer_simps \<S>\<H>A del: \<S>\<H>B"),
           (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
-                     search_prf "clarsimp simp add: \<phi>sledgehammer_simps, ((rule conjI)+)?")),
+                     search_prf "clarsimp simp add: \<phi>sledgehammer_simps \<S>\<H>A del: \<S>\<H>B, ((rule conjI)+)?")),
           (fn () => (tracing "Fails... Try instead the weakest prompt..." ;
                      search_prf "-"))
         ]
