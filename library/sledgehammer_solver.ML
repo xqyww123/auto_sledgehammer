@@ -1,6 +1,9 @@
 signature PHI_SLEDGEHAMMER_SOLVER = sig
 
-val auto : Phi_Cache_DB.proof_id option -> Proof.context -> thm -> thm
+val orverride_parser : Sledgehammer.fact_override parser
+val auto : Sledgehammer.fact_override
+        -> Phi_Cache_DB.proof_id option
+        -> Proof.context -> thm -> thm
 
 val assync_proof : bool Config.T
 
@@ -252,14 +255,14 @@ fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, prove
        preplay_timeout=preplay_timeout, expect=expect}
 
 
-fun raw_sledgehammer stat =
+fun raw_sledgehammer override stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
       val ret : string list Synchronized.var = Synchronized.var "\<phi>System.raw_sledgehammer" []
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
    in \<^try>\<open>(Sledgehammer.run_sledgehammer
               (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
-              Sledgehammer_Prover.Normal (SOME (dirty_hack ret stat)) 1 Sledgehammer_Fact.no_fact_override
+              Sledgehammer_Prover.Normal (SOME (dirty_hack ret stat)) 1 override
               (silence_state stat);
        @{print} (Synchronized.value ret))
 
@@ -337,7 +340,7 @@ fun folerant_time t = Time.scale 1.3 t + time_delt
 fun funpow' (0: int) _ x = x
   | funpow' n f x = funpow' (n - 1) f (f n x)
 
-fun sledgehammer (ctxt,sequent) =
+fun sledgehammer override (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
       val stat = Proof.theorem NONE (K I) [[(goal_term, [])]] ctxt
 
@@ -362,7 +365,7 @@ fun sledgehammer (ctxt,sequent) =
             funpow' N (fn j => fn (ps,s) =>
                         let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
-                            val prfx = raw_sledgehammer s
+                            val prfx = raw_sledgehammer override s
                             val (p',s') = eval_prf_strs_stat prfx s
                          in (p'::ps, s') end)
                      ((if prf0 = "" then [] else [prf0]),stat0)
@@ -384,7 +387,7 @@ fun sledgehammer (ctxt,sequent) =
   end
 
 
-fun auto'i id (ctxt,sequent) =
+fun auto'i override id (ctxt,sequent) =
   let
     val id = case id of SOME some => some
                       | _ => Hasher.goal (ctxt,sequent)
@@ -423,10 +426,10 @@ fun auto'i id (ctxt,sequent) =
             ((time,""), (ctxt, sequent'))
          | _ => (
             tracing "Proof search by default tactic fails. Invoking sledgehammer...";
-            sledgehammer (ctxt, sequent) ))
+            sledgehammer override (ctxt, sequent) ))
       handle Timeout.TIMEOUT _ => (
         tracing "Proof search by default tactic times out. Invoking sledgehammer...";
-        sledgehammer (ctxt, sequent) )
+        sledgehammer override (ctxt, sequent) )
 
     in try_cached_proof (fn no_cache' => (let
           val hash = Hasher.goal (ctxt,sequent)
@@ -452,15 +455,22 @@ fun auto'i id (ctxt,sequent) =
    end
 (* val proof = raw_sledgehammer stat *)
 
-fun auto id ctxt sequent =
-  wrapper (auto'i id) (ctxt,sequent)
+fun auto override id ctxt sequent =
+  wrapper  (auto'i override id) (ctxt,sequent)
   handle Auto_Fail _ => error (error_message ctxt sequent)
 
 fun insert_tac _ [] _ = all_tac
   | insert_tac ctxt facts i =
       EVERY (map (fn r => resolve_tac ctxt [Thm.forall_intr_vars r COMP_INCR revcut_rl] i) facts);
 
-val _ = Theory.setup (Method.setup \<^binding>\<open>auto_sledgehammer\<close> (Scan.lift (Scan.succeed (fn _ =>
+val orverride_parser =
+        Scan.repeat (   (Args.add |-- Scan.repeat Parse.thm >> rpair [])
+                     || (Args.del |-- Scan.repeat Parse.thm >>  pair []) )
+     >> (fn LL => fold_rev (fn (A,D) => fn (A',D') => (A @ A', D @ D') ) LL ([],[])
+               |> (fn (A,D) => {add = A, del = D, only = false}))
+
+val _ = Theory.setup (Method.setup \<^binding>\<open>auto_sledgehammer\<close> (Scan.lift (
+  orverride_parser >> (fn override => fn _ =>
   Method.CONTEXT_METHOD (fn uses => fn (ctxt0,sequent) => Seq.make (fn () =>
     let val ctxt = Config.put assync_proof false ctxt0
         val id = Hasher.goal (ctxt,sequent)
@@ -470,7 +480,7 @@ val _ = Theory.setup (Method.setup \<^binding>\<open>auto_sledgehammer\<close> (
                 of SOME (ret, _) => ret
                  | NONE => error "Why the insert_tac can fail?"
      in SOME (
-         (Seq.Result (ctxt, auto (SOME id) ctxt sequent')
+         (Seq.Result (ctxt, auto override (SOME id) ctxt sequent')
           handle Auto_Fail _ => Seq.Error err),
          Seq.empty)
     end))
