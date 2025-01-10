@@ -257,7 +257,7 @@ fun raw_sledgehammer stat =
       val _ = if N = 0 then error "No subgoal!" else ()
       val ret : string list Synchronized.var = Synchronized.var "\<phi>System.raw_sledgehammer" []
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
-   in (Sledgehammer.run_sledgehammer
+   in \<^try>\<open>(Sledgehammer.run_sledgehammer
               (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
               Sledgehammer_Prover.Normal (SOME (dirty_hack ret stat)) 1 Sledgehammer_Fact.no_fact_override
               (silence_state stat);
@@ -281,13 +281,14 @@ fun raw_sledgehammer stat =
              in @{print} alt_output
             end
          | _ => raise Phi_Reasoners.Automation_Fail NONE)*)
-    handle SH_Short_Cut ret => [ret]
+    catch SH_Short_Cut ret => [ret]
          | err as Exn.Interrupt_Break => (warning "Interrupted\n\
               \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
               \proof reconstruction of Sledgehammer.\n\
               \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
               \and hopefully the problem can be addressed.";
               Exn.reraise err)
+         | err as Interrupt_Breakdown => Exn.reraise err\<close>
   end
 
 (*** Proof search using Sledgehammer ***)
