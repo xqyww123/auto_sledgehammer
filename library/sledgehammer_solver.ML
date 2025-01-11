@@ -17,6 +17,7 @@ exception Auto_Fail of fail_reason
 datatype type_of_rule = T_SIMP | T_INTRO | T_ELIM | T_DEST | T_CONG | T_SPLIT | T_IFF | T_UNKNOWN
 val infer_type_of_rule : string -> thm -> type_of_rule
 val with_rule : bool -> string -> thm -> Context.generic -> Context.generic
+val should_be_inserted : Proof.context -> term -> bool
 
 end
 
@@ -179,6 +180,17 @@ end
 
 fun with_rule add name rule ctxt =
   Thm.apply_attribute (modifier_of add (infer_type_of_rule name rule)) rule ctxt |> snd
+
+fun should_be_inserted ctxt  =
+  let val outter = try Local_Theory.target_of ctxt
+      fun is_new name = case outter of NONE => true
+                                     | SOME ctxt' => Variable.is_newly_fixed ctxt ctxt' name
+   in fn rule =>
+      Term.add_free_names rule []
+   |> filter is_new
+   |> null
+   |> not
+  end
 
 end
 
@@ -480,14 +492,34 @@ fun folerant_time t = Time.scale 1.3 t + time_delt
 fun funpow' (0: int) _ x = x
   | funpow' n f x = funpow' (n - 1) f (f n x)
 
+fun restore_interval (Facts.FromTo (i,j)) = string_of_int i ^ "-" ^ string_of_int j
+  | restore_interval (Facts.From i) = string_of_int i ^ "-"
+  | restore_interval (Facts.Single i) = string_of_int i
+fun restore_ref (Facts.Named ((name,_), NONE)) = name
+  | restore_ref (Facts.Named ((name,_), SOME ivs)) =
+      name ^ "(" ^ String.concatWith "," (map restore_interval ivs) ^ ")"
+  | restore_ref (Facts.Fact expr) = "\<open>" ^ expr ^ "\<close>"
+fun restore_ref' (rf, []) = restore_ref rf
+  | restore_ref' (rf, attrs) =
+      restore_ref rf ^ "[" ^
+          space_implode "," (map (fn attr => space_implode " " (map Token.unparse attr)) attrs)
+        ^ "]"
+
+
 fun sledgehammer override (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
-      fun note name ths ctxt = ctxt
-            |> Proof_Context.note_thms "" ((Binding.name name, []), [(Attrib.eval_thms ctxt ths, [])])
-            |> snd
-      val ctxt = ctxt
-              |> note "\<S>\<H>A" (#add override)
-              |> note "\<S>\<H>D" (#del override)
+
+      val sbi = should_be_inserted ctxt
+      val (ithms, sthms, OA) = fold_rev (fn th => fn (I,S,OA) =>
+            if exists (sbi o Thm.prop_of) (Attrib.eval_thms ctxt [th])
+            then (restore_ref' th :: I, S, OA)
+            else (I, restore_ref' th :: S, th :: OA)
+          ) (#add override) ([],[],[])
+      val ithm = if null ithms then "" else "insert " ^ space_implode " " ithms ^ ", "
+      val sthm = if null sthms then "" else " " ^ space_implode " " sthms
+      val dthm = if null (#del override) then ""
+                 else " simp del: " ^ space_implode " " (map restore_ref' (#del override))
+      val override = {add=OA, del = #del override, only = #only override}
 
       val stat = Proof.theorem NONE (K I) [[(goal_term, [])]] ctxt
 
@@ -523,9 +555,9 @@ fun sledgehammer override (ctxt,sequent) =
       fun rep_tries [] = raise Auto_Fail Application_Fails
         | rep_tries (f::L) = f () handle Auto_Fail _ => rep_tries L
       val prf = rep_tries [
-          (fn () => search_prf "auto simp add: \<phi>sledgehammer_simps \<S>\<H>A del: \<S>\<H>B"),
+          (fn () => search_prf (ithm ^ "auto simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm)),
           (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
-                     search_prf "clarsimp simp add: \<phi>sledgehammer_simps \<S>\<H>A del: \<S>\<H>B, ((rule conjI)+)?")),
+                     search_prf (ithm ^ "clarsimp simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm ^", ((rule conjI)+)?"))),
           (fn () => (tracing "Fails... Try instead the weakest prompt..." ;
                      search_prf "-"))
         ]
