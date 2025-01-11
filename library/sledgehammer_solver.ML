@@ -14,9 +14,17 @@ datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal
                      | Prompt_Timeout
 exception Auto_Fail of fail_reason
 
+datatype type_of_rule = T_SIMP | T_INTRO | T_ELIM | T_DEST | T_CONG | T_SPLIT | T_IFF | T_UNKNOWN
+val infer_type_of_rule : string -> thm -> type_of_rule
+val with_rule : bool -> string -> thm -> Context.generic -> Context.generic
+
 end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
+
+(*** Preliminaries ***)
+
+(** Options **)
 
 val classical_prover_timeout =
         Attrib.setup_config_int \<^binding>\<open>classical_prover_timeout\<close> (K 3)
@@ -33,6 +41,8 @@ fun get_sledgehammer_params ctxt =
                       of [k,v] => (Symbol.trim_blanks k, Symbol.trim_blanks v)
                        | _ => error ("Invalid auto_sledgehammer_params : " ^ s))
 
+(** Helpers **)
+
 fun error_message ctxt sequent =
   Pretty.string_of (Pretty.chunks (
     Pretty.para "Fail to prove the goal" ::
@@ -40,6 +50,137 @@ fun error_message ctxt sequent =
        of (x::_)
             => [Syntax.pretty_term ctxt x]
         | _ => [])))
+
+(** Infer Type of Rule **)
+
+datatype type_of_rule = T_SIMP | T_INTRO | T_ELIM | T_DEST | T_CONG | T_SPLIT | T_IFF | T_UNKNOWN
+
+local
+
+fun chk_cong th =
+    case Thm.concl_of th
+      of (\<^Const>\<open>Pure.eq _\<close> $ LHS $ RHS) =>
+        let exception NO in
+        let val (LH, LAS) = strip_comb LHS
+            val (RH, RAS) = strip_comb RHS
+            val _ = if LH = RH andalso
+                       length LAS = length RAS andalso
+                       forall is_Var LAS andalso
+                       forall is_Var RAS andalso
+                       not (has_duplicates (op =) (LAS @ RAS))
+                    then () else raise NO
+            val prems = Thm.prems_of th
+                     |> map (fn tm =>
+                        case Logic.strip_assums_concl tm
+                          of \<^Const>\<open>Pure.eq _\<close> $ L $ R => (L,R)
+                           | _ => raise NO)
+         in eq_set (op =) (prems, LAS ~~ RAS)
+        end handle NO => false
+        end
+       | _ => false
+
+fun chk_elim th =
+  case Thm.concl_of th
+    of \<^Const>\<open>Trueprop\<close> $ (Var C) =>
+      (case Thm.prems_of th
+         of (\<^Const>\<open>Trueprop\<close> $ X) :: prems =>
+             is_Const (Term.head_of X) andalso
+             prems
+          |> forall ( Logic.strip_assums_concl
+                  #> (fn \<^Const>\<open>Trueprop\<close> $ Var C' => C = C'
+                       | _ => false))
+          | _ => false )
+     | _ => false
+
+fun dest_eq (\<^Const>\<open>Trueprop\<close> $ X) = dest_eq X
+  | dest_eq (\<^Const>\<open>HOL.eq _\<close> $ A $ B)  = SOME (A,B)
+  | dest_eq (\<^Const>\<open>Pure.eq _\<close> $ A $ B) = SOME (A,B)
+  | dest_eq (\<^Const>\<open>HOL.implies\<close> $ _ $ X) = dest_eq X
+  | dest_eq (\<^Const>\<open>HOL.All _\<close> $ Abs (_, _, X)) = dest_eq X
+  | dest_eq _ = NONE
+
+val chk_simp = is_some o dest_eq
+fun chk_split tm =
+  let val SOME (LHS, RHS) = dest_eq tm
+      val (Var LH, _) = strip_comb LHS
+      val (Var RH, _) = strip_comb LHS
+   in LH = RH
+  end handle Bind => false
+
+fun lower_name name =
+  let fun chk []  = NONE
+        | chk [#"I"] = SOME T_INTRO
+        | chk [#"E"] = SOME T_ELIM
+        | chk [#"D"] = SOME T_DEST
+        | chk (c::cs) = if Char.isLower c then chk cs else NONE
+   in chk (String.explode name)
+  end
+
+in
+
+fun infer_type_of_rule name th =
+  if String.isSuffix "_intro" name orelse
+     String.isSuffix ".intro" name
+     then T_INTRO
+  else if String.isSuffix "_elim" name orelse
+          String.isSuffix ".elim" name
+       then T_ELIM
+  else if String.isSuffix "_simp"  name orelse
+          String.isSuffix ".simp"  name orelse
+          String.isSuffix "_simps" name orelse
+          String.isSuffix ".simps" name orelse
+          String.isSuffix "_iff"   name
+       then T_SIMP
+  else if String.isSuffix "_def" name then T_IFF
+  else if String.isSuffix ".splits" name then T_SPLIT
+  else if String.isSuffix "_dest" name orelse
+          String.isSuffix ".dest" name
+       then T_DEST
+  else if chk_cong th then T_CONG
+  else if chk_split (Thm.concl_of th) then T_SPLIT
+  else if chk_elim th then T_ELIM
+  else if chk_simp (Thm.concl_of th) then T_SIMP
+  else (case lower_name name
+    of SOME ret => ret
+     | NONE => T_UNKNOWN)
+
+local
+val split_add = Simplifier.attrib Splitter.add_split;
+val split_del = Simplifier.attrib Splitter.del_split;
+
+val T_INTRO_add = Classical.unsafe_intro NONE
+val T_ELIM_add  = Classical.unsafe_elim  NONE
+val T_DEST_add  = Classical.unsafe_dest  NONE
+(* fun comb att1 att2 (c,th) =
+  let val (c',th') = att1 (c,th)
+      val c' = the_default c c'
+      val th' = the_default th th'
+   in att2 (c',th')
+  end *)
+in
+fun modifier_of true  T_SIMP  = Simplifier.simp_add
+  | modifier_of false T_SIMP  = Simplifier.simp_del
+  | modifier_of true  T_INTRO = T_INTRO_add
+  | modifier_of false T_INTRO = Classical.rule_del
+  | modifier_of true  T_ELIM  = T_ELIM_add
+  | modifier_of false T_ELIM  = Classical.rule_del
+  | modifier_of true  T_DEST  = T_DEST_add
+  | modifier_of false T_DEST  = Classical.rule_del
+  | modifier_of true  T_CONG  = Simplifier.cong_add
+  | modifier_of false T_CONG  = Classical.rule_del
+  | modifier_of true  T_SPLIT = split_add
+  | modifier_of false T_SPLIT = split_del
+  | modifier_of true  T_IFF   = Clasimp.iff_add
+  | modifier_of false T_IFF   = Clasimp.iff_del
+  | modifier_of true  T_UNKNOWN = Simplifier.simp_add
+  | modifier_of false T_UNKNOWN = Simplifier.simp_del
+
+end
+
+fun with_rule add name rule ctxt =
+  Thm.apply_attribute (modifier_of add (infer_type_of_rule name rule)) rule ctxt |> snd
+
+end
 
 (*** Adapter of Sledgehammer ***)
 
