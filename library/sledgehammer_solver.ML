@@ -337,6 +337,7 @@ fun eval_prf_str_stat timeout F_None prf stat =
         handle Timeout.TIMEOUT _ => (
           tracing "The proof fails due to timeout. Re-searching proofs...";
           raise Auto_Fail Timeout)
+            | Auto_Fail reason => raise Auto_Fail reason
             | err => (
           tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
           raise Auto_Fail Unknown)
@@ -492,13 +493,23 @@ fun folerant_time t = Time.scale 1.3 t + time_delt
 fun funpow' (0: int) _ x = x
   | funpow' n f x = funpow' (n - 1) f (f n x)
 
+fun trim_makrup msg =
+  let fun auto _ [] = []
+        | auto acc (#"\005" :: L) = auto (not acc) L
+        | auto true (#"\127" :: L) = auto true L
+        | auto true (x :: L) = x :: auto true L
+        | auto false (_ :: L) = auto false L
+   in String.implode (auto true (String.explode msg))
+  end
+
+
 fun restore_interval (Facts.FromTo (i,j)) = string_of_int i ^ "-" ^ string_of_int j
   | restore_interval (Facts.From i) = string_of_int i ^ "-"
   | restore_interval (Facts.Single i) = string_of_int i
 fun restore_ref (Facts.Named ((name,_), NONE)) = name
   | restore_ref (Facts.Named ((name,_), SOME ivs)) =
       name ^ "(" ^ String.concatWith "," (map restore_interval ivs) ^ ")"
-  | restore_ref (Facts.Fact expr) = "\<open>" ^ expr ^ "\<close>"
+  | restore_ref (Facts.Fact expr) = "\<open>" ^ trim_makrup expr ^ "\<close>"
 fun restore_ref' (rf, []) = restore_ref rf
   | restore_ref' (rf, attrs) =
       restore_ref rf ^ "[" ^
@@ -530,7 +541,7 @@ fun sledgehammer override (ctxt,sequent) =
 
       fun search_prf prompt =
         let
-          val (prf0,stat0) = eval_prf_str_stat 8 (SOME (fn () => ("",stat))) prompt stat
+          val (prf0,stat0) = eval_prf_str_stat 8 NONE prompt stat
                              handle Auto_Fail Timeout => raise Auto_Fail Prompt_Timeout
           val N = Thm.nprems_of (@{print} (#goal (Proof.raw_goal stat0)))
           val Ns = string_of_int N
@@ -559,7 +570,7 @@ fun sledgehammer override (ctxt,sequent) =
           (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
                      search_prf (ithm ^ "clarsimp simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm ^", ((rule conjI)+)?"))),
           (fn () => (tracing "Fails... Try instead the weakest prompt..." ;
-                     search_prf "-"))
+                     search_prf (ithm ^ "-")))
         ]
 
    in eval_prf_str Time.zeroTime prf (ctxt,sequent)
