@@ -19,6 +19,8 @@ val infer_type_of_rule : string -> thm -> type_of_rule
 val with_rule : bool -> string -> thm -> Context.generic -> Context.generic
 val should_be_inserted : Proof.context -> term -> bool
 
+val need_standard_tac : Proof.context -> thm -> bool
+
 end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
@@ -193,6 +195,23 @@ fun should_be_inserted ctxt  =
   end
 
 end
+
+(** Does it need the standard tac? **)
+
+fun need_standard_tac ctxt st =
+  let val thy = Proof_Context.theory_of ctxt
+      val [\<^Const>\<open>Trueprop\<close> $ goal] = Thm.prems_of st
+      val Const(name, _) = head_of goal
+      fun pass [] = []
+        | pass ["class", x] = [x]
+        | pass (h::L) = h :: pass L
+      fun qchk [] = false
+        | qchk ["class", _] = true
+        | qchk (_::L) = qchk L
+      val idts = Long_Name.explode name
+      val name' = if qchk idts then Long_Name.implode (pass idts) else name
+   in Locale.defined thy name'
+  end handle Bind => false
 
 (*** Adapter of Sledgehammer ***)
 
@@ -532,6 +551,8 @@ fun sledgehammer override (ctxt,sequent) =
                  else " simp del: " ^ space_implode " " (map restore_ref' (#del override))
       val override = {add=OA, del = #del override, only = #only override}
 
+      val need_standard = need_standard_tac ctxt sequent
+
       val stat = Proof.theorem NONE (K I) [[(goal_term, [])]] ctxt
 
       fun eval_prf_strs_stat [] _ = raise Auto_Fail Application_Fails
@@ -566,9 +587,15 @@ fun sledgehammer override (ctxt,sequent) =
       fun rep_tries [] = raise Auto_Fail Application_Fails
         | rep_tries (f::L) = f () handle Auto_Fail _ => rep_tries L
       val prf = rep_tries [
+          (fn () => (if need_standard
+                     then search_prf ("standard, " ^ ithm ^ "auto simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm)
+                     else raise Auto_Fail Application_Fails)),
           (fn () => search_prf (ithm ^ "auto simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm)),
           (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
                      search_prf (ithm ^ "clarsimp simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm ^", ((rule conjI)+)?"))),
+          (fn () => (if need_standard
+                     then search_prf ("standard, " ^ ithm ^ "-")
+                     else raise Auto_Fail Application_Fails )),
           (fn () => (tracing "Fails... Try instead the weakest prompt..." ;
                      search_prf (ithm ^ "-")))
         ]
