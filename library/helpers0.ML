@@ -9,7 +9,6 @@ val leading_antecedent : term -> (string * typ) list (*quantified variables*)
                                * term (*conclusion containing loose bound*)
 
 val leading_antecedent' : thm -> term
-
 end
 
 

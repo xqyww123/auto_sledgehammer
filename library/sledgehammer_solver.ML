@@ -3,7 +3,7 @@ signature PHI_SLEDGEHAMMER_SOLVER = sig
 val orverride_parser : Sledgehammer.fact_override parser
 val auto : Sledgehammer.fact_override
         -> Phi_Cache_DB.proof_id option
-        -> Proof.context -> thm -> thm
+        -> Proof.context -> thm -> string (*proof*) * thm
 
 val assync_proof : bool Config.T
 
@@ -309,8 +309,8 @@ fun head_only tac th =
   then all_tac th
   else Goal.protect 1 th |> tac |> Seq.map Goal.conclude
 
-fun auto_obligation_solver (ctxt, th) = th
-       |> head_only (SOLVED' (fn _ => Clasimp.auto_tac ctxt) 1)
+fun auto_obligation_solver (ctxt, th) = Seq.make (fn () =>
+       Seq.pull (head_only (SOLVED' (fn _ => Clasimp.auto_tac ctxt) 1) th))
 
 fun auto_obligation_solver1 (ctxt, th) = th
        |> head_only (SOLVED' (fn _ => Clasimp.auto_tac ctxt) 1)
@@ -364,6 +364,8 @@ fun eval_prf_str_stat timeout F_None prf stat =
 
 exception SH_Short_Cut of string
 
+val keywords = Thy_Header.get_keywords \<^theory>
+
 fun dirty_hack ret stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
@@ -392,10 +394,10 @@ fun dirty_hack ret stat s =
                     then "(" ^ unparse [tok1] ^ ")" ^ unparse (tok2::R)
                     else unparse (tok1::tok2::R)
                 | unparse_tac toks = unparse toks
+
             in (if null using then "" else "(insert " ^ unparse using ^ ")[1], ") ^ unparse_tac tac
            end
         val ctxt = Proof.context_of stat
-        val keywords = Thy_Header.get_keywords (Proof_Context.theory_of ctxt)
         val prf = trans (Input.string s_prf
                       |> Input.source_explode
                       |> Token.tokenize keywords {strict = true}
@@ -501,9 +503,11 @@ fun assync_prove f (ctxt,sequent) =
   end
 
 fun wrapper f (ctxt,sequent) =
-  if Thm.no_prems sequent then sequent
+  if Thm.no_prems sequent
+  then ("", sequent)
   else case Thm.major_prem_of sequent
-    of Const (\<^const_name>\<open>Trueprop\<close>, _) $ \<^const>\<open>True\<close> => @{thm TrueI} RS sequent
+    of Const (\<^const_name>\<open>Trueprop\<close>, _) $ \<^const>\<open>True\<close> =>
+            ("", @{thm TrueI} RS sequent)
      | _ => f (ctxt,sequent)
 
 val time_delt = Time.fromMilliseconds 1000
@@ -619,7 +623,8 @@ fun auto'i override id (ctxt,sequent) =
                 val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
              in (case eval_prf_str (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
                    of (_, (_, sequent')) =>
-                      if Thm.nprems_of sequent' < nprem then sequent'
+                      if Thm.nprems_of sequent' < nprem
+                      then (prf, sequent')
                       else raise Auto_Fail Subgoal_unsolved )
                 handle Auto_Fail _ => fallback false
             end )
@@ -631,7 +636,7 @@ fun auto'i override id (ctxt,sequent) =
            ) ;
            Phi_Cache_DB.update_hash_cache hash prf';
            Phi_Cache_DB.update_cached_proof thy (id, prf') ;
-           sequent')
+           (snd prf', sequent'))
 
 
 
@@ -697,7 +702,7 @@ val _ = Theory.setup (Method.setup \<^binding>\<open>auto_sledgehammer\<close> (
                 of SOME (ret, _) => ret
                  | NONE => error "Why the insert_tac can fail?"
      in SOME (
-         (Seq.Result (ctxt, auto override (SOME id) ctxt sequent')
+         (Seq.Result (ctxt, snd (auto override (SOME id) ctxt sequent'))
           handle Auto_Fail _ => Seq.Error err),
          Seq.empty)
     end))

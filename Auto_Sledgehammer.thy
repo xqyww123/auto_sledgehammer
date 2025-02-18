@@ -11,7 +11,7 @@ ML_file \<open>library/Hasher.ML\<close>
 ML_file \<open>library/cache_file.ML\<close>
 ML_file \<open>library/sledgehammer_solver.ML\<close>
  
-ML \<open>
+ML \<open> (*TEST*)
 let open Phi_Sledgehammer_Solver
     fun assert A B = if A = B then () else error "ASSERTION"
  in assert T_ELIM  (infer_type_of_rule "conjE" @{thm conjE})
