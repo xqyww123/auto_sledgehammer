@@ -557,6 +557,8 @@ fun sledgehammer kws override (ctxt,sequent) =
       val sthm = if null sthms then "" else " " ^ space_implode " " sthms
       val dthm = if null (#del override) then ""
                  else " simp del: " ^ space_implode " " (map restore_ref' (#del override))
+      val athms = space_implode " " (map restore_ref' (#add override))
+
       val override = {add=OA, del = #del override, only = #only override}
 
       val need_standard = need_standard_tac ctxt sequent
@@ -609,9 +611,26 @@ fun sledgehammer kws override (ctxt,sequent) =
           val prf = "(" ^ String.concatWith ",\n" (rev prfs) ^ ")"
         in prf end
 
-      val prf = Par_List.get_some (fn F => SOME (F ()) handle Auto_Fail E => NONE) [
-          (fn () => hammer prelude_simp),
-          (fn () => hammer noprelude)
+      fun fastforce () =
+        let val src = "(insert " ^ athms ^ ", fastforce)"
+         in eval_prf_str_stat kws 5 NONE src stat
+         |> fst
+        end
+
+      fun simp () =
+        let val src = "(insert " ^ athms ^ ", simp)"
+            val n0 = Thm.nprems_of (#goal (Proof.goal stat))
+            val (ret, s') = eval_prf_str_stat kws 5 NONE src stat
+         in if Thm.nprems_of (#goal (Proof.goal s')) + 1 = n0
+          then ret
+          else raise Auto_Fail Application_Fails
+        end
+
+      val prf = Par_List.get_some (fn F => SOME (F ()) handle Auto_Fail _ => NONE) [
+            (fn () => hammer prelude_simp),
+            (fn () => hammer noprelude),
+            fastforce,
+            simp
 
 (*          (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
                      search_prf (ithm ^ "clarsimp simp: "^ sthm ^ dthm ^", ((rule conjI)+)?"))),
@@ -664,13 +683,13 @@ fun auto'i override id (ctxt,sequent) =
 
     val classical_timeout = Config.get ctxt classical_prover_timeout
     fun find_proof () =
-     (case Timeout.apply (Time.fromSeconds classical_timeout) (Timing.timing Seq.pull)
+     ((* case Timeout.apply (Time.fromSeconds classical_timeout) (Timing.timing Seq.pull)
                             (auto_obligation_solver (ctxt, sequent))
         of ({elapsed=time,...}, SOME (sequent', _)) =>
             ((time,""), (ctxt, sequent'))
          | _ => (
-            tracing "Proof search by default tactic fails. Invoking sledgehammer...";
-            sledgehammer kws override (ctxt, sequent) ))
+            tracing "Proof search by default tactic fails. Invoking sledgehammer..."; *)
+            sledgehammer kws override (ctxt, sequent) )
       handle Timeout.TIMEOUT _ => (
         tracing "Proof search by default tactic times out. Invoking sledgehammer...";
         sledgehammer kws override (ctxt, sequent) )
