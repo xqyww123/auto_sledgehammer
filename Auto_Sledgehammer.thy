@@ -2,8 +2,9 @@ theory Auto_Sledgehammer
   imports HOL.Sledgehammer
 begin
 
+(*
 named_theorems \<phi>sledgehammer_simps \<open>Simplification rules used before applying slegehammer automation\<close>
-
+*)
 declare [[ML_debugger]]
 
 ML_file \<open>library/helpers0.ML\<close>

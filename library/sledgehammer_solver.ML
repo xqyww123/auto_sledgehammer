@@ -11,7 +11,7 @@ val sledgehammer_params : string Config.T
 val classical_prover_timeout : int Config.T
 
 datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal_unsolved | Unknown
-                     | Prompt_Timeout
+                     | Prelude_Timeout
 exception Auto_Fail of fail_reason
 
 datatype type_of_rule = T_SIMP | T_INTRO | T_ELIM | T_DEST | T_CONG | T_SPLIT | T_IFF | T_UNKNOWN
@@ -32,7 +32,7 @@ structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
 val classical_prover_timeout =
         Attrib.setup_config_int \<^binding>\<open>classical_prover_timeout\<close> (K 3)
 
-val sledgehammer_params_fixed = [("isar_proofs", "false")]
+val sledgehammer_params_fixed = [("isar_proofs", "false"), ("try0", "false")]
 
 val sledgehammer_params = Attrib.setup_config_string \<^binding>\<open>auto_sledgehammer_params\<close> (K "")
 val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 20)
@@ -301,7 +301,7 @@ fun preplay_ord ((_, Sledgehammer_Proof_Methods.Played t1, _),
       = EQUAL
 
 datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal_unsolved | Unknown
-                     | Prompt_Timeout
+                     | Prelude_Timeout
 exception Auto_Fail of fail_reason
 
 fun head_only tac th =
@@ -318,18 +318,17 @@ fun auto_obligation_solver1 (ctxt, th) = th
        |> (fn NONE => raise Auto_Fail Application_Fails
             | SOME (th', _) => (ctxt, th'))
 
-fun eval_prf_str timeout "" (ctxt,sequent) =
+fun eval_prf_str _ timeout "" (ctxt,sequent) =
      (Timeout.apply timeout (Timing.timing (
             Position.setmp_thread_data Position.none auto_obligation_solver1)
          ) (ctxt,sequent) |> apfst (fn {elapsed=time,...} => (time,""))
               handle Timeout.TIMEOUT _               => raise Auto_Fail Timeout
                   |  err => (tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
                              raise Auto_Fail Unknown) )
-  | eval_prf_str timeout prf (ctxt,sequent) =
+  | eval_prf_str kws timeout prf (ctxt,sequent) =
       let val seq =
             Method.evaluate (
-              Parse.read_embedded ctxt (Thy_Header.get_keywords (Proof_Context.theory_of ctxt))
-                                       Method.parse (Input.string prf)
+              Parse.read_embedded ctxt kws Method.parse (Input.string prf)
                 |> fst
                 |> Method.check_text ctxt
               ) ctxt [] (ctxt, sequent)
@@ -343,12 +342,11 @@ fun eval_prf_str timeout "" (ctxt,sequent) =
                           raise Auto_Fail Unknown)
 
 
-fun eval_prf_str_stat timeout F_None prf stat =
+fun eval_prf_str_stat kws timeout F_None prf stat =
     let val ctxt = Proof.context_of stat
-        val keywords = Thy_Header.get_keywords (Proof_Context.theory_of ctxt)
     in (case Timeout.apply (Time.fromSeconds timeout)
                 (Position.setmp_thread_data Position.none Seq.pull)
-                (Proof.apply (Parse.read_embedded ctxt keywords Method.parse
+                (Proof.apply (Parse.read_embedded ctxt kws Method.parse
                                                   (Input.string ("(" ^ prf ^ ")"))) stat)
           of (SOME (Seq.Result stat', _)) => (prf, stat')
            | _ => case F_None of SOME f => f()
@@ -362,11 +360,10 @@ fun eval_prf_str_stat timeout F_None prf stat =
           raise Auto_Fail Unknown)
     end
 
-exception SH_Short_Cut of string
+val full_keywords = Thy_Header.get_keywords \<^theory>
+val keywords = Keyword.no_major_keywords full_keywords
 
-val keywords = Thy_Header.get_keywords \<^theory>
-
-fun dirty_hack ret stat s =
+fun dirty_hack ret shortcut stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -400,13 +397,15 @@ fun dirty_hack ret stat s =
         val ctxt = Proof.context_of stat
         val prf = trans (Input.string s_prf
                       |> Input.source_explode
-                      |> Token.tokenize keywords {strict = true}
+                      |> Token.tokenize full_keywords {strict = true}
                       |> filter Token.is_proper)
         val _ = Synchronized.change ret (fn prfs => prf :: prfs)
         val _ = tracing s
         val timeout = Config.get ctxt preplay_timeout
-        in if preplay_succeeded andalso can (eval_prf_str_stat timeout NONE prf) stat
-           then raise SH_Short_Cut prf
+        in if preplay_succeeded andalso can (eval_prf_str_stat keywords timeout NONE prf) stat
+           then (
+              Synchronized.change shortcut (K (SOME prf))
+            ; Exn.interrupt () )
            else ()
        end
   end
@@ -432,11 +431,12 @@ fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, prove
 fun raw_sledgehammer override stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
-      val ret : string list Synchronized.var = Synchronized.var "\<phi>System.raw_sledgehammer" []
+      val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" []
+      val shortcut : string option Synchronized.var = Synchronized.var "raw_sledgehammer.shortcut" NONE
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
    in (Sledgehammer.run_sledgehammer
               (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
-              Sledgehammer_Prover.Normal (SOME (dirty_hack ret stat)) 1 override
+              Sledgehammer_Prover.Normal (SOME (dirty_hack ret shortcut stat)) 1 override
               (silence_state stat);
        @{print} (Synchronized.value ret))
 
@@ -458,14 +458,18 @@ fun raw_sledgehammer override stat =
              in @{print} alt_output
             end
          | _ => raise Phi_Reasoners.Automation_Fail NONE)*)
-    handle SH_Short_Cut ret => [ret]
-         | err as Exn.Interrupt => (warning "Interrupted\n\
+    handle E =>
+        if Exn.is_interrupt E
+        then case Synchronized.value shortcut
+          of SOME ret => [ret]
+           | NONE => (*
+              warning "Interrupted\n\
               \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
               \proof reconstruction of Sledgehammer.\n\
               \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
-              \and hopefully the problem can be addressed.";
-              Exn.reraise err)
-         | E => raise E
+              \and hopefully the problem can be addressed."
+              ; *) Exn.reraise E
+        else Exn.reraise E
   end
 
 (*** Proof search using Sledgehammer ***)
@@ -529,9 +533,9 @@ fun trim_makrup msg =
 fun restore_interval (Facts.FromTo (i,j)) = string_of_int i ^ "-" ^ string_of_int j
   | restore_interval (Facts.From i) = string_of_int i ^ "-"
   | restore_interval (Facts.Single i) = string_of_int i
-fun restore_ref (Facts.Named ((name,_), NONE)) = name
+fun restore_ref (Facts.Named ((name,_), NONE)) = Phi_Help.quote_fact name
   | restore_ref (Facts.Named ((name,_), SOME ivs)) =
-      name ^ "(" ^ String.concatWith "," (map restore_interval ivs) ^ ")"
+      Phi_Help.quote_fact name ^ "(" ^ String.concatWith "," (map restore_interval ivs) ^ ")"
   | restore_ref (Facts.Fact expr) = "\<open>" ^ trim_makrup expr ^ "\<close>"
 fun restore_ref' (rf, []) = restore_ref rf
   | restore_ref' (rf, attrs) =
@@ -540,7 +544,7 @@ fun restore_ref' (rf, []) = restore_ref rf
         ^ "]"
 
 
-fun sledgehammer override (ctxt,sequent) =
+fun sledgehammer kws override (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
 
       val sbi = should_be_inserted ctxt
@@ -561,13 +565,30 @@ fun sledgehammer override (ctxt,sequent) =
 
       fun eval_prf_strs_stat [] _ = raise Auto_Fail Application_Fails
         | eval_prf_strs_stat (prf::L) stat =
-            eval_prf_str_stat 30 NONE prf stat
+            eval_prf_str_stat kws 30 NONE prf stat
             handle Auto_Fail _ => eval_prf_strs_stat L stat
 
-      fun search_prf prompt =
+      fun prelude_simp stat =
+        let val src = if need_standard
+                      then "standard, " ^ ithm ^ "auto simp: "^ sthm ^ dthm
+                      else ithm ^ "auto simp: "^ sthm ^ dthm
+         in eval_prf_str_stat kws 5 NONE src stat
+        end handle Auto_Fail Timeout =>
+        let val src = if need_standard
+                      then "standard, " ^ ithm ^ "clarsimp simp: "^ sthm ^ dthm
+                      else ithm ^ "clarsimp simp: "^ sthm ^ dthm
+         in eval_prf_str_stat kws 5 NONE src stat
+        end
+
+      fun noprelude stat =
+            if null ithms
+            then ("-", stat)
+            else eval_prf_str_stat kws 5 NONE (ithm ^ "-") stat
+
+      fun hammer prelude =
         let
-          val (prf0,stat0) = eval_prf_str_stat 8 NONE prompt stat
-                             handle Auto_Fail Timeout => raise Auto_Fail Prompt_Timeout
+          val (prf0,stat0) = prelude stat
+                             handle Auto_Fail Timeout => raise Auto_Fail Prelude_Timeout
           val N = Thm.nprems_of (@{print} (#goal (Proof.raw_goal stat0)))
           val Ns = string_of_int N
 
@@ -588,23 +609,22 @@ fun sledgehammer override (ctxt,sequent) =
           val prf = "(" ^ String.concatWith ",\n" (rev prfs) ^ ")"
         in prf end
 
-      fun rep_tries [] = raise Auto_Fail Application_Fails
-        | rep_tries (f::L) = f () handle Auto_Fail _ => rep_tries L
-      val prf = rep_tries [
-          (fn () => (if need_standard
-                     then search_prf ("standard, " ^ ithm ^ "auto simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm)
-                     else raise Auto_Fail Application_Fails)),
-          (fn () => search_prf (ithm ^ "auto simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm)),
-          (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
-                     search_prf (ithm ^ "clarsimp simp add: \<phi>sledgehammer_simps"^ sthm ^ dthm ^", ((rule conjI)+)?"))),
+      val prf = Par_List.get_some (fn F => SOME (F ()) handle Auto_Fail E => NONE) [
+          (fn () => hammer prelude_simp),
+          (fn () => hammer noprelude)
+
+(*          (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
+                     search_prf (ithm ^ "clarsimp simp: "^ sthm ^ dthm ^", ((rule conjI)+)?"))),
           (fn () => (if need_standard
                      then search_prf ("standard, " ^ ithm ^ "-")
                      else raise Auto_Fail Application_Fails )),
           (fn () => (tracing "Fails... Try instead the weakest prompt..." ;
-                     search_prf (ithm ^ "-")))
+                     search_prf (ithm ^ "-"))) *)
         ]
 
-   in eval_prf_str Time.zeroTime prf (ctxt,sequent)
+   in case prf
+   of SOME prf => eval_prf_str kws Time.zeroTime prf (ctxt,sequent)
+    | NONE => raise Auto_Fail Application_Fails
   end
 
 
@@ -614,6 +634,8 @@ fun auto'i override id (ctxt,sequent) =
                       | _ => Hasher.goal (ctxt,sequent)
 
     val thy = Proof_Context.theory_of ctxt
+    val kws = Keyword.no_major_keywords (
+                      Thy_Header.get_keywords (Proof_Context.theory_of ctxt))
 
     fun try_cached_proof fallback =
      (case Phi_Cache_DB.get_cached_proof thy id
@@ -621,7 +643,7 @@ fun auto'i override id (ctxt,sequent) =
          | SOME (time,prf) =>
             let val nprem = Thm.nprems_of sequent
                 val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
-             in (case eval_prf_str (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
+             in (case eval_prf_str kws (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
                    of (_, (_, sequent')) =>
                       if Thm.nprems_of sequent' < nprem
                       then (prf, sequent')
@@ -648,10 +670,10 @@ fun auto'i override id (ctxt,sequent) =
             ((time,""), (ctxt, sequent'))
          | _ => (
             tracing "Proof search by default tactic fails. Invoking sledgehammer...";
-            sledgehammer override (ctxt, sequent) ))
+            sledgehammer kws override (ctxt, sequent) ))
       handle Timeout.TIMEOUT _ => (
         tracing "Proof search by default tactic times out. Invoking sledgehammer...";
-        sledgehammer override (ctxt, sequent) )
+        sledgehammer kws override (ctxt, sequent) )
 
     in try_cached_proof (fn no_cache' => (let
           val hash = Hasher.goal (ctxt,sequent)
@@ -660,7 +682,7 @@ fun auto'i override id (ctxt,sequent) =
                   of SOME (t, prf) =>
                       let val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
                        in ((false, SOME (
-                                  eval_prf_str (folerant_time t) prf (ctxt',sequent)))
+                                  eval_prf_str kws (folerant_time t) prf (ctxt',sequent)))
                            handle Auto_Fail _ => (false, NONE))
                       end
                    | NONE => (no_cache', NONE)
