@@ -111,12 +111,12 @@ fun chk_split tm =
   end handle Bind => false
 
 fun lower_name name =
-  let fun chk []  = NONE
-        | chk [#"I"] = SOME T_INTRO
-        | chk [#"E"] = SOME T_ELIM
-        | chk [#"D"] = SOME T_DEST
-        | chk (c::cs) = if Char.isLower c then chk cs else NONE
-   in chk (String.explode name)
+  let fun chk _ []  = NONE
+        | chk N [#"I"] = if N >= 2 then SOME T_INTRO else NONE
+        | chk N [#"E"] = if N >= 2 then SOME T_ELIM  else NONE
+        | chk N [#"D"] = if N >= 2 then SOME T_DEST  else NONE
+        | chk N (c::cs) = if Char.isUpper c then chk 0 cs else chk (N+1) cs
+   in chk 0 (String.explode name)
   end
 
 in
