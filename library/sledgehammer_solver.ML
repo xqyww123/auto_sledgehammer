@@ -400,20 +400,22 @@ fun dirty_hack futures main_thread pptimeout shortcut stat s =
                       |> filter Token.is_proper)
         val _ = tracing s
         fun eval_future () =
-          Synchronized.change futures (fn fs =>
-            Future.fork (fn () =>
-              case try (eval_prf_str_stat keywords pptimeout NONE prf) stat
-                of SOME ret => (
-                      Synchronized.change shortcut (fn NONE => SOME ret | some => some)
-                    ; Thread.interrupt main_thread )
-                 | NONE => ()) :: fs)
-        in if preplay_succeeded
+          Synchronized.change futures (
+            fn NONE => NONE
+             | SOME fs => SOME (
+              Future.fork (fn () =>
+                case try (eval_prf_str_stat keywords pptimeout NONE prf) stat
+                  of SOME ret => (
+                        Synchronized.change shortcut (fn NONE => SOME ret | some => some)
+                      ; Thread.interrupt main_thread )
+                   | NONE => ()) :: fs))
+        in (* if preplay_succeeded
          then case try (eval_prf_str_stat keywords 3 NONE prf) stat
              of SOME ret => (
                   Synchronized.change shortcut (fn NONE => SOME ret | some => some)
                 ; Thread.interrupt main_thread )
               | NONE => eval_future ()
-         else eval_future ()
+         else *) eval_future ()
        end
   end
 
@@ -439,7 +441,7 @@ fun raw_sledgehammer override stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
       (* val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" [] *)
-      val futures = Synchronized.var "\<phi>sledgehammer.futures" []
+      val futures = Synchronized.var "\<phi>sledgehammer.futures" (SOME [])
       val shortcut = Synchronized.var "\<phi>sledgehammer.shortcut" NONE
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
@@ -448,8 +450,12 @@ fun raw_sledgehammer override stat =
             (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
                 Sledgehammer_Prover.Normal
                 (SOME (dirty_hack futures (Thread.self ()) pptimeout shortcut stat)) 1 override
-                (silence_state stat);
-       Future.joins (Synchronized.value futures);
+                (silence_state stat)
+     ; let val workers = Synchronized.change_result futures (
+                  fn SOME workers => (workers, NONE)
+                   | NONE => ([], NONE))
+        in if null workers then () else (Future.joins workers; ())
+       end ;
        NONE)
 
 (* For some unknown reason, the return of Sledgehammer.run_sledgehammer doesn't give me everything
@@ -472,7 +478,11 @@ fun raw_sledgehammer override stat =
          | _ => raise Phi_Reasoners.Automation_Fail NONE)*)
     handle E =>
         if Exn.is_interrupt E
-        then case Synchronized.value shortcut
+        then let val workers = Synchronized.change_result futures (
+                       fn SOME workers => (workers, NONE)
+                        | NONE => ([], NONE))
+          in List.app Future.cancel workers
+           ; case Synchronized.value shortcut
           of SOME ret => SOME ret
            | NONE => (*
               warning "Interrupted\n\
@@ -481,6 +491,7 @@ fun raw_sledgehammer override stat =
               \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
               \and hopefully the problem can be addressed."
               ; *) Exn.reraise E
+         end
         else Exn.reraise E
   end
 
