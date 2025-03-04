@@ -402,7 +402,7 @@ fun dirty_hack ret shortcut stat s =
         val _ = Synchronized.change ret (fn prfs => prf :: prfs)
         val _ = tracing s
         val timeout = Config.get ctxt preplay_timeout
-        in if preplay_succeeded andalso can (eval_prf_str_stat keywords timeout NONE prf) stat
+        in if can (eval_prf_str_stat keywords timeout NONE prf) stat
            then (
               Synchronized.change shortcut (K (SOME prf))
             ; Exn.interrupt () )
@@ -544,7 +544,7 @@ fun restore_ref' (rf, []) = restore_ref rf
         ^ "]"
 
 
-fun sledgehammer kws override (ctxt,sequent) =
+fun sledgehammer kws override0 (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
 
       val sbi = should_be_inserted ctxt
@@ -552,45 +552,31 @@ fun sledgehammer kws override (ctxt,sequent) =
             if exists (sbi o Thm.prop_of) (Attrib.eval_thms ctxt [th])
             then (restore_ref' th :: I, S, OA)
             else (I, restore_ref' th :: S, th :: OA)
-          ) (#add override) ([],[],[])
+          ) (#add override0) ([],[],[])
       val ithm = if null ithms then "" else "insert " ^ space_implode " " ithms ^ ", "
       val sthm = if null sthms then "" else " " ^ space_implode " " sthms
-      val dthm = if null (#del override) then ""
-                 else " simp del: " ^ space_implode " " (map restore_ref' (#del override))
-      val athms = space_implode " " (map restore_ref' (#add override))
+      val dthm = if null (#del override0) then ""
+                 else " simp del: " ^ space_implode " " (map restore_ref' (#del override0))
+      val athms = space_implode " " (map restore_ref' (#add override0))
 
-      val override = {add=OA, del = #del override, only = #only override}
+      val override = {add=OA, del = #del override0, only = #only override0}
 
       val need_standard = need_standard_tac ctxt sequent
 
       val stat = Proof.theorem NONE (K I) [[(goal_term, [])]] ctxt
 
       fun eval_prf_strs_stat [] _ = raise Auto_Fail Application_Fails
-        | eval_prf_strs_stat (prf::L) stat =
-            eval_prf_str_stat kws 30 NONE prf stat
-            handle Auto_Fail _ => eval_prf_strs_stat L stat
+        | eval_prf_strs_stat [prf] stat = eval_prf_str_stat kws 30 NONE prf stat
+        | eval_prf_strs_stat prfs stat =
+            case Par_List.get_some (fn prf =>
+                    SOME (eval_prf_str_stat kws 30 NONE prf stat)
+                    handle Auto_Fail _ => NONE
+                 ) prfs
+              of SOME ret => ret
+               | NONE => raise Auto_Fail Application_Fails
 
-      fun prelude_simp stat =
-        let val src = if need_standard
-                      then "standard, " ^ ithm ^ "auto simp: "^ sthm ^ dthm
-                      else ithm ^ "auto simp: "^ sthm ^ dthm
-         in eval_prf_str_stat kws 5 NONE src stat
-        end handle Auto_Fail Timeout =>
-        let val src = if need_standard
-                      then "standard, " ^ ithm ^ "clarsimp simp: "^ sthm ^ dthm
-                      else ithm ^ "clarsimp simp: "^ sthm ^ dthm
-         in eval_prf_str_stat kws 5 NONE src stat
-        end
-
-      fun noprelude stat =
-            if null ithms
-            then ("-", stat)
-            else eval_prf_str_stat kws 5 NONE (ithm ^ "-") stat
-
-      fun hammer prelude =
+      fun hammer override (prf0,stat0) =
         let
-          val (prf0,stat0) = prelude stat
-                             handle Auto_Fail Timeout => raise Auto_Fail Prelude_Timeout
           val N = Thm.nprems_of (@{print} (#goal (Proof.raw_goal stat0)))
           val Ns = string_of_int N
 
@@ -611,6 +597,38 @@ fun sledgehammer kws override (ctxt,sequent) =
           val prf = "(" ^ String.concatWith ",\n" (rev prfs) ^ ")"
         in prf end
 
+      fun hammer' () =
+        let val src1 = if need_standard
+                       then "standard, " ^ ithm ^ "auto simp: "^ sthm ^ dthm
+                       else ithm ^ "auto simp: "^ sthm ^ dthm
+            val src2 = if need_standard
+                       then "standard, " ^ ithm ^ "clarsimp simp: "^ sthm ^ dthm
+                       else ithm ^ "clarsimp simp: "^ sthm ^ dthm
+            val auto = SOME (eval_prf_str_stat kws 5 NONE src1 stat)
+                       handle Auto_Fail E => NONE
+            val clar = SOME (eval_prf_str_stat kws 4 NONE src2 stat)
+                       handle Auto_Fail E => NONE
+            val thy = Proof.theory_of stat
+            val plan = case (auto, clar)
+                         of (SOME (prf1, s1), SOME (prf2, s2)) =>
+                            if Thm.equiv_thm thy (#goal (Proof.raw_goal s1),
+                                                  #goal (Proof.raw_goal s2))
+                            then [(prf2, s2)]
+                            else [(prf1, s1), (prf2, s2)]
+                          | (SOME ret, _) => [ret]
+                          | (_, SOME ret) => [ret]
+                          | _ => []
+         in if null plan
+          then raise Auto_Fail Application_Fails
+          else case Par_List.get_some (SOME o hammer override) plan
+            of SOME ret => ret
+             | _ => raise Auto_Fail Application_Fails
+        end
+
+      fun bare_hammer () =
+          hammer override0 ("-", stat)
+
+
       fun fastforce () =
         let val src = "(insert " ^ athms ^ ", fastforce)"
          in eval_prf_str_stat kws 5 NONE src stat
@@ -627,8 +645,8 @@ fun sledgehammer kws override (ctxt,sequent) =
         end
 
       val prf = Par_List.get_some (fn F => SOME (F ()) handle Auto_Fail _ => NONE) [
-            (fn () => hammer prelude_simp),
-            (fn () => hammer noprelude),
+            hammer',
+            bare_hammer,
             fastforce,
             simp
 
