@@ -35,7 +35,7 @@ val classical_prover_timeout =
 val sledgehammer_params_fixed = [("isar_proofs", "false"), ("try0", "false")]
 
 val sledgehammer_params = Attrib.setup_config_string \<^binding>\<open>auto_sledgehammer_params\<close> (K "")
-val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 20)
+val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 30)
 
 fun get_sledgehammer_params ctxt =
   Config.get ctxt sledgehammer_params
@@ -402,11 +402,11 @@ fun dirty_hack ret shortcut stat s =
         val _ = Synchronized.change ret (fn prfs => prf :: prfs)
         val _ = tracing s
         val timeout = Config.get ctxt preplay_timeout
-        in if can (eval_prf_str_stat keywords timeout NONE prf) stat
-           then (
-              Synchronized.change shortcut (K (SOME prf))
-            ; Exn.interrupt () )
-           else ()
+        in case try (eval_prf_str_stat keywords timeout NONE prf) stat
+             of SOME ret => (
+                  Synchronized.change shortcut (K (SOME ret))
+                ; Exn.interrupt () )
+              | NONE => ()
        end
   end
 
@@ -432,13 +432,13 @@ fun raw_sledgehammer override stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
       val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" []
-      val shortcut : string option Synchronized.var = Synchronized.var "raw_sledgehammer.shortcut" NONE
+      val shortcut = Synchronized.var "raw_sledgehammer.shortcut" NONE
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
    in (Sledgehammer.run_sledgehammer
               (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
               Sledgehammer_Prover.Normal (SOME (dirty_hack ret shortcut stat)) 1 override
               (silence_state stat);
-       @{print} (Synchronized.value ret))
+       NONE)
 
 (* For some unknown reason, the return of Sledgehammer.run_sledgehammer doesn't give me everything
    it finds (not match to its output to users), so I have to dirty hijack its output stream and
@@ -461,7 +461,7 @@ fun raw_sledgehammer override stat =
     handle E =>
         if Exn.is_interrupt E
         then case Synchronized.value shortcut
-          of SOME ret => [ret]
+          of SOME ret => SOME ret
            | NONE => (*
               warning "Interrupted\n\
               \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
@@ -589,8 +589,9 @@ fun sledgehammer kws override0 (ctxt,sequent) =
             funpow' N (fn j => fn (ps,s) =>
                         let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
-                            val prfx = raw_sledgehammer override s
-                            val (p',s') = eval_prf_strs_stat prfx s
+                            val (p',s') = case raw_sledgehammer override s
+                                            of NONE => raise Auto_Fail Application_Fails
+                                             | SOME prf => prf
                          in (p'::ps, s') end)
                      ((if prf0 = "" then [] else [prf0]),stat0)
     
@@ -618,9 +619,12 @@ fun sledgehammer kws override0 (ctxt,sequent) =
                           | (SOME ret, _) => [ret]
                           | (_, SOME ret) => [ret]
                           | _ => []
+            fun get_some _ [] = NONE
+              | get_some F [x] = F x
+              | get_some F L = Par_List.get_some F L
          in if null plan
           then raise Auto_Fail Application_Fails
-          else case Par_List.get_some (SOME o hammer override) plan
+          else case get_some (SOME o hammer override) plan
             of SOME ret => ret
              | _ => raise Auto_Fail Application_Fails
         end
