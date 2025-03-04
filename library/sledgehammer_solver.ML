@@ -35,7 +35,7 @@ val classical_prover_timeout =
 val sledgehammer_params_fixed = [("isar_proofs", "false"), ("try0", "false")]
 
 val sledgehammer_params = Attrib.setup_config_string \<^binding>\<open>auto_sledgehammer_params\<close> (K "")
-val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 20)
+val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 10)
 
 fun get_sledgehammer_params ctxt =
   Config.get ctxt sledgehammer_params
@@ -103,20 +103,21 @@ fun dest_eq (\<^Const>\<open>Trueprop\<close> $ X) = dest_eq X
   | dest_eq _ = NONE
 
 val chk_simp = is_some o dest_eq
-fun chk_split tm =
-  let val SOME (LHS, RHS) = dest_eq tm
-      val (Var LH, _) = strip_comb LHS
-      val (Var RH, _) = strip_comb LHS
-   in LH = RH
-  end handle Bind => false
+fun chk_split thm =
+  (case Thm.concl_of (Simpdata.mk_eq thm) of
+    \<^Const_>\<open>Pure.eq _ for \<open>Var _ $ t\<close> c\<close> =>
+      (case strip_comb t of
+        (Const p, _) => true
+      | _ => false)
+  | _ => false);
 
 fun lower_name name =
-  let fun chk []  = NONE
-        | chk [#"I"] = SOME T_INTRO
-        | chk [#"E"] = SOME T_ELIM
-        | chk [#"D"] = SOME T_DEST
-        | chk (c::cs) = if Char.isLower c then chk cs else NONE
-   in chk (String.explode name)
+  let fun chk _ []  = NONE
+        | chk N [#"I"] = if N >= 2 then SOME T_INTRO else NONE
+        | chk N [#"E"] = if N >= 2 then SOME T_ELIM  else NONE
+        | chk N [#"D"] = if N >= 2 then SOME T_DEST  else NONE
+        | chk N (c::cs) = if Char.isUpper c then chk 0 cs else chk (N+1) cs
+   in chk 0 (String.explode name)
   end
 
 in
@@ -140,7 +141,7 @@ fun infer_type_of_rule name th =
           String.isSuffix ".dest" name
        then T_DEST
   else if chk_cong th then T_CONG
-  else if chk_split (Thm.concl_of th) then T_SPLIT
+  else if chk_split th then T_SPLIT
   else if chk_elim th then T_ELIM
   else if chk_simp (Thm.concl_of th) then T_SIMP
   else (case lower_name name
@@ -363,7 +364,7 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
-fun dirty_hack ret shortcut stat s =
+fun dirty_hack futures group main_thread pptimeout shortcut stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -394,19 +395,32 @@ fun dirty_hack ret shortcut stat s =
 
             in (if null using then "" else "(insert " ^ unparse using ^ ")[1], ") ^ unparse_tac tac
            end
-        val ctxt = Proof.context_of stat
         val prf = trans (Input.string s_prf
                       |> Input.source_explode
                       |> Token.tokenize full_keywords {strict = true}
                       |> filter Token.is_proper)
-        val _ = Synchronized.change ret (fn prfs => prf :: prfs)
         val _ = tracing s
-        val timeout = Config.get ctxt preplay_timeout
-        in if preplay_succeeded andalso can (eval_prf_str_stat keywords timeout NONE prf) stat
-           then (
-              Synchronized.change shortcut (K (SOME prf))
-            ; Exn.interrupt () )
-           else ()
+        fun eval_future () =
+          Synchronized.change futures (
+            fn NONE => NONE
+             | SOME fs => SOME (
+              Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=20, interrupts=true}
+              [fn () =>
+                case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
+                  of SOME ret =>
+                    Synchronized.change shortcut
+                        (fn NONE => ( Thread.interrupt main_thread
+                                    ; SOME ret)
+                          | some => some)
+                   | NONE => ()] @ fs))
+        in if preplay_succeeded
+         then case try (eval_prf_str_stat keywords 3 NONE prf) stat
+             of SOME ret => (
+                    Synchronized.change shortcut (fn NONE => SOME ret
+                                                   | some => some)
+                  ; Future.cancel_group group)
+              | NONE => ()
+         else eval_future ()
        end
   end
 
@@ -431,14 +445,34 @@ fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, prove
 fun raw_sledgehammer override stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
-      val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" []
-      val shortcut : string option Synchronized.var = Synchronized.var "raw_sledgehammer.shortcut" NONE
+      (* val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" [] *)
+      val futures = Synchronized.var "\<phi>sledgehammer.futures" (SOME [])
+      val shortcut = Synchronized.var "\<phi>sledgehammer.shortcut" NONE
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
-   in (Sledgehammer.run_sledgehammer
-              (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
-              Sledgehammer_Prover.Normal (SOME (dirty_hack ret shortcut stat)) 1 override
-              (silence_state stat);
-       @{print} (Synchronized.value ret))
+      val ctxt = Proof.context_of stat
+      val pptimeout = Config.get ctxt preplay_timeout
+      val group = Future.new_group (Future.worker_group ())
+   in Future.forks {name="\<phi>SH", group = SOME group, deps = [], pri=10, interrupts=true} [(fn () =>
+        ( Sledgehammer.run_sledgehammer
+            (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
+                Sledgehammer_Prover.Normal
+                (SOME (dirty_hack futures group (Thread.self ()) pptimeout shortcut stat)) 1 override
+                (silence_state stat)
+        ; ()))]
+    |> Future.join_results
+     ; Synchronized.change futures (K NONE)
+     ; Future.cancel_group group
+  (* ; Future.join_results workers *)
+     ; ( case Synchronized.value shortcut
+           of SOME ret => SOME ret
+            | NONE => NONE )
+ (* ( (*
+              warning "Interrupted\n\
+              \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
+              \proof reconstruction of Sledgehammer.\n\
+              \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
+              \and hopefully the problem can be addressed."
+              ; *)  Exn.reraise E) *)
 
 (* For some unknown reason, the return of Sledgehammer.run_sledgehammer doesn't give me everything
    it finds (not match to its output to users), so I have to dirty hijack its output stream and
@@ -458,18 +492,6 @@ fun raw_sledgehammer override stat =
              in @{print} alt_output
             end
          | _ => raise Phi_Reasoners.Automation_Fail NONE)*)
-    handle E =>
-        if Exn.is_interrupt E
-        then case Synchronized.value shortcut
-          of SOME ret => [ret]
-           | NONE => (*
-              warning "Interrupted\n\
-              \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
-              \proof reconstruction of Sledgehammer.\n\
-              \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
-              \and hopefully the problem can be addressed."
-              ; *) Exn.reraise E
-        else Exn.reraise E
   end
 
 (*** Proof search using Sledgehammer ***)
@@ -543,54 +565,69 @@ fun restore_ref' (rf, []) = restore_ref rf
           space_implode "," (map (fn attr => space_implode " " (map Token.unparse attr)) attrs)
         ^ "]"
 
+val iv_ord = int_ord o apply2 (fn Facts.FromTo (i,_) => i
+                                | Facts.From i => i
+                                | Facts.Single i => i)
+local open Facts
+fun merge_iv (SOME a) (SOME b) = SOME (a @ b)
+  | merge_iv NONE (SOME x) = SOME x
+  | merge_iv (SOME x) NONE = SOME x
+  | merge_iv NONE NONE = NONE
+fun merge_facts' ((x1 as (Named ((s1,p1),iv1), att1)) :: (L2 as (Named ((s2,p2),iv2), att2) :: L))
+      = if s1 = s2 andalso pointer_eq (att1, att2)
+        then merge_facts' ((Named ((s1,p1), merge_iv iv1 iv2), att1) :: L)
+        else x1 :: merge_facts' L2
+  | merge_facts' L = L
+in
+fun fact_ord (Named ((s1,_),iv1), Named ((s2,_),iv2)) =
+      prod_ord string_ord (option_ord (list_ord iv_ord)) ((s1,iv1), (s2,iv2))
+  | fact_ord (Named _, Fact _) = GREATER
+  | fact_ord (Fact _, Named _) = LESS
+  | fact_ord (Fact s1, Fact s2) = string_ord (s1, s2)
 
-fun sledgehammer kws override (ctxt,sequent) =
+val merge_facts = merge_facts' o sort (fact_ord o apply2 fst)
+end
+
+
+fun sledgehammer kws override0 (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
 
+      val pass_thms  = filter (can (Attrib.eval_thms ctxt) o single)
+      val pass_thms' = map_filter (fn th => try (rpair th o Attrib.eval_thms ctxt) [th])
+      val origin_add = pass_thms' (#add override0)
+      val origin_del = pass_thms' (#del override0)
+
       val sbi = should_be_inserted ctxt
-      val (ithms, sthms, OA) = fold_rev (fn th => fn (I,S,OA) =>
-            if exists (sbi o Thm.prop_of) (Attrib.eval_thms ctxt [th])
+      val (ithms, sthms, OA) = fold_rev (fn (th', th) => fn (I,S,OA) =>
+            if exists (sbi o Thm.prop_of) th'
             then (restore_ref' th :: I, S, OA)
-            else (I, restore_ref' th :: S, th :: OA)
-          ) (#add override) ([],[],[])
+            else (I, restore_ref' th :: S, (th', th) :: OA)
+          ) origin_add ([],[],[])
       val ithm = if null ithms then "" else "insert " ^ space_implode " " ithms ^ ", "
       val sthm = if null sthms then "" else " " ^ space_implode " " sthms
-      val dthm = if null (#del override) then ""
-                 else " simp del: " ^ space_implode " " (map restore_ref' (#del override))
-      val athms = space_implode " " (map restore_ref' (#add override))
+      val dthm = if null origin_del then ""
+                 else " simp del: " ^ space_implode " " (map (restore_ref' o snd) origin_del)
+      val athms = space_implode " " (map (restore_ref' o snd) origin_add)
 
-      val override = {add=OA, del = #del override, only = #only override}
+      val override = {add=map snd OA, del = map snd origin_del, only = #only override0}
+      val raw_override = {add = map snd origin_add, del = map snd origin_del, only = #only override0}
 
       val need_standard = need_standard_tac ctxt sequent
 
       val stat = Proof.theorem NONE (K I) [[(goal_term, [])]] ctxt
 
       fun eval_prf_strs_stat [] _ = raise Auto_Fail Application_Fails
-        | eval_prf_strs_stat (prf::L) stat =
-            eval_prf_str_stat kws 30 NONE prf stat
-            handle Auto_Fail _ => eval_prf_strs_stat L stat
+        | eval_prf_strs_stat [prf] stat = eval_prf_str_stat kws 30 NONE prf stat
+        | eval_prf_strs_stat prfs stat =
+            case Par_List.get_some (fn prf =>
+                    SOME (eval_prf_str_stat kws 30 NONE prf stat)
+                    handle Auto_Fail _ => NONE
+                 ) prfs
+              of SOME ret => ret
+               | NONE => raise Auto_Fail Application_Fails
 
-      fun prelude_simp stat =
-        let val src = if need_standard
-                      then "standard, " ^ ithm ^ "auto simp: "^ sthm ^ dthm
-                      else ithm ^ "auto simp: "^ sthm ^ dthm
-         in eval_prf_str_stat kws 5 NONE src stat
-        end handle Auto_Fail Timeout =>
-        let val src = if need_standard
-                      then "standard, " ^ ithm ^ "clarsimp simp: "^ sthm ^ dthm
-                      else ithm ^ "clarsimp simp: "^ sthm ^ dthm
-         in eval_prf_str_stat kws 5 NONE src stat
-        end
-
-      fun noprelude stat =
-            if null ithms
-            then ("-", stat)
-            else eval_prf_str_stat kws 5 NONE (ithm ^ "-") stat
-
-      fun hammer prelude =
+      fun hammer override (prf0,stat0) =
         let
-          val (prf0,stat0) = prelude stat
-                             handle Auto_Fail Timeout => raise Auto_Fail Prelude_Timeout
           val N = Thm.nprems_of (@{print} (#goal (Proof.raw_goal stat0)))
           val Ns = string_of_int N
 
@@ -603,16 +640,130 @@ fun sledgehammer kws override (ctxt,sequent) =
             funpow' N (fn j => fn (ps,s) =>
                         let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
-                            val prfx = raw_sledgehammer override s
-                            val (p',s') = eval_prf_strs_stat prfx s
+                            val (p',s') = case raw_sledgehammer override s
+                                            of NONE => raise Auto_Fail Application_Fails
+                                             | SOME prf => prf
                          in (p'::ps, s') end)
                      ((if prf0 = "" then [] else [prf0]),stat0)
     
           val prf = "(" ^ String.concatWith ",\n" (rev prfs) ^ ")"
         in prf end
 
+      fun hammer' () =
+        let val src1 = if need_standard
+                       then "standard, " ^ ithm ^ "auto simp: "^ sthm ^ dthm
+                       else ithm ^ "auto simp: "^ sthm ^ dthm
+            val src2 = if need_standard
+                       then "standard, " ^ ithm ^ "clarsimp simp: "^ sthm ^ dthm
+                       else ithm ^ "clarsimp simp: "^ sthm ^ dthm
+            val auto = SOME (eval_prf_str_stat kws 5 NONE src1 stat)
+                       handle Auto_Fail E => NONE
+            val clar = SOME (eval_prf_str_stat kws 4 NONE src2 stat)
+                       handle Auto_Fail E => NONE
+            val thy = Proof.theory_of stat
+            val plan = case (auto, clar)
+                         of (SOME (prf1, s1), SOME (prf2, s2)) =>
+                            if Thm.equiv_thm thy (#goal (Proof.raw_goal s1),
+                                                  #goal (Proof.raw_goal s2))
+                            then [(prf2, s2)]
+                            else [(prf1, s1), (prf2, s2)]
+                          | (SOME ret, _) => [ret]
+                          | (_, SOME ret) => [ret]
+                          | _ => []
+            fun get_some _ [] = NONE
+              | get_some F [x] = F x
+              | get_some F L = Par_List.get_some F L
+         in if null plan
+          then raise Auto_Fail Application_Fails
+          else case get_some (SOME o hammer override) plan
+            of SOME ret => ret
+             | _ => raise Auto_Fail Application_Fails
+        end
+
+      fun bare_hammer () =
+          hammer raw_override ("-", stat)
+
       fun fastforce () =
-        let val src = "(insert " ^ athms ^ ", fastforce)"
+        let fun nth_iv' i (Facts.FromTo (j,k) :: L) =
+                  if i < k-j+1
+                  then SOME [Facts.Single (j+i)]
+                  else nth_iv' (i - (k-j+1)) L
+              | nth_iv' i [Facts.From j] = SOME [Facts.Single (j+i)]
+              | nth_iv' i (Facts.Single j :: L) = nth_iv' i (Facts.FromTo (j,j) :: L)
+              | nth_iv' _ _ = error "BUG SH fastforce() nth_iv"
+            
+            fun nth_iv N i iv =
+                  if i + 1 = N then NONE
+                  else case iv
+                    of NONE => SOME [Facts.Single (i+1)]
+                     | SOME ivs => ivs
+                                |> sort iv_ord
+                                |> nth_iv' i
+            val type_of_thms = maps (
+                  fn (ths, (Facts.Named ((name, pos), iv), atts)) =>
+                      let val N = length ths
+                       in map_index (fn (i,th) =>
+                            (infer_type_of_rule name th,
+                             (Facts.Named ((name, pos), nth_iv N i iv), atts))
+                          ) ths
+                      end
+                   | ([th], fact as (Facts.Fact _, _)) =>
+                        [(infer_type_of_rule "" th, fact)]
+                   | _ => error "BUG SH fastforce() 2"
+                    )
+            val thms = type_of_thms OA
+            val dthms= type_of_thms origin_del
+            val simps  = map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " simp: " ^ space_implode " " (map restore_ref' L))
+            val intros = map_filter (fn (ty, x) => if ty = T_INTRO then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L => " intro: " ^ space_implode " " (map restore_ref' L))
+            val elims  = map_filter (fn (ty, x) => if ty = T_ELIM then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " elim: " ^ space_implode " " (map restore_ref' L))
+            val dests  = map_filter (fn (ty, x) => if ty = T_DEST then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " dest: " ^ space_implode " " (map restore_ref' L))
+            val congs  = map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " cong: " ^ space_implode " " (map restore_ref' L))
+            val splits = map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L => " split: " ^ space_implode " " (map restore_ref' L))
+            val iffs   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>   " iff: " ^ space_implode " " (map restore_ref' L))
+
+            val dsimps= map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " simp del: " ^ space_implode " " (map restore_ref' L))
+            val dcongs= map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " cong del: " ^ space_implode " " (map restore_ref' L))
+            val dsplits= map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " split del: " ^ space_implode " " (map restore_ref' L))
+            val diff   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " iff del: " ^ space_implode " " (map restore_ref' L))
+            val del    = map snd dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " del: " ^ space_implode " " (map restore_ref' L))
+
+
+            val src = String.concat ["(",
+                        ithm, "fastforce", simps, intros, elims, dests, congs, splits, iffs,
+                        dsimps, dcongs, dsplits, diff, del,
+                      ")"]
+         in tracing src
+          ; eval_prf_str_stat kws 5 NONE src (
+                Proof.map_context (Context_Position.set_visible false) stat)
+         |> fst
+        end
+
+      fun smt () =
+        let val src = "(smt " ^ athms ^ ")"
          in eval_prf_str_stat kws 5 NONE src stat
          |> fst
         end
@@ -627,10 +778,11 @@ fun sledgehammer kws override (ctxt,sequent) =
         end
 
       val prf = Par_List.get_some (fn F => SOME (F ()) handle Auto_Fail _ => NONE) [
-            (fn () => hammer prelude_simp),
-            (fn () => hammer noprelude),
+            hammer',
+            bare_hammer,
             fastforce,
-            simp
+            simp,
+            smt
 
 (*          (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
                      search_prf (ithm ^ "clarsimp simp: "^ sthm ^ dthm ^", ((rule conjI)+)?"))),
