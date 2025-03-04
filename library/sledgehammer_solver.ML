@@ -570,19 +570,25 @@ fun restore_ref' (rf, []) = restore_ref rf
 fun sledgehammer kws override0 (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
 
+      val pass_thms  = filter (can (Attrib.eval_thms ctxt) o single)
+      val pass_thms' = map_filter (fn th => try (rpair th o Attrib.eval_thms ctxt) [th])
+      val origin_add = pass_thms' (#add override0)
+      val origin_del = pass_thms (#del override0)
+
       val sbi = should_be_inserted ctxt
-      val (ithms, sthms, OA) = fold_rev (fn th => fn (I,S,OA) =>
-            if exists (sbi o Thm.prop_of) (Attrib.eval_thms ctxt [th])
+      val (ithms, sthms, OA) = fold_rev (fn (th', th) => fn (I,S,OA) =>
+            if exists (sbi o Thm.prop_of) th'
             then (restore_ref' th :: I, S, OA)
             else (I, restore_ref' th :: S, th :: OA)
-          ) (#add override0) ([],[],[])
+          ) origin_add ([],[],[])
       val ithm = if null ithms then "" else "insert " ^ space_implode " " ithms ^ ", "
       val sthm = if null sthms then "" else " " ^ space_implode " " sthms
-      val dthm = if null (#del override0) then ""
-                 else " simp del: " ^ space_implode " " (map restore_ref' (#del override0))
-      val athms = space_implode " " (map restore_ref' (#add override0))
+      val dthm = if null origin_del then ""
+                 else " simp del: " ^ space_implode " " (map restore_ref' origin_del)
+      val athms = space_implode " " (map (restore_ref' o snd) origin_add)
 
-      val override = {add=OA, del = #del override0, only = #only override0}
+      val override = {add=OA, del = origin_del, only = #only override0}
+      val raw_override = {add = map snd origin_add, del = origin_del, only = #only override0}
 
       val need_standard = need_standard_tac ctxt sequent
 
@@ -653,7 +659,7 @@ fun sledgehammer kws override0 (ctxt,sequent) =
         end
 
       fun bare_hammer () =
-          hammer override0 ("-", stat)
+          hammer raw_override ("-", stat)
 
 
       fun fastforce () =
