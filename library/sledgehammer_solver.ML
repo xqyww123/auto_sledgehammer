@@ -363,7 +363,7 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
-fun dirty_hack ret shortcut stat s =
+fun dirty_hack main_thread pptimeout ret shortcut stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -394,19 +394,27 @@ fun dirty_hack ret shortcut stat s =
 
             in (if null using then "" else "(insert " ^ unparse using ^ ")[1], ") ^ unparse_tac tac
            end
-        val ctxt = Proof.context_of stat
         val prf = trans (Input.string s_prf
                       |> Input.source_explode
                       |> Token.tokenize full_keywords {strict = true}
                       |> filter Token.is_proper)
         val _ = Synchronized.change ret (fn prfs => prf :: prfs)
         val _ = tracing s
-        val timeout = Config.get ctxt preplay_timeout
-        in case try (eval_prf_str_stat keywords timeout NONE prf) stat
+        fun eval_future () = (
+          Future.fork (fn () =>
+            case try (eval_prf_str_stat keywords pptimeout NONE prf) stat
+              of SOME ret => (
+                    Synchronized.change shortcut (fn NONE => SOME ret | some => some)
+                  ; Thread.interrupt main_thread )
+               | NONE => ())
+          ; () )
+        in if preplay_succeeded
+         then case try (eval_prf_str_stat keywords 3 NONE prf) stat
              of SOME ret => (
-                  Synchronized.change shortcut (K (SOME ret))
-                ; Exn.interrupt () )
-              | NONE => ()
+                  Synchronized.change shortcut (fn NONE => SOME ret | some => some)
+                ; Thread.interrupt main_thread )
+              | NONE => eval_future ()
+         else eval_future ()
        end
   end
 
@@ -434,10 +442,13 @@ fun raw_sledgehammer override stat =
       val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" []
       val shortcut = Synchronized.var "raw_sledgehammer.shortcut" NONE
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
+      val ctxt = Proof.context_of stat
+      val pptimeout = Config.get ctxt preplay_timeout
    in (Sledgehammer.run_sledgehammer
-              (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
-              Sledgehammer_Prover.Normal (SOME (dirty_hack ret shortcut stat)) 1 override
-              (silence_state stat);
+            (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
+                Sledgehammer_Prover.Normal
+                (SOME (dirty_hack (Thread.self ()) pptimeout ret shortcut stat)) 1 override
+                (silence_state stat);
        NONE)
 
 (* For some unknown reason, the return of Sledgehammer.run_sledgehammer doesn't give me everything
