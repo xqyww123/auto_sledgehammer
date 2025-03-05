@@ -103,12 +103,13 @@ fun dest_eq (\<^Const>\<open>Trueprop\<close> $ X) = dest_eq X
   | dest_eq _ = NONE
 
 val chk_simp = is_some o dest_eq
-fun chk_split tm =
-  let val SOME (LHS, RHS) = dest_eq tm
-      val (Var LH, _) = strip_comb LHS
-      val (Var RH, _) = strip_comb LHS
-   in LH = RH
-  end handle Bind => false
+fun chk_split thm =
+  (case Thm.concl_of (Simpdata.mk_eq thm) of
+    \<^Const_>\<open>Pure.eq _ for \<open>Var _ $ t\<close> c\<close> =>
+      (case strip_comb t of
+        (Const p, _) => true
+      | _ => false)
+  | _ => false);
 
 fun lower_name name =
   let fun chk _ []  = NONE
@@ -140,7 +141,7 @@ fun infer_type_of_rule name th =
           String.isSuffix ".dest" name
        then T_DEST
   else if chk_cong th then T_CONG
-  else if chk_split (Thm.concl_of th) then T_SPLIT
+  else if chk_split th then T_SPLIT
   else if chk_elim th then T_ELIM
   else if chk_simp (Thm.concl_of th) then T_SIMP
   else (case lower_name name
@@ -576,6 +577,29 @@ fun restore_ref' (rf, []) = restore_ref rf
           space_implode "," (map (fn attr => space_implode " " (map Token.unparse attr)) attrs)
         ^ "]"
 
+val iv_ord = int_ord o apply2 (fn Facts.FromTo (i,_) => i
+                                | Facts.From i => i
+                                | Facts.Single i => i)
+local open Facts
+fun merge_iv (SOME a) (SOME b) = SOME (a @ b)
+  | merge_iv NONE (SOME x) = SOME x
+  | merge_iv (SOME x) NONE = SOME x
+  | merge_iv NONE NONE = NONE
+fun merge_facts' ((x1 as (Named ((s1,p1),iv1), att1)) :: (L2 as (Named ((s2,p2),iv2), att2) :: L))
+      = if s1 = s2 andalso pointer_eq (att1, att2)
+        then merge_facts' ((Named ((s1,p1), merge_iv iv1 iv2), att1) :: L)
+        else x1 :: merge_facts' L2
+  | merge_facts' L = L
+in
+fun fact_ord (Named ((s1,_),iv1), Named ((s2,_),iv2)) =
+      prod_ord string_ord (option_ord (list_ord iv_ord)) ((s1,iv1), (s2,iv2))
+  | fact_ord (Named _, Fact _) = GREATER
+  | fact_ord (Fact _, Named _) = LESS
+  | fact_ord (Fact s1, Fact s2) = string_ord (s1, s2)
+
+val merge_facts = merge_facts' o sort (fact_ord o apply2 fst)
+end
+
 
 fun sledgehammer kws override0 (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
@@ -583,22 +607,22 @@ fun sledgehammer kws override0 (ctxt,sequent) =
       val pass_thms  = filter (can (Attrib.eval_thms ctxt) o single)
       val pass_thms' = map_filter (fn th => try (rpair th o Attrib.eval_thms ctxt) [th])
       val origin_add = pass_thms' (#add override0)
-      val origin_del = pass_thms (#del override0)
+      val origin_del = pass_thms' (#del override0)
 
       val sbi = should_be_inserted ctxt
       val (ithms, sthms, OA) = fold_rev (fn (th', th) => fn (I,S,OA) =>
             if exists (sbi o Thm.prop_of) th'
             then (restore_ref' th :: I, S, OA)
-            else (I, restore_ref' th :: S, th :: OA)
+            else (I, restore_ref' th :: S, (th', th) :: OA)
           ) origin_add ([],[],[])
       val ithm = if null ithms then "" else "insert " ^ space_implode " " ithms ^ ", "
       val sthm = if null sthms then "" else " " ^ space_implode " " sthms
       val dthm = if null origin_del then ""
-                 else " simp del: " ^ space_implode " " (map restore_ref' origin_del)
+                 else " simp del: " ^ space_implode " " (map (restore_ref' o snd) origin_del)
       val athms = space_implode " " (map (restore_ref' o snd) origin_add)
 
-      val override = {add=OA, del = origin_del, only = #only override0}
-      val raw_override = {add = map snd origin_add, del = origin_del, only = #only override0}
+      val override = {add=map snd OA, del = map snd origin_del, only = #only override0}
+      val raw_override = {add = map snd origin_add, del = map snd origin_del, only = #only override0}
 
       val need_standard = need_standard_tac ctxt sequent
 
@@ -671,10 +695,81 @@ fun sledgehammer kws override0 (ctxt,sequent) =
       fun bare_hammer () =
           hammer raw_override ("-", stat)
 
-
       fun fastforce () =
-        let val src = "(insert " ^ athms ^ ", fastforce)"
-         in eval_prf_str_stat kws 5 NONE src stat
+        let fun nth_iv' i (Facts.FromTo (j,k) :: L) =
+                  if i < k-j+1
+                  then SOME [Facts.Single (j+i)]
+                  else nth_iv' (i - (k-j+1)) L
+              | nth_iv' i [Facts.From j] = SOME [Facts.Single (j+i)]
+              | nth_iv' i (Facts.Single j :: L) = nth_iv' i (Facts.FromTo (j,j) :: L)
+              | nth_iv' _ _ = error "BUG SH fastforce() nth_iv"
+            
+            fun nth_iv N i iv =
+                  if i + 1 = N then NONE
+                  else case iv
+                    of NONE => SOME [Facts.Single i]
+                     | SOME ivs => ivs
+                                |> sort iv_ord
+                                |> nth_iv' i
+            val type_of_thms = maps (
+                  fn (ths, (Facts.Named ((name, pos), iv), atts)) =>
+                      let val N = length ths
+                       in map_index (fn (i,th) =>
+                            (infer_type_of_rule name th,
+                             (Facts.Named ((name, pos), nth_iv N i iv), atts))
+                          ) ths
+                      end
+                   | ([th], fact as (Facts.Fact _, _)) =>
+                        [(infer_type_of_rule "" th, fact)]
+                   | _ => error "BUG SH fastforce() 2"
+                    )
+            val thms = type_of_thms OA
+            val dthms= type_of_thms origin_del
+            val simps  = map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " simp: " ^ space_implode " " (map restore_ref' L))
+            val intros = map_filter (fn (ty, x) => if ty = T_INTRO then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L => " intro: " ^ space_implode " " (map restore_ref' L))
+            val elims  = map_filter (fn (ty, x) => if ty = T_ELIM then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " elim: " ^ space_implode " " (map restore_ref' L))
+            val dests  = map_filter (fn (ty, x) => if ty = T_DEST then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " dest: " ^ space_implode " " (map restore_ref' L))
+            val congs  = map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " cong: " ^ space_implode " " (map restore_ref' L))
+            val splits = map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L => " split: " ^ space_implode " " (map restore_ref' L))
+            val iffs   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) thms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>   " iff: " ^ space_implode " " (map restore_ref' L))
+
+            val dsimps= map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " simp del: " ^ space_implode " " (map restore_ref' L))
+            val dcongs= map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " cong del: " ^ space_implode " " (map restore_ref' L))
+            val dsplits= map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " split del: " ^ space_implode " " (map restore_ref' L))
+            val diff   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " iff del: " ^ space_implode " " (map restore_ref' L))
+            val del    = map snd dthms
+                      |> merge_facts
+                      |> (fn [] => "" | L =>  " del: " ^ space_implode " " (map restore_ref' L))
+
+
+            val src = String.concat ["(",
+                        ithm, "fastforce", simps, intros, elims, dests, congs, splits, iffs,
+                        dsimps, dcongs, dsplits, diff, del,
+                      ")"]
+         in tracing src
+          ; eval_prf_str_stat kws 5 NONE src stat
          |> fst
         end
 
