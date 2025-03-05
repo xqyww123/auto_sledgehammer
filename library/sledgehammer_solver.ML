@@ -678,6 +678,12 @@ fun sledgehammer kws override0 (ctxt,sequent) =
          |> fst
         end
 
+      fun smt () =
+        let val src = "(smt " ^ athms ^ ")"
+         in eval_prf_str_stat kws 5 NONE src stat
+         |> fst
+        end
+
       fun simp () =
         let val src = "(insert " ^ athms ^ ", simp)"
             val n0 = Thm.nprems_of (#goal (Proof.goal stat))
@@ -691,7 +697,8 @@ fun sledgehammer kws override0 (ctxt,sequent) =
             hammer',
             bare_hammer,
             fastforce,
-            simp
+            simp,
+            smt
 
 (*          (fn () => (tracing "Fails... Try instead a stronger or maybe weaker prompt..." ;
                      search_prf (ithm ^ "clarsimp simp: "^ sthm ^ dthm ^", ((rule conjI)+)?"))),
