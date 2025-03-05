@@ -35,7 +35,7 @@ val classical_prover_timeout =
 val sledgehammer_params_fixed = [("isar_proofs", "false"), ("try0", "false")]
 
 val sledgehammer_params = Attrib.setup_config_string \<^binding>\<open>auto_sledgehammer_params\<close> (K "")
-val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 30)
+val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 10)
 
 fun get_sledgehammer_params ctxt =
   Config.get ctxt sledgehammer_params
@@ -414,13 +414,13 @@ fun dirty_hack futures main_thread pptimeout shortcut stat s =
                       else ()
                     end
                    | NONE => ()) :: fs))
-        in (* if preplay_succeeded
+        in if preplay_succeeded
          then case try (eval_prf_str_stat keywords 3 NONE prf) stat
              of SOME ret => (
                   Synchronized.change shortcut (fn NONE => SOME ret | some => some)
                 ; Thread.interrupt main_thread )
-              | NONE => eval_future ()
-         else *) eval_future ()
+              | NONE => ()
+         else eval_future ()
        end
   end
 
