@@ -404,7 +404,7 @@ fun dirty_hack futures main_thread pptimeout shortcut stat s =
             fn NONE => NONE
              | SOME fs => SOME (
               Future.fork (fn () =>
-                case try (eval_prf_str_stat keywords pptimeout NONE prf) stat
+                case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
                   of SOME ret =>
                     let val interrupt =
                           Synchronized.change_result shortcut (fn NONE => (true, SOME ret)
