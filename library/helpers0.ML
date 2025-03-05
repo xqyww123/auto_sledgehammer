@@ -39,7 +39,7 @@ fun has_delimiter s =
    in while !i < N andalso not (!ret) do
         let val c = String.sub (s, !i)
          in if Char.isAlphaNum c orelse
-               (case c of #"_" => true | #"'" => true | _ => false)
+               (case c of #"_" => true | #"'" => true | #"." => true | _ => false)
           then i := !i + 1
           else ret := true
         end
