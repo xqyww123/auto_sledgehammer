@@ -405,9 +405,14 @@ fun dirty_hack futures main_thread pptimeout shortcut stat s =
              | SOME fs => SOME (
               Future.fork (fn () =>
                 case try (eval_prf_str_stat keywords pptimeout NONE prf) stat
-                  of SOME ret => (
-                        Synchronized.change shortcut (fn NONE => SOME ret | some => some)
-                      ; Thread.interrupt main_thread )
+                  of SOME ret =>
+                    let val interrupt =
+                          Synchronized.change_result shortcut (fn NONE => (true, SOME ret)
+                                                                | some => (false, some))
+                     in if interrupt
+                      then Thread.interrupt main_thread
+                      else ()
+                    end
                    | NONE => ()) :: fs))
         in (* if preplay_succeeded
          then case try (eval_prf_str_stat keywords 3 NONE prf) stat
