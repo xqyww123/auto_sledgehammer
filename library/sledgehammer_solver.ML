@@ -707,7 +707,7 @@ fun sledgehammer kws override0 (ctxt,sequent) =
             fun nth_iv N i iv =
                   if i + 1 = N then NONE
                   else case iv
-                    of NONE => SOME [Facts.Single i]
+                    of NONE => SOME [Facts.Single (i+1)]
                      | SOME ivs => ivs
                                 |> sort iv_ord
                                 |> nth_iv' i
