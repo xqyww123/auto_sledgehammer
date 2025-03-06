@@ -364,7 +364,7 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
-fun dirty_hack futures main_thread pptimeout shortcut stat s =
+fun dirty_hack futures group main_thread pptimeout shortcut stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -404,27 +404,21 @@ fun dirty_hack futures main_thread pptimeout shortcut stat s =
           Synchronized.change futures (
             fn NONE => NONE
              | SOME fs => SOME (
-              Future.fork (fn () =>
+              Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=20, interrupts=true}
+              [fn () =>
                 case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
                   of SOME ret =>
-                    let val interrupt =
-                          Synchronized.change_result shortcut (fn NONE => (true, SOME ret)
-                                                                | some => (false, some))
-                     in if interrupt
-                      then Thread.interrupt main_thread
-                      else ()
-                    end
-                   | NONE => ()) :: fs))
+                    Synchronized.change shortcut
+                        (fn NONE => ( Thread.interrupt main_thread
+                                    ; SOME ret)
+                          | some => some)
+                   | NONE => ()] @ fs))
         in if preplay_succeeded
          then case try (eval_prf_str_stat keywords 3 NONE prf) stat
-             of SOME ret =>
-                  let val interrupt =
-                        Synchronized.change_result shortcut (fn NONE => (true, SOME ret)
-                                                              | some => (false, some))
-                   in if interrupt
-                    then Thread.interrupt main_thread
-                    else ()
-                  end
+             of SOME ret => (
+                    Synchronized.change shortcut (fn NONE => SOME ret
+                                                   | some => some)
+                  ; Future.cancel_group group)
               | NONE => ()
          else eval_future ()
        end
@@ -457,17 +451,30 @@ fun raw_sledgehammer override stat =
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
       val pptimeout = Config.get ctxt preplay_timeout
-   in (Sledgehammer.run_sledgehammer
+      val group = Future.new_group (Future.worker_group ())
+   in Future.forks {name="\<phi>SH", group = SOME group, deps = [], pri=10, interrupts=true} [(fn () =>
+        ( Sledgehammer.run_sledgehammer
             (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
                 Sledgehammer_Prover.Normal
-                (SOME (dirty_hack futures (Thread.self ()) pptimeout shortcut stat)) 1 override
+                (SOME (dirty_hack futures group (Thread.self ()) pptimeout shortcut stat)) 1 override
                 (silence_state stat)
-     ; let val workers = Synchronized.change_result futures (
-                  fn SOME workers => (workers, NONE)
-                   | NONE => ([], NONE))
-        in if null workers then () else (Future.joins workers; ())
-       end ;
-       NONE)
+        ; ()))]
+    |> Future.join_results
+    ; let val workers = Synchronized.change_result futures (
+                       fn SOME workers => (workers, NONE)
+                        | NONE => ([], NONE))
+          in Future.cancel_group group
+        (* ; Future.join_results workers *)
+           ; case Synchronized.value shortcut
+          of SOME ret => SOME ret
+           | NONE => NONE (* ( (*
+              warning "Interrupted\n\
+              \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
+              \proof reconstruction of Sledgehammer.\n\
+              \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
+              \and hopefully the problem can be addressed."
+              ; *)  Exn.reraise E) *)
+         end
 
 (* For some unknown reason, the return of Sledgehammer.run_sledgehammer doesn't give me everything
    it finds (not match to its output to users), so I have to dirty hijack its output stream and
@@ -487,23 +494,6 @@ fun raw_sledgehammer override stat =
              in @{print} alt_output
             end
          | _ => raise Phi_Reasoners.Automation_Fail NONE)*)
-    handle E =>
-        if Exn.is_interrupt E
-        then let val workers = Synchronized.change_result futures (
-                       fn SOME workers => (workers, NONE)
-                        | NONE => ([], NONE))
-          in List.app Future.cancel workers
-           ; case Synchronized.value shortcut
-          of SOME ret => SOME ret
-           | NONE => (*
-              warning "Interrupted\n\
-              \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
-              \proof reconstruction of Sledgehammer.\n\
-              \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
-              \and hopefully the problem can be addressed."
-              ; *) Exn.reraise E
-         end
-        else Exn.reraise E
   end
 
 (*** Proof search using Sledgehammer ***)
@@ -769,7 +759,8 @@ fun sledgehammer kws override0 (ctxt,sequent) =
                         dsimps, dcongs, dsplits, diff, del,
                       ")"]
          in tracing src
-          ; eval_prf_str_stat kws 5 NONE src stat
+          ; eval_prf_str_stat kws 5 NONE src (
+                Proof.map_context (Context_Position.set_visible false) stat)
          |> fst
         end
 
