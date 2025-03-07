@@ -10,6 +10,9 @@ val leading_antecedent : term -> (string * typ) list (*quantified variables*)
 
 val leading_antecedent' : thm -> term
 
+val quote_space : string -> string
+val quote_fact  : string -> string
+
 end
 
 
@@ -28,5 +31,27 @@ fun leading_antecedent (Const("Pure.imp", _) $ H $ _) = strip_meta_hhf H
   | leading_antecedent X = raise TERM ("has no antecedent", [X])
 
 fun leading_antecedent' thm = fst (Logic.dest_implies (Thm.prop_of thm))
+
+fun has_delimiter s =
+  let val N = size s
+      val i = Unsynchronized.ref 0
+      val ret = Unsynchronized.ref false
+   in while !i < N andalso not (!ret) do
+        let val c = String.sub (s, !i)
+         in if Char.isAlphaNum c orelse
+               (case c of #"_" => true | #"'" => true | #"." => true | _ => false)
+          then i := !i + 1
+          else ret := true
+        end
+    ; !ret
+  end
+
+fun quote_space s = if has_delimiter s then quote s else s
+fun quote_fact s =
+      if s <> "" andalso
+        (has_delimiter s orelse
+         not (Char.isAlpha (String.sub (s,0))) )
+      then quote s
+      else s
 
 end
