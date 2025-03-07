@@ -364,7 +364,7 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
-fun dirty_hack futures group main_thread pptimeout shortcut stat s =
+fun dirty_hack futures group pptimeout shortcut stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -407,11 +407,10 @@ fun dirty_hack futures group main_thread pptimeout shortcut stat s =
               Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=20, interrupts=true}
               [fn () =>
                 case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
-                  of SOME ret =>
-                    Synchronized.change shortcut
-                        (fn NONE => ( Thread.interrupt main_thread
-                                    ; SOME ret)
-                          | some => some)
+                  of SOME ret => (
+                       Synchronized.change shortcut (fn NONE => SOME ret
+                                                      | some => some)
+                     ; Future.cancel_group group)
                    | NONE => ()] @ fs))
         in if preplay_succeeded
          then case try (eval_prf_str_stat keywords 3 NONE prf) stat
@@ -456,7 +455,7 @@ fun raw_sledgehammer override stat =
         ( Sledgehammer.run_sledgehammer
             (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
                 Sledgehammer_Prover.Normal
-                (SOME (dirty_hack futures group (Thread.self ()) pptimeout shortcut stat)) 1 override
+                (SOME (dirty_hack futures group pptimeout shortcut stat)) 1 override
                 (silence_state stat)
         ; ()))]
     |> Future.join_results
