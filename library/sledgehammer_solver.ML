@@ -461,36 +461,9 @@ fun raw_sledgehammer override stat =
     |> Future.join_results
      ; Synchronized.change futures (K NONE)
      ; Future.cancel_group group
-  (* ; Future.join_results workers *)
      ; ( case Synchronized.value shortcut
            of SOME ret => SOME ret
             | NONE => NONE )
- (* ( (*
-              warning "Interrupted\n\
-              \If this interruption is unexpected for you, it can be caused by the \<open>try0\<close> based\n\
-              \proof reconstruction of Sledgehammer.\n\
-              \You may \<open>declare [[auto_sledgehammer_params = \"try0 = false\"]]\<close> to disable \<open>try0\<close>,\n\
-              \and hopefully the problem can be addressed."
-              ; *)  Exn.reraise E) *)
-
-(* For some unknown reason, the return of Sledgehammer.run_sledgehammer doesn't give me everything
-   it finds (not match to its output to users), so I have to dirty hijack its output stream and
-   recovery the result in a hacking way.
-   
-
-  (case Sledgehammer.run_sledgehammer
-              (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
-              Sledgehammer_Prover.Normal (SOME (dirty_hack ret stat)) 1 Sledgehammer_Fact.no_fact_override
-              (silence_state stat)
-        of (_, (Sledgehammer.SH_Some (result, preplays0), _)) =>
-            let val preplays = @{print} preplays0
-                            |> filter (fn (_, Sledgehammer_Proof_Methods.Played _, _) => true
-                                        | _ => false)
-                            |> sort preplay_ord
-                val alt_output = Synchronized.value ret
-             in @{print} alt_output
-            end
-         | _ => raise Phi_Reasoners.Automation_Fail NONE)*)
   end
 
 (*** Proof search using Sledgehammer ***)
@@ -755,8 +728,8 @@ fun sledgehammer kws override0 (ctxt,sequent) =
                         ithm, "fastforce", simps, intros, elims, dests, congs, splits, iffs,
                         dsimps, dcongs, dsplits, diff, del,
                       ")"]
-         in tracing src
-          ; eval_prf_str_stat kws 5 NONE src (
+         in (* tracing src
+          ; *) eval_prf_str_stat kws 5 NONE src (
                 Proof.map_context (Context_Position.set_visible false) stat)
          |> fst
         end
