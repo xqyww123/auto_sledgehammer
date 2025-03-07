@@ -364,7 +364,7 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
-fun dirty_hack futures group pptimeout shortcut stat s =
+fun dirty_hack group pptimeout shortcut stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -400,23 +400,19 @@ fun dirty_hack futures group pptimeout shortcut stat s =
                       |> Token.tokenize full_keywords {strict = true}
                       |> filter Token.is_proper)
         val _ = tracing s
-        fun eval_future () =
-          Synchronized.change futures (
-            fn NONE => NONE
-             | SOME fs => SOME (
+        fun eval_future () = (
               Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=20, interrupts=true}
               [fn () =>
                 case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
                   of SOME ret => (
-                       Synchronized.change shortcut (fn NONE => SOME ret
-                                                      | some => some)
+                       (Single_Assignment.assign shortcut ret handle Fail _ => ())
                      ; Future.cancel_group group)
-                   | NONE => ()] @ fs))
+                   | NONE => ()]
+              ; () )
         in if preplay_succeeded
          then case try (eval_prf_str_stat keywords 3 NONE prf) stat
              of SOME ret => (
-                    Synchronized.change shortcut (fn NONE => SOME ret
-                                                   | some => some)
+                    (Single_Assignment.assign shortcut ret handle Fail _ => ())
                   ; Future.cancel_group group)
               | NONE => ()
          else eval_future ()
@@ -445,8 +441,7 @@ fun raw_sledgehammer override stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
       (* val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" [] *)
-      val futures = Synchronized.var "\<phi>sledgehammer.futures" (SOME [])
-      val shortcut = Synchronized.var "\<phi>sledgehammer.shortcut" NONE
+      val shortcut = Single_Assignment.var "\<phi>sledgehammer.shortcut"
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
       val pptimeout = Config.get ctxt preplay_timeout
@@ -455,15 +450,12 @@ fun raw_sledgehammer override stat =
         ( Sledgehammer.run_sledgehammer
             (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
                 Sledgehammer_Prover.Normal
-                (SOME (dirty_hack futures group pptimeout shortcut stat)) 1 override
+                (SOME (dirty_hack group pptimeout shortcut stat)) 1 override
                 (silence_state stat)
         ; ()))]
     |> Future.join_results
-     ; Synchronized.change futures (K NONE)
      ; Future.cancel_group group
-     ; ( case Synchronized.value shortcut
-           of SOME ret => SOME ret
-            | NONE => NONE )
+     ; Single_Assignment.peek shortcut
   end
 
 (*** Proof search using Sledgehammer ***)
