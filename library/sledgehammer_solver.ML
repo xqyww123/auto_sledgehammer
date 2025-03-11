@@ -32,7 +32,7 @@ structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
 val classical_prover_timeout =
         Attrib.setup_config_int \<^binding>\<open>classical_prover_timeout\<close> (K 3)
 
-val sledgehammer_params_fixed = [("isar_proofs", "false"), ("try0", "false")]
+val sledgehammer_params_fixed = [("isar_proofs", "false")]
 
 val sledgehammer_params = Attrib.setup_config_string \<^binding>\<open>auto_sledgehammer_params\<close> (K "")
 val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 10)
@@ -365,7 +365,7 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
-fun dirty_hack group pptimeout shortcut stat s =
+fun dirty_hack group futures pptimeout shortcut stat s =
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -401,21 +401,22 @@ fun dirty_hack group pptimeout shortcut stat s =
                       |> Token.tokenize full_keywords {strict = true}
                       |> filter Token.is_proper)
         val _ = tracing s
-        fun eval_future () = (
-              Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=20, interrupts=true}
+        fun eval_future () =
+          let val future = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
               [fn () =>
                 case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
                   of SOME ret => (
                        (Single_Assignment.assign shortcut ret handle Fail _ => ())
                      ; Future.cancel_group group)
                    | NONE => ()]
-              ; () )
+           in Synchronized.change futures (fn L => future @ L)
+          end
         in if preplay_succeeded
          then case try (eval_prf_str_stat keywords 3 NONE prf) stat
              of SOME ret => (
                     (Single_Assignment.assign shortcut ret handle Fail _ => ())
                   ; Future.cancel_group group)
-              | NONE => ()
+              | NONE => eval_future ()
          else eval_future ()
        end
   end
@@ -443,6 +444,7 @@ fun raw_sledgehammer override stat =
       val _ = if N = 0 then error "No subgoal!" else ()
       (* val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" [] *)
       val shortcut = Single_Assignment.var "\<phi>sledgehammer.shortcut"
+      val futures = Synchronized.var "\<phi>sledgehammer.futures" []
       val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
       val pptimeout = Config.get ctxt preplay_timeout
@@ -451,10 +453,11 @@ fun raw_sledgehammer override stat =
         ( Sledgehammer.run_sledgehammer
             (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
                 Sledgehammer_Prover.Normal
-                (SOME (dirty_hack group pptimeout shortcut stat)) 1 override
+                (SOME (dirty_hack group futures pptimeout shortcut stat)) 1 override
                 (silence_state stat)
         ; ()))]
     |> Future.join_results
+     ; Future.join_results (Synchronized.value futures)
      ; Future.cancel_group group
      ; Single_Assignment.peek shortcut
   end
@@ -534,7 +537,22 @@ val iv_ord = int_ord o apply2 (fn Facts.FromTo (i,_) => i
                                 | Facts.From i => i
                                 | Facts.Single i => i)
 local open Facts
-fun merge_iv (SOME a) (SOME b) = SOME (a @ b)
+fun collapse_iv' (From i :: _) = [From i]
+  | collapse_iv' ((X as FromTo (i,j)) :: (LL as FromTo(k,l) :: L)) =
+      if j+1=k then collapse_iv' (FromTo (i,l) :: L)
+               else X :: collapse_iv' LL
+  | collapse_iv' ((X as FromTo (i,j)) :: (LL as Single k :: L)) =
+      if j+1=k then collapse_iv' (FromTo (i,k) :: L)
+               else X :: collapse_iv' LL
+  | collapse_iv' ((X as Single i) :: (LL as FromTo(k,l) :: L)) =
+      if i+1=k then collapse_iv' (FromTo (i,l) :: L)
+               else X :: collapse_iv' LL
+  | collapse_iv' ((X as Single i) :: (LL as Single k :: L)) =
+      if i+1=k then collapse_iv' (FromTo (i,k) :: L)
+               else X :: collapse_iv' LL
+  | collapse_iv' L = L
+fun collapse_iv L = collapse_iv' (sort iv_ord L)
+fun merge_iv (SOME a) (SOME b) = SOME (collapse_iv (a @ b))
   | merge_iv NONE (SOME x) = SOME x
   | merge_iv (SOME x) NONE = SOME x
   | merge_iv NONE NONE = NONE
