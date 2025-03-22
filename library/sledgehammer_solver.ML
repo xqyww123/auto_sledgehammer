@@ -552,7 +552,7 @@ fun collapse_iv' (From i :: _) = [From i]
                else X :: collapse_iv' LL
   | collapse_iv' L = L
 fun collapse_iv L = collapse_iv' (sort iv_ord L)
-fun merge_iv (SOME a) (SOME b) = SOME (collapse_iv (a @ b))
+fun merge_iv (SOME a) (SOME b) = SOME (a @ b)
   | merge_iv NONE (SOME x) = SOME x
   | merge_iv (SOME x) NONE = SOME x
   | merge_iv NONE NONE = NONE
@@ -568,7 +568,21 @@ fun fact_ord (Named ((s1,_),iv1), Named ((s2,_),iv2)) =
   | fact_ord (Fact _, Named _) = LESS
   | fact_ord (Fact s1, Fact s2) = string_ord (s1, s2)
 
-val merge_facts = merge_facts' o sort (fact_ord o apply2 fst)
+fun merge_facts ctxt facts =
+         facts
+      |> sort (fact_ord o apply2 fst)
+      |> merge_facts'
+      |> map (apfst (fn Named (name, SOME iv) =>
+                          let val iv' = collapse_iv iv
+                                     |> (fn X as [FromTo (1,n)] =>
+                                           (( if n = length (Proof_Context.get_thms ctxt (fst name))
+                                              then NONE
+                                              else SOME X )
+                                              handle ERROR _ => SOME X )
+                                          | X => SOME X)
+                           in Named (name, iv')
+                          end
+                      | X => X))
 end
 
 
@@ -667,7 +681,8 @@ fun sledgehammer kws override0 (ctxt,sequent) =
           hammer raw_override ("-", stat)
 
       fun fastforce () =
-        let fun nth_iv' i (Facts.FromTo (j,k) :: L) =
+        let val ctxt = Proof.context_of stat
+            fun nth_iv' i (Facts.FromTo (j,k) :: L) =
                   if i < k-j+1
                   then SOME [Facts.Single (j+i)]
                   else nth_iv' (i - (k-j+1)) L
@@ -697,41 +712,41 @@ fun sledgehammer kws override0 (ctxt,sequent) =
             val thms = type_of_thms OA
             val dthms= type_of_thms origin_del
             val simps  = map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) thms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " simp: " ^ space_implode " " (map restore_ref' L))
             val intros = map_filter (fn (ty, x) => if ty = T_INTRO then SOME x else NONE) thms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L => " intro: " ^ space_implode " " (map restore_ref' L))
             val elims  = map_filter (fn (ty, x) => if ty = T_ELIM then SOME x else NONE) thms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " elim: " ^ space_implode " " (map restore_ref' L))
             val dests  = map_filter (fn (ty, x) => if ty = T_DEST then SOME x else NONE) thms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " dest: " ^ space_implode " " (map restore_ref' L))
             val congs  = map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) thms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " cong: " ^ space_implode " " (map restore_ref' L))
             val splits = map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) thms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L => " split: " ^ space_implode " " (map restore_ref' L))
             val iffs   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) thms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>   " iff: " ^ space_implode " " (map restore_ref' L))
 
             val dsimps= map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) dthms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " simp del: " ^ space_implode " " (map restore_ref' L))
             val dcongs= map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) dthms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " cong del: " ^ space_implode " " (map restore_ref' L))
             val dsplits= map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) dthms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " split del: " ^ space_implode " " (map restore_ref' L))
             val diff   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) dthms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " iff del: " ^ space_implode " " (map restore_ref' L))
             val del    = map snd dthms
-                      |> merge_facts
+                      |> merge_facts ctxt
                       |> (fn [] => "" | L =>  " del: " ^ space_implode " " (map restore_ref' L))
 
 
