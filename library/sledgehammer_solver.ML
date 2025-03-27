@@ -5,6 +5,11 @@ val auto : bool (*true for using the improved version,  false for the raw sledge
         -> Sledgehammer.fact_override
         -> Phi_Cache_DB.proof_id option
         -> Proof.context -> thm -> string (*proof*) * thm
+(*attacks all goals*)
+val all_auto : bool (*true for using the improved version,  false for the raw sledgehammer*)
+        -> Sledgehammer.fact_override
+        -> Phi_Cache_DB.proof_id option
+        -> Proof.context -> thm -> string (*proof*) * thm
 
 val assync_proof : bool Config.T
 
