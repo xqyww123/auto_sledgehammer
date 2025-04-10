@@ -27,6 +27,8 @@ val should_be_inserted : Proof.context -> term -> bool
 
 val need_standard_tac : Proof.context -> thm -> bool
 
+val collapse_iv : Facts.interval list -> Facts.interval list
+
 end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
@@ -546,17 +548,21 @@ val iv_ord = int_ord o apply2 (fn Facts.FromTo (i,_) => i
 local open Facts
 fun collapse_iv' (From i :: _) = [From i]
   | collapse_iv' ((X as FromTo (i,j)) :: (LL as FromTo(k,l) :: L)) =
-      if j+1=k then collapse_iv' (FromTo (i,l) :: L)
-               else X :: collapse_iv' LL
+      if k <= j     then collapse_iv' (FromTo (i,l) :: L)
+      else if j+1=k then collapse_iv' (FromTo (i,l) :: L)
+                    else X :: collapse_iv' LL
   | collapse_iv' ((X as FromTo (i,j)) :: (LL as Single k :: L)) =
-      if j+1=k then collapse_iv' (FromTo (i,k) :: L)
-               else X :: collapse_iv' LL
+      if k <= j     then collapse_iv' (FromTo (i,j) :: L)
+      else if j+1=k then collapse_iv' (FromTo (i,k) :: L)
+                    else X :: collapse_iv' LL
   | collapse_iv' ((X as Single i) :: (LL as FromTo(k,l) :: L)) =
-      if i+1=k then collapse_iv' (FromTo (i,l) :: L)
-               else X :: collapse_iv' LL
+      if k <= i     then collapse_iv' (FromTo (k,l) :: L)
+      else if i+1=k then collapse_iv' (FromTo (i,l) :: L)
+                    else X :: collapse_iv' LL
   | collapse_iv' ((X as Single i) :: (LL as Single k :: L)) =
-      if i+1=k then collapse_iv' (FromTo (i,k) :: L)
-               else X :: collapse_iv' LL
+      if k = i      then collapse_iv' (Single k :: L)
+      else if i+1=k then collapse_iv' (FromTo (i,k) :: L)
+                    else X :: collapse_iv' LL
   | collapse_iv' L = L
 fun collapse_iv L = collapse_iv' (sort iv_ord L)
 fun merge_iv (SOME a) (SOME b) = SOME (a @ b)
@@ -569,6 +575,7 @@ fun merge_facts' ((x1 as (Named ((s1,p1),iv1), att1)) :: (L2 as (Named ((s2,p2),
         else x1 :: merge_facts' L2
   | merge_facts' L = L
 in
+val collapse_iv = collapse_iv
 fun fact_ord (Named ((s1,_),iv1), Named ((s2,_),iv2)) =
       prod_ord string_ord (option_ord (list_ord iv_ord)) ((s1,iv1), (s2,iv2))
   | fact_ord (Named _, Fact _) = GREATER
