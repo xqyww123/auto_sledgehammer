@@ -899,11 +899,11 @@ fun insert_tac _ [] _ = all_tac
   | insert_tac ctxt facts i =
       EVERY (map (fn r => resolve_tac ctxt [Thm.forall_intr_vars r COMP_INCR revcut_rl] i) facts);
 
-val orverride_parser =
-        Scan.repeat (   (Args.add |-- Scan.repeat Parse.thm >> rpair [])
-                     || (Args.del |-- Scan.repeat Parse.thm >>  pair []) )
+fun orverride_parser toks = (
+        Scan.repeat (   (Args.add |-- \<^keyword>\<open>:\<close> |-- Scan.repeat Parse.thm >> rpair [])
+                     || (Args.del |-- \<^keyword>\<open>:\<close> |-- Scan.repeat Parse.thm >>  pair []) )
      >> (fn LL => fold_rev (fn (A,D) => fn (A',D') => (A @ A', D @ D') ) LL ([],[])
-               |> (fn (A,D) => {add = A, del = D, only = false}))
+               |> (fn (A,D) => {add = A, del = D, only = false})) ) toks
 
 val _ = Theory.setup (
 Method.setup \<^binding>\<open>auto_sledgehammer\<close> (Scan.lift (
