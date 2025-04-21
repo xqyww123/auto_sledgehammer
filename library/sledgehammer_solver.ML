@@ -510,7 +510,9 @@ fun wrapper f (ctxt,sequent) =
   else case Thm.major_prem_of sequent
     of Const (\<^const_name>\<open>Trueprop\<close>, _) $ \<^const>\<open>True\<close> =>
             ("rule TrueI", @{thm TrueI} RS sequent)
-     | _ => f (ctxt,sequent)
+     | _ => if getenv "DEBUG_DISABLE_SH" = "yes"
+            then error "Proof fails and Sledgehammer is disable due to debugging"
+            else f (ctxt,sequent)
 
 
 val time_delt = Time.fromMilliseconds 1000
