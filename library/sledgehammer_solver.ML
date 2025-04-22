@@ -29,6 +29,8 @@ val need_standard_tac : Proof.context -> thm -> bool
 
 val collapse_iv : Facts.interval list -> Facts.interval list
 
+val hasty_mode : bool Config.T
+
 end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
@@ -373,7 +375,20 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
-fun dirty_hack group futures pptimeout shortcut stat s =
+val hasty_mode = Attrib.setup_config_bool \<^binding>\<open>auto_sledgehammer_hasty\<close> (K false)
+
+fun dirty_hack group futures pptimeout hasty shortcut stat s =
+  if hasty
+  then if String.isSubstring "found a proof" s
+    then let
+       val ret = Proof.refine (Method.Basic (fn ctxt =>
+                    Method.METHOD (fn _ => Skip_Proof.cheat_tac ctxt 1))) stat
+              |> Seq.the_result "cheat fails?!"
+    in (Single_Assignment.assign shortcut ("<cheat>", ret) handle Fail _ => ())
+     ; Future.cancel_group group
+   end
+   else ()
+  else
   let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
       val inds = find #"\^E" s
    in if length inds < 4
@@ -447,7 +462,7 @@ fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, prove
        preplay_timeout=preplay_timeout, expect=expect}
 
 
-fun raw_sledgehammer override stat =
+fun raw_sledgehammer override hasty stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
       (* val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" [] *)
@@ -461,7 +476,7 @@ fun raw_sledgehammer override stat =
         ( Sledgehammer.run_sledgehammer
             (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
                 Sledgehammer_Prover.Normal
-                (SOME (dirty_hack group futures pptimeout shortcut stat)) 1 override
+                (SOME (dirty_hack group futures pptimeout hasty shortcut stat)) 1 override
                 (silence_state stat)
         ; ()))]
     |> Future.join_results
@@ -605,7 +620,7 @@ fun merge_facts ctxt facts =
 end
 
 
-fun sledgehammer improved kws override0 (ctxt,sequent) =
+fun sledgehammer improved hasty kws override0 (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
 
       val pass_thms  = filter (can (Attrib.eval_thms ctxt) o single)
@@ -652,18 +667,19 @@ fun sledgehammer improved kws override0 (ctxt,sequent) =
                                   raise Auto_Fail Too_Many_Subgoals)
                             else ()
 
-          val (prfs,_) =
+          val (prfs, final_state) =
             funpow' N (fn j => fn (ps,s) =>
                         let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
-                            val (p',s') = case raw_sledgehammer override s
+                            val (p',s') = case raw_sledgehammer override hasty s
                                             of NONE => raise Auto_Fail Application_Fails
                                              | SOME prf => prf
                          in (p'::ps, s') end)
                      ((if prf0 = "" then [] else [prf0]),stat0)
     
           val prf = "(" ^ String.concatWith ",\n" (rev prfs) ^ ")"
-        in prf end
+        in (prf, #goal (Proof.goal final_state))
+       end
 
       fun hammer' () =
         let val src1 = if need_standard
@@ -776,13 +792,13 @@ fun sledgehammer improved kws override0 (ctxt,sequent) =
          in (* tracing src
           ; *) eval_prf_str_stat kws 5 NONE src (
                 Proof.map_context (Context_Position.set_visible false) stat)
-         |> fst
+         |> apsnd (#goal o Proof.goal)
         end
 
       fun smt () =
         let val src = "(smt " ^ athms ^ ")"
          in eval_prf_str_stat kws 5 NONE src stat
-         |> fst
+         |> apsnd (#goal o Proof.goal)
         end
 
       fun simp () =
@@ -790,7 +806,7 @@ fun sledgehammer improved kws override0 (ctxt,sequent) =
             val n0 = Thm.nprems_of (#goal (Proof.goal stat))
             val (ret, s') = eval_prf_str_stat kws 5 NONE src stat
          in if Thm.nprems_of (#goal (Proof.goal s')) + 1 = n0
-          then ret
+          then (ret, #goal (Proof.goal s'))
           else raise Auto_Fail Application_Fails
         end
 
@@ -805,7 +821,10 @@ fun sledgehammer improved kws override0 (ctxt,sequent) =
         else (SOME (bare_hammer ()) handle Auto_Fail _ => NONE)
 
    in case prf
-   of SOME prf => eval_prf_str kws Time.zeroTime prf (ctxt,sequent)
+   of SOME (prf, sequent') =>
+        if hasty
+        then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
+        else eval_prf_str kws Time.zeroTime prf (ctxt,sequent)
     | NONE => raise Auto_Fail Application_Fails
   end
 
@@ -814,6 +833,7 @@ fun auto'i improved override id (ctxt,sequent) =
   let
     val id = case id of SOME some => some
                       | _ => Hasher.goal (ctxt,sequent)
+    val hasty = Config.get ctxt hasty_mode
 
     val thy = Proof_Context.theory_of ctxt
     val kws = Keyword.no_major_keywords (
@@ -852,10 +872,10 @@ fun auto'i improved override id (ctxt,sequent) =
             ((time,""), (ctxt, sequent'))
          | _ => (
             tracing "Proof search by default tactic fails. Invoking sledgehammer..."; *)
-            sledgehammer improved kws override (ctxt, sequent) )
+            sledgehammer improved hasty kws override (ctxt, sequent) )
       handle Timeout.TIMEOUT _ => (
         tracing "Proof search by default tactic times out. Invoking sledgehammer...";
-        sledgehammer improved kws override (ctxt, sequent) )
+        sledgehammer improved hasty kws override (ctxt, sequent) )
 
     in try_cached_proof (fn no_cache' => (let
           val hash = Hasher.goal (ctxt,sequent)
@@ -876,7 +896,11 @@ fun auto'i improved override id (ctxt,sequent) =
                               else (warning "A cached proof fails. Re-searching proofs...";
                                     Phi_Cache_DB.invalidate_proof_cache (not no_cache) id thy) ;
                               find_proof ())
-           in update_cache hash prf_result
+           in if hasty
+           then let val ((_,prf'), (_, sequent')) =  prf_result
+                 in (prf', sequent')
+                end
+           else update_cache hash prf_result
           end ))
    end
 (* val proof = raw_sledgehammer stat *)
