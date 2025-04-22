@@ -511,7 +511,10 @@ fun wrapper f (ctxt,sequent) =
     of Const (\<^const_name>\<open>Trueprop\<close>, _) $ \<^const>\<open>True\<close> =>
             ("rule TrueI", @{thm TrueI} RS sequent)
      | _ => if getenv "DEBUG_DISABLE_SH" = "yes"
-            then error "Proof fails and Sledgehammer is disable due to debugging"
+            then let
+                 val (_, (_, ret)) = eval_prf_str keywords (Time.fromSeconds 3) "fastforce" (ctxt, sequent)
+              in ("fastforce", ret)
+             end handle Auto_Fail _ => error "Proof fails and Sledgehammer is disable due to debugging"
             else f (ctxt,sequent)
 
 
