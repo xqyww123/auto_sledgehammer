@@ -512,8 +512,8 @@ fun wrapper f (ctxt,sequent) =
             ("rule TrueI", @{thm TrueI} RS sequent)
      | _ => if getenv "DEBUG_DISABLE_SH" = "yes"
             then let
-                 val (_, (_, ret)) = eval_prf_str keywords (Time.fromSeconds 3) "fastforce" (ctxt, sequent)
-              in ("fastforce", ret)
+                 val (_, (_, ret)) = eval_prf_str keywords (Time.fromSeconds 3) "safe" (ctxt, sequent)
+              in ("safe", ret)
              end handle Auto_Fail _ => error "Proof fails and Sledgehammer is disable due to debugging"
             else f (ctxt,sequent)
 
