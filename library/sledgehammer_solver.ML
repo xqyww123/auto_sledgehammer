@@ -926,8 +926,18 @@ fun insert_tac _ [] _ = all_tac
   | insert_tac ctxt facts i =
       EVERY (map (fn r => resolve_tac ctxt [Thm.forall_intr_vars r COMP_INCR revcut_rl] i) facts);
 
+fun not_del parser (toks as (tok1 :: tok2 :: _)) =
+      if Token.is_kind Token.Keyword tok2 andalso
+         Token.is_kind Token.Ident tok1 andalso
+         Token.content_of tok1 = "del" andalso
+         Token.content_of tok2 = ":"
+      then Scan.fail toks
+      else parser toks
+  | not_del parser toks = parser toks
+  
+
 fun orverride_parser toks = (
-        Scan.repeat (   (Args.add |-- \<^keyword>\<open>:\<close> |-- Scan.repeat Parse.thm >> rpair [])
+        Scan.repeat (   (Args.add |-- \<^keyword>\<open>:\<close> |-- Scan.repeat (not_del Parse.thm) >> rpair [])
                      || (Args.del |-- \<^keyword>\<open>:\<close> |-- Scan.repeat Parse.thm >>  pair []) )
      >> (fn LL => fold_rev (fn (A,D) => fn (A',D') => (A @ A', D @ D') ) LL ([],[])
                |> (fn (A,D) => {add = A, del = D, only = false})) ) toks
