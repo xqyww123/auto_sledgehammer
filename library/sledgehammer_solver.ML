@@ -53,6 +53,8 @@ fun get_sledgehammer_params ctxt =
     |> map (fn s => case String.tokens (fn #"=" => true | _ => false) s
                       of [k,v] => (Symbol.trim_blanks k, Symbol.trim_blanks v)
                        | _ => error ("Invalid auto_sledgehammer_params : " ^ s))
+    |> filter (fn ("mini_use_improved_SH", _) => false
+                | _ => true)
 
 (** Helpers **)
 
