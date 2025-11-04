@@ -36,6 +36,13 @@ val access_hash_cache : Hasher.digest -> proof_cache option
 val update_hash_cache : Hasher.digest -> proof_cache -> unit
 val clean_hash_cache  : unit -> unit
 
+type proof = string
+val try_cached_proof_by_hash :
+         (Time.time -> proof -> context_state -> context_state option) (*evaluator*)
+      -> (string option (*original cached proof*) -> (Time.time * proof) * context_state)
+      -> context_state
+      -> (Time.time * proof) * context_state
+
 end
 
 
@@ -227,5 +234,36 @@ fun update_hash_cache hash prf =
 
 fun clean_hash_cache () =
   Synchronized.change hash_cache (K Symtab.empty)
+
+fun update_cache_by_hash hash prf' (ctxt, sequent') = (
+       tracing (
+          "Find proof (" ^ hash ^ ", time: " ^ Value.print_time (fst prf') ^ "): " ^
+           (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
+       ) ;
+       update_hash_cache hash prf';
+       update_cached_proof (Proof_Context.theory_of ctxt) (hash, prf') ;
+       (snd prf', sequent'))
+
+type proof = string
+val time_delt = Time.fromMilliseconds 1000
+
+fun try_cached_proof_by_hash evaluator fallback (ctxt, sequent) =
+  let val hash = Hasher.goal (ctxt, sequent)
+      fun fallback' origin_prf =
+            let val (prf', ret) = fallback origin_prf
+             in update_cache_by_hash hash prf' (ctxt, sequent)
+              ; (prf', ret)
+            end
+   in case get_cached_proof (Proof_Context.theory_of ctxt) hash
+        of NONE => fallback' NONE
+         | SOME (time,prf) =>
+            let val nprem = Thm.nprems_of sequent
+                val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
+             in case ( evaluator (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
+                       handle Timeout.TIMEOUT _ => NONE )
+                  of SOME ret => ((time,prf), ret)
+                   | NONE => fallback' (SOME prf)
+            end
+  end
 
 end

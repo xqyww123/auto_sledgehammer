@@ -374,6 +374,9 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
           raise Auto_Fail Unknown) \<close>
     end
 
+
+(** Sledgehammer **)
+
 val full_keywords = Thy_Header.get_keywords \<^theory>
 val keywords = Keyword.no_major_keywords full_keywords
 
