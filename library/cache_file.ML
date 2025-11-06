@@ -43,10 +43,14 @@ val try_cached_proof_by_hash :
       -> context_state
       -> (Time.time * proof) * context_state
 
+val enable_proof_cache : bool Config.T
+
 end
 
 
 structure Phi_Cache_DB : PHI_CACHE_DB = struct
+
+val enable_proof_cache = Attrib.setup_config_bool \<^binding>\<open>enable_proof_cache\<close> (K true)
 
 type proof_id = string
 type proof_cache = Time.time * string
@@ -254,16 +258,17 @@ fun try_cached_proof_by_hash evaluator fallback (ctxt, sequent) =
              in update_cache_by_hash hash prf' (ctxt, sequent)
               ; (prf', ret)
             end
-   in case get_cached_proof (Proof_Context.theory_of ctxt) hash
-        of NONE => fallback' NONE
-         | SOME (time,prf) =>
-            let val nprem = Thm.nprems_of sequent
-                val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
-             in case ( evaluator (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
-                       handle Timeout.TIMEOUT _ => NONE )
-                  of SOME ret => ((time,prf), ret)
-                   | NONE => fallback' (SOME prf)
-            end
+   in if Config.get ctxt enable_proof_cache
+    then case get_cached_proof (Proof_Context.theory_of ctxt) hash
+          of NONE => fallback' NONE
+           | SOME (time,prf) =>
+              let val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
+               in case ( evaluator (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
+                         handle Timeout.TIMEOUT _ => NONE )
+                    of SOME ret => ((time,prf), ret)
+                     | NONE => fallback' (SOME prf)
+              end
+    else fallback NONE
   end
 
 end
