@@ -31,6 +31,8 @@ val collapse_iv : Facts.interval list -> Facts.interval list
 
 val hasty_mode : bool Config.T
 
+val get_sledgehammer_params : Proof.context -> (string * string) list
+
 end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
@@ -55,6 +57,7 @@ fun get_sledgehammer_params ctxt =
                        | _ => error ("Invalid auto_sledgehammer_params : " ^ s))
     |> filter (fn ("mini_use_improved_SH", _) => false
                 | _ => true)
+    |> (fn L => sledgehammer_params_fixed @ L)
 
 (** Helpers **)
 
@@ -473,7 +476,7 @@ fun raw_sledgehammer override hasty stat =
       (* val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" [] *)
       val shortcut = Single_Assignment.var "\<phi>sledgehammer.shortcut"
       val futures = Synchronized.var "\<phi>sledgehammer.futures" []
-      val sledgehammer_params = sledgehammer_params_fixed @ get_sledgehammer_params (Proof.context_of stat)
+      val sledgehammer_params = get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
       val pptimeout = Config.get ctxt preplay_timeout
       val group = Future.new_group (Future.worker_group ())
