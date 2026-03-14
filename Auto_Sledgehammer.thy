@@ -3,13 +3,12 @@ theory Auto_Sledgehammer
 begin
 
 (*
-named_theorems \<phi>sledgehammer_simps \<open>Simplification rules used before applying slegehammer automation\<close>
+named_theorems φsledgehammer_simps ‹Simplification rules used before applying slegehammer automation›
 *)
 
-ML_file \<open>library/helpers0.ML\<close>
-ML_file \<open>library/Hasher.ML\<close>
-ML_file \<open>library/cache_file.ML\<close>
-ML_file \<open>library/sledgehammer_solver.ML\<close>
-
+ML_file ‹library/helpers0.ML›
+ML_file ‹library/Hasher.ML›
+ML_file ‹library/cache_file.ML›
+ML_file ‹library/sledgehammer_solver.ML›
 
 end
