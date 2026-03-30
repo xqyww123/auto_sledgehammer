@@ -4,6 +4,7 @@ val orverride_parser : Sledgehammer.fact_override parser
 val auto : bool (*true for using the improved version,  false for the raw sledgehammer*)
         -> Sledgehammer.fact_override
         -> Phi_Cache_DB.proof_id option
+        -> Time.time option (*optional timeout override*)
         -> Proof.context -> thm -> string (*proof*) * thm
 (*attacks all goals*)
 val all_auto : bool (*true for using the improved version,  false for the raw sledgehammer*)
@@ -914,9 +915,14 @@ fun auto'i improved override id (ctxt,sequent) =
    end
 (* val proof = raw_sledgehammer stat *)
 
-fun auto improved override id ctxt sequent =
-  wrapper (auto'i improved override id) (ctxt,sequent)
-  handle Auto_Fail _ => error (error_message ctxt sequent)
+fun auto improved override id timeout_opt ctxt sequent =
+  let val ctxt' = case timeout_opt of
+          NONE => ctxt
+        | SOME t => Config.map sledgehammer_params
+                      (fn s => "timeout = " ^ string_of_int (Time.toSeconds t) ^ ", " ^ s) ctxt
+  in wrapper (auto'i improved override id) (ctxt', sequent)
+     handle Auto_Fail _ => error (error_message ctxt sequent)
+  end
 
 fun all_auto improved override id ctxt sequent =
   let fun loop sequent =
@@ -963,7 +969,7 @@ Method.setup \<^binding>\<open>auto_sledgehammer\<close> (Scan.lift (
                 of SOME (ret, _) => ret
                  | NONE => error "Why the insert_tac can fail?"
      in SOME (
-         (Seq.Result (ctxt, snd (auto true override (SOME id) ctxt sequent'))
+         (Seq.Result (ctxt, snd (auto true override (SOME id) NONE ctxt sequent'))
           handle Auto_Fail _ => Seq.Error err),
          Seq.empty)
     end))
@@ -999,7 +1005,7 @@ Method.setup \<^binding>\<open>raw_sledgehammer\<close> (Scan.lift (
                 of SOME (ret, _) => ret
                  | NONE => error "Why the insert_tac can fail?"
      in SOME (
-         (Seq.Result (ctxt, snd (auto false override (SOME id) ctxt sequent'))
+         (Seq.Result (ctxt, snd (auto false override (SOME id) NONE ctxt sequent'))
           handle Auto_Fail _ => Seq.Error err),
          Seq.empty)
     end))
