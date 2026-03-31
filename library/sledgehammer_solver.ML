@@ -343,15 +343,19 @@ fun eval_prf_str _ timeout "" (ctxt,sequent) =
                   |  err => (tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
                              raise Auto_Fail Unknown)\<close>
   | eval_prf_str kws timeout prf (ctxt,sequent) = \<^try>\<open>
-      let val seq =
+      let val protected = Goal.protect 1 sequent
+          val seq =
             Method.evaluate (
               Parse.read_embedded ctxt kws Method.parse (Input.string prf)
                 |> fst
                 |> Method.check_text ctxt
-              ) ctxt [] (ctxt, sequent)
+              ) ctxt [] (ctxt, protected)
         in case Timeout.apply timeout (Timing.timing (
                     Position.setmp_thread_data Position.none Seq.pull)) seq
-             of ({elapsed=time,...}, SOME (Seq.Result ret, _)) => ((time,prf), ret)
+             of ({elapsed=time,...}, SOME (Seq.Result (ctxt', sequent'), _)) =>
+                  if Thm.no_prems sequent'
+                  then ((time,prf), (ctxt', Goal.conclude sequent'))
+                  else raise Auto_Fail Subgoal_unsolved
               | _ => raise Auto_Fail Application_Fails
       end catch Timeout.TIMEOUT _ => raise Auto_Fail Timeout
               | Auto_Fail err => Exn.reraise (Auto_Fail err)
