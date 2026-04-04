@@ -924,8 +924,18 @@ fun auto improved override id timeout_opt ctxt sequent =
           NONE => ctxt
         | SOME t => Config.map sledgehammer_params
                       (fn s => "timeout = " ^ string_of_int (Time.toSeconds t) ^ ", " ^ s) ctxt
-  in wrapper (auto'i improved override id) (ctxt', sequent)
-     handle Auto_Fail _ => error (error_message ctxt sequent)
+  in \<^try>\<open>
+       wrapper (auto'i improved override id) (ctxt', sequent)
+       catch Auto_Fail _ => error (error_message ctxt sequent)
+           | exn => (case Par_Exn.dest exn of
+               SOME exns =>
+                 let val msgs = map_filter (fn ERROR msg => SOME msg | _ => NONE) exns
+                 in if null exns orelse length msgs <> length exns
+                    then Exn.reraise exn
+                    else error (String.concatWith "\n" msgs)
+                 end
+             | NONE => Exn.reraise exn)
+     \<close>
   end
 
 fun all_auto improved override id ctxt sequent =
