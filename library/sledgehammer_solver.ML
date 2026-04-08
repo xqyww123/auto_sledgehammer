@@ -923,7 +923,8 @@ fun auto improved override id timeout_opt ctxt sequent =
   let val ctxt' = case timeout_opt of
           NONE => ctxt
         | SOME t => Config.map sledgehammer_params
-                      (fn s => "timeout = " ^ string_of_int (Time.toSeconds t) ^ ", " ^ s) ctxt
+                      (fn s => "timeout = " ^ string_of_int (Time.toSeconds t)
+                               ^ (if s = "" then "" else ", " ^ s)) ctxt
   in \<^try>\<open>
        wrapper (auto'i improved override id) (ctxt', sequent)
        catch Auto_Fail _ => error (error_message ctxt sequent)
