@@ -18,7 +18,7 @@ val sledgehammer_params : string Config.T
 val classical_prover_timeout : int Config.T
 
 datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal_unsolved | Unknown
-                     | Prelude_Timeout
+                     | Prelude_Timeout | Subgoal_Fail of term
 exception Auto_Fail of fail_reason
 
 datatype type_of_rule = T_SIMP | T_INTRO | T_ELIM | T_DEST | T_CONG | T_SPLIT | T_IFF | T_UNKNOWN
@@ -34,6 +34,16 @@ val hasty_mode : bool Config.T
 
 val get_sledgehammer_params : Proof.context -> (string * string) list
 
+(* Like `auto`, but propagates Auto_Fail instead of converting it to ERROR.
+   The caller is responsible for handling Auto_Fail (including Subgoal_Fail).
+   WARNING: Par_Exn from parallel thread failures may also propagate —
+   callers should handle or convert them. *)
+val auto_raw : bool -> Sledgehammer.fact_override -> Phi_Cache_DB.proof_id option
+            -> Time.time option -> Proof.context -> thm -> string * thm
+
+val fast_mepo_max_facts : int Config.T
+val fast_mepo_tac : Time.time -> Proof.context -> int -> tactic
+
 end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
@@ -44,6 +54,9 @@ structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
 
 val classical_prover_timeout =
         Attrib.setup_config_int \<^binding>\<open>classical_prover_timeout\<close> (K 3)
+
+val fast_mepo_max_facts =
+  Attrib.setup_config_int \<^binding>\<open>fast_mepo_max_facts\<close> (K 32)
 
 val sledgehammer_params_fixed = [("isar_proofs", "false")]
 
@@ -213,6 +226,112 @@ fun should_be_inserted ctxt  =
 
 end
 
+(** MePo-guided fastforce **)
+
+local
+
+val mepo_dummy_params = {
+  debug = false, verbose = false, overlord = false, spy = false,
+  provers = [], abduce = NONE, falsify = NONE, type_enc = NONE,
+  strict = false, lam_trans = NONE, uncurried_aliases = NONE,
+  learn = false, fact_filter = NONE, induction_rules = NONE,
+  max_facts = NONE, fact_thresholds = (0.45, 0.85),
+  max_mono_iters = NONE, max_new_mono_instances = NONE,
+  max_proofs = 1, isar_proofs = NONE, compress = NONE,
+  try0 = false, smt_proofs = false, minimize = false,
+  slices = 1, timeout = Time.fromSeconds 5,
+  preplay_timeout = Time.fromSeconds 1, expect = ""
+} : Sledgehammer_Prover.params
+
+fun local_facts_as_mepo_lazy_facts ctxt =
+  let
+    val transfer = Thm.transfer' ctxt
+    val local_facts = Proof_Context.facts_of ctxt
+    val outer_facts = try Local_Theory.target_of ctxt
+                   |> Option.map Proof_Context.facts_of
+                   |> the_list
+    val named_locals = Facts.dest_static false outer_facts local_facts
+                    |> filter (fn ("local.this", _) => false | _ => true)
+  in
+    maps (fn (name0, ths) =>
+      let val n = length ths
+          val extern_name = Facts.extern ctxt local_facts name0
+      in map_index (fn (j, th0) =>
+        let
+          val th = transfer th0
+          val get_name = fn () =>
+            if name0 = "" then Sledgehammer_Fact.cartouche_thm ctxt th
+            else if n > 1 then extern_name ^ "(" ^ string_of_int (j + 1) ^ ")"
+            else extern_name
+          val stature = (ATP_Problem_Generate.Local, ATP_Problem_Generate.General)
+        in ((get_name, stature), th) : Sledgehammer_Fact.lazy_fact
+        end
+      ) ths end
+    ) named_locals
+  end
+
+in
+
+fun fast_mepo_tac timeout ctxt i st =
+  if Thm.nprems_of st < i then Seq.empty
+  else let
+    val max_facts = Config.get ctxt fast_mepo_max_facts
+    val lazy_facts = local_facts_as_mepo_lazy_facts ctxt
+
+    val goal_term = Logic.get_goal (Thm.prop_of st) i
+    val hyp_ts = Logic.strip_assums_hyp goal_term
+    val concl_t = Logic.strip_assums_concl goal_term
+
+    val selected = Sledgehammer_MePo.mepo_suggested_facts
+                     ctxt mepo_dummy_params max_facts NONE hyp_ts concl_t lazy_facts
+
+    val sbi = should_be_inserted ctxt
+    val (to_insert, to_add) =
+      fold_rev (fn ((name, _), th) => fn (ins, add) =>
+        if sbi (Thm.prop_of th)
+        then (th :: ins, add)
+        else (ins, (name, th) :: add)
+      ) selected ([], [])
+
+    val ctxt' = fold (fn (name, th) => fn c =>
+      with_rule true name th (Context.Proof c) |> Context.proof_of
+    ) to_add ctxt
+
+    (* fastforce branch *)
+    fun fastforce_branch () =
+      (Method.insert_tac ctxt to_insert i THEN Clasimp.fast_force_tac ctxt' i) st
+
+    (* TODO: enable SMT branch
+    val all_selected_thms = map snd selected
+
+    fun smt_branch () =
+      let
+        val use_cvc5 = not (Config.get ctxt SMT_Config.oracle)
+                        andalso SMT_Config.is_available ctxt "cvc5"
+        val smt_ctxt = if use_cvc5
+          then SMT_Config.select_solver "cvc5" (Context.Proof ctxt) |> Context.proof_of
+          else ctxt
+        val _ = tracing ("fast_mepo: trying smt" ^
+                         (if use_cvc5 then " (cvc5)" else " (default)") ^
+                         " with " ^ string_of_int (length all_selected_thms) ^ " facts")
+      in SMT_Solver.smt_tac smt_ctxt all_selected_thms i st
+      end
+    *)
+  in
+    (* TODO: run fastforce and smt in parallel
+    (case Timeout.apply timeout (fn () =>
+        Par_List.get_some (fn f => (case Seq.pull (f ()) of SOME r => SOME r | NONE => NONE))
+          [fastforce_branch, smt_branch]) ()
+      of SOME (st', seq) => Seq.cons st' seq
+       | NONE => Seq.empty)
+    handle Timeout.TIMEOUT _ => Seq.empty
+    *)
+    Timeout.apply timeout fastforce_branch ()
+    handle Timeout.TIMEOUT _ => Seq.empty
+  end
+
+end
+
 (** Does it need the standard tac? **)
 
 fun need_standard_tac ctxt st =
@@ -318,7 +437,7 @@ fun preplay_ord ((_, Sledgehammer_Proof_Methods.Played t1, _),
       = EQUAL
 
 datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal_unsolved | Unknown
-                     | Prelude_Timeout
+                     | Prelude_Timeout | Subgoal_Fail of term
 exception Auto_Fail of fail_reason
 
 fun head_only tac th =
@@ -390,73 +509,6 @@ val keywords = Keyword.no_major_keywords full_keywords
 
 val hasty_mode = Attrib.setup_config_bool \<^binding>\<open>auto_sledgehammer_hasty\<close> (K false)
 
-fun dirty_hack group futures pptimeout hasty shortcut stat s =
-  if hasty
-  then if String.isSubstring "found a proof" s
-    then let
-       val ret = Proof.refine (Method.Basic (fn ctxt =>
-                    Method.METHOD (fn _ => Skip_Proof.cheat_tac ctxt 1))) stat
-              |> Seq.the_result "cheat fails?!"
-    in (Single_Assignment.assign shortcut ("<cheat>", ret) handle Fail _ => ())
-     ; Future.cancel_group group
-   end
-   else ()
-  else
-  let fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
-      val inds = find #"\^E" s
-   in if length inds < 4
-      then tracing s
-      else let
-        val i2 = List.nth (inds, 1)
-        val i3 = List.nth (inds, 2)
-        val i4 = List.nth (inds, 3)
-        val s_prf = String.substring (s, i2+1, i3 - 1 -i2)
-        val preplay_succeeded = is_some (CharVector.findi (fn (i,c) => i > i4 andalso c = #"(") s)
-        fun trans toks =
-          let val toks1 = case toks of [] => raise Fail "internal bug #e12asfwgy43"
-                                     | (tok::L) =>
-                                 if Token.is_command tok andalso Token.content_of tok = "using"
-                                 then L else tok::L
-              val sep = find_index (fn tok => Token.is_command tok andalso
-                                              (Token.content_of tok = "apply" orelse
-                                               Token.content_of tok = "by")) toks1
-              val (using, tac) = if sep = ~1 then raise Fail "internal bug #e12asfwgy44"
-                                 else (take sep toks1, drop (sep+1) toks1)
-              fun unparse toks = String.concatWith " " (map Token.unparse toks)
-              fun unparse_tac (tok1::tok2::R) =
-                    if Token.keyword_with (fn s => s = "[") tok2
-                       andalso not (Token.keyword_with (K true) tok1)
-                    then "(" ^ unparse [tok1] ^ ")" ^ unparse (tok2::R)
-                    else unparse (tok1::tok2::R)
-                | unparse_tac toks = unparse toks
-
-            in (if null using then "" else "(insert " ^ unparse using ^ ")[1], ") ^ unparse_tac tac
-           end
-        val prf = trans (Input.string s_prf
-                      |> Input.source_explode
-                      |> Token.tokenize full_keywords {strict = true}
-                      |> filter Token.is_proper)
-        val _ = tracing s
-        fun eval_future () =
-          let val future = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
-              [fn () =>
-                case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
-                  of SOME ret => (
-                       (Single_Assignment.assign shortcut ret handle Fail _ => ())
-                     ; Future.cancel_group group)
-                   | NONE => ()]
-           in Synchronized.change futures (fn L => future @ L)
-          end
-        in if preplay_succeeded
-         then case try (eval_prf_str_stat keywords 3 NONE prf) stat
-             of SOME ret => (
-                    (Single_Assignment.assign shortcut ret handle Fail _ => ())
-                  ; Future.cancel_group group)
-              | NONE => eval_future ()
-         else eval_future ()
-       end
-  end
-
 fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, provers=provers,
                  abduce=abduce, falsify=falsify, type_enc=type_enc, strict=strict, lam_trans=lam_trans,
                  uncurried_aliases=uncurried_aliases, learn=learn, fact_filter=fact_filter,
@@ -475,25 +527,114 @@ fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, prove
        preplay_timeout=preplay_timeout, expect=expect}
 
 
-fun raw_sledgehammer override hasty stat =
+fun raw_sledgehammer timeout_opt override hasty stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
-      (* val ret : string list Synchronized.var = Synchronized.var "raw_sledgehammer" [] *)
       val shortcut = Single_Assignment.var "\<phi>sledgehammer.shortcut"
       val futures = Synchronized.var "\<phi>sledgehammer.futures" []
+      val found_proof = Synchronized.var "\<phi>sledgehammer.found_proof" false
       val sledgehammer_params = get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
       val pptimeout = Config.get ctxt preplay_timeout
       val group = Future.new_group (Future.worker_group ())
+      val effective_timeout = case timeout_opt of
+            SOME t => SOME t
+          | NONE => (case AList.lookup (op =) sledgehammer_params "timeout" of
+              SOME s => Option.mapPartial (fn secs =>
+                  if secs <= 0 then NONE else SOME (Time.fromSeconds secs))
+                (Int.fromString s)
+            | NONE => let val secs = Options.default_int \<^system_option>\<open>sledgehammer_timeout\<close>
+                       in if secs <= 0 then NONE else SOME (Time.fromSeconds secs) end)
+      val deadline = Option.map (fn t => Time.scale (2.0 / 3.0) t) effective_timeout
+
+      fun dirty_hack s =
+        if String.isSubstring "found a falsification" s
+        then Future.cancel_group group
+        else if hasty
+        then if String.isSubstring "found a proof" s
+          then let
+             val ret = Proof.refine (Method.Basic (fn ctxt =>
+                          Method.METHOD (fn _ => Skip_Proof.cheat_tac ctxt 1))) stat
+                    |> Seq.the_result "cheat fails?!"
+          in (Single_Assignment.assign shortcut ("<cheat>", ret) handle Fail _ => ())
+           ; Future.cancel_group group
+         end
+         else ()
+        else
+        let val _ = if String.isSubstring "found a proof" s
+                    then Synchronized.change found_proof (K true) else ()
+            fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
+            val inds = find #"\^E" s
+         in if length inds < 4
+            then tracing s
+            else let
+              val i2 = List.nth (inds, 1)
+              val i3 = List.nth (inds, 2)
+              val i4 = List.nth (inds, 3)
+              val s_prf = String.substring (s, i2+1, i3 - 1 -i2)
+              val preplay_succeeded = is_some (CharVector.findi (fn (i,c) => i > i4 andalso c = #"(") s)
+              fun trans toks =
+                let val toks1 = case toks of [] => raise Fail "internal bug #e12asfwgy43"
+                                           | (tok::L) =>
+                                       if Token.is_command tok andalso Token.content_of tok = "using"
+                                       then L else tok::L
+                    val sep = find_index (fn tok => Token.is_command tok andalso
+                                                    (Token.content_of tok = "apply" orelse
+                                                     Token.content_of tok = "by")) toks1
+                    val (using, tac) = if sep = ~1 then raise Fail "internal bug #e12asfwgy44"
+                                       else (take sep toks1, drop (sep+1) toks1)
+                    fun unparse toks = String.concatWith " " (map Token.unparse toks)
+                    fun unparse_tac (tok1::tok2::R) =
+                          if Token.keyword_with (fn s => s = "[") tok2
+                             andalso not (Token.keyword_with (K true) tok1)
+                          then "(" ^ unparse [tok1] ^ ")" ^ unparse (tok2::R)
+                          else unparse (tok1::tok2::R)
+                      | unparse_tac toks = unparse toks
+
+                  in (if null using then "" else "(insert " ^ unparse using ^ ")[1], ") ^ unparse_tac tac
+                 end
+              val prf = trans (Input.string s_prf
+                            |> Input.source_explode
+                            |> Token.tokenize full_keywords {strict = true}
+                            |> filter Token.is_proper)
+              val _ = tracing s
+              fun eval_future () =
+                let val future = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
+                    [fn () =>
+                      case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
+                        of SOME ret => (
+                             (Single_Assignment.assign shortcut ret handle Fail _ => ())
+                           ; Future.cancel_group group)
+                         | NONE => ()]
+                 in Synchronized.change futures (fn L => future @ L)
+                end
+              in if preplay_succeeded
+               then case try (eval_prf_str_stat keywords 3 NONE prf) stat
+                   of SOME ret => (
+                          (Single_Assignment.assign shortcut ret handle Fail _ => ())
+                        ; Future.cancel_group group)
+                    | NONE => eval_future ()
+               else eval_future ()
+             end
+        end
+
+      val watchdog = Option.map (fn dl =>
+            Event_Timer.request {physical = true} (Time.now () + dl) (fn () =>
+              if not (Synchronized.value found_proof)
+              then (tracing "no proof found. give up in advance"; Future.cancel_group group)
+              else ()))
+          deadline
+
    in Future.forks {name="\<phi>SH", group = SOME group, deps = [], pri=10, interrupts=true} [(fn () =>
         ( Sledgehammer.run_sledgehammer
             (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
                 Sledgehammer_Prover.Normal
-                (SOME (dirty_hack group futures pptimeout hasty shortcut stat)) 1 override
+                (SOME dirty_hack) 1 override
                 (silence_state stat)
         ; ()))]
     |> Future.join_results
      ; Future.join_results (Synchronized.value futures)
+     ; (case watchdog of SOME req => ignore (Event_Timer.cancel req) | NONE => ())
      ; Future.cancel_group group
      ; Single_Assignment.peek shortcut
   end
@@ -634,8 +775,10 @@ fun merge_facts ctxt facts =
 end
 
 
-fun sledgehammer improved hasty kws override0 (ctxt,sequent) =
+fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
   let val (goal_term,_) = Logic.dest_implies (Thm.prop_of sequent)
+
+      val failed_subgoal = Unsynchronized.ref (NONE : term option)
 
       val pass_thms  = filter (can (Attrib.eval_thms ctxt) o single)
       val pass_thms' = map_filter (fn th => try (rpair th o Attrib.eval_thms ctxt) [th])
@@ -685,9 +828,26 @@ fun sledgehammer improved hasty kws override0 (ctxt,sequent) =
             funpow' N (fn j => fn (ps,s) =>
                         let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
-                            val (p',s') = case raw_sledgehammer override hasty s
-                                            of NONE => raise Auto_Fail Application_Fails
-                                             | SOME prf => prf
+                            val (p',s') = case raw_sledgehammer timeout_opt override hasty s
+                                            of NONE =>
+                                  let val subgoal_raw = hd (Thm.prems_of (#goal (Proof.raw_goal s)))
+                                      val params = Logic.strip_params subgoal_raw
+                                      val concl = Logic.strip_assums_concl subgoal_raw
+                                      val concl0 = Logic.strip_assums_concl goal_term
+                                      val _ = if not (concl aconv concl0)
+                                        then let val subgoal = HOLogic.mk_Trueprop (
+                                                fold_rev (fn (name, T) => fn body =>
+                                                  HOLogic.mk_all (name, T, body))
+                                                params (HOLogic.dest_Trueprop concl))
+                                              handle TERM _ => concl
+                                          in if smart_size_of_term subgoal <= 30
+                                            then failed_subgoal := SOME subgoal
+                                            else ()
+                                         end
+                                        else ()
+                                   in raise Auto_Fail Application_Fails
+                                  end
+                               | SOME prf => prf
                          in (p'::ps, s') end)
                      ((if prf0 = "" then [] else [prf0]),stat0)
     
@@ -702,19 +862,19 @@ fun sledgehammer improved hasty kws override0 (ctxt,sequent) =
             val src2 = if need_standard
                        then "standard, " ^ ithm ^ "clarsimp simp: "^ sthm ^ dthm
                        else ithm ^ "clarsimp simp: "^ sthm ^ dthm
-            val auto = SOME (eval_prf_str_stat kws 5 NONE src1 stat)
-                       handle Auto_Fail E => NONE
-            val clar = SOME (eval_prf_str_stat kws 4 NONE src2 stat)
-                       handle Auto_Fail E => NONE
+            fun auto () = SOME (eval_prf_str_stat kws 5 NONE src1 stat)
+                          handle Auto_Fail E => NONE
+            fun clar () = SOME (eval_prf_str_stat kws 4 NONE src2 stat)
+                          handle Auto_Fail E => NONE
             val thy = Proof.theory_of stat
-            val plan = case (auto, clar)
-                         of (SOME (prf1, s1), SOME (prf2, s2)) =>
+            val plan = case Par_List.map (fn f => f()) [auto, clar]
+                         of [SOME (prf1, s1), SOME (prf2, s2)] =>
                             if Thm.equiv_thm thy (#goal (Proof.raw_goal s1),
                                                   #goal (Proof.raw_goal s2))
                             then [(prf2, s2)]
                             else [(prf1, s1), (prf2, s2)]
-                          | (SOME ret, _) => [ret]
-                          | (_, SOME ret) => [ret]
+                          | [SOME ret, _] => [ret]
+                          | [_, SOME ret] => [ret]
                           | _ => []
             fun get_some _ [] = NONE
               | get_some F [x] = F x
@@ -839,11 +999,13 @@ fun sledgehammer improved hasty kws override0 (ctxt,sequent) =
         if hasty
         then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
         else eval_prf_str kws Time.zeroTime prf (ctxt,sequent)
-    | NONE => raise Auto_Fail Application_Fails
+    | NONE => (case !failed_subgoal
+                 of SOME t => raise Auto_Fail (Subgoal_Fail t)
+                  | NONE => raise Auto_Fail Application_Fails)
   end
 
 
-fun auto'i improved override id (ctxt,sequent) =
+fun auto'i timeout_opt improved override id (ctxt,sequent) =
   let
     val id = case id of SOME some => some
                       | _ => Hasher.goal (ctxt,sequent)
@@ -886,10 +1048,10 @@ fun auto'i improved override id (ctxt,sequent) =
             ((time,""), (ctxt, sequent'))
          | _ => (
             tracing "Proof search by default tactic fails. Invoking sledgehammer..."; *)
-            sledgehammer improved hasty kws override (ctxt, sequent) )
+            sledgehammer timeout_opt improved hasty kws override (ctxt, sequent) )
       handle Timeout.TIMEOUT _ => (
         tracing "Proof search by default tactic times out. Invoking sledgehammer...";
-        sledgehammer improved hasty kws override (ctxt, sequent) )
+        sledgehammer timeout_opt improved hasty kws override (ctxt, sequent) )
 
     in try_cached_proof (fn no_cache' => (let
           val hash = Hasher.goal (ctxt,sequent)
@@ -926,7 +1088,7 @@ fun auto improved override id timeout_opt ctxt sequent =
                       (fn s => "timeout = " ^ string_of_int (Time.toSeconds t)
                                ^ (if s = "" then "" else ", " ^ s)) ctxt
   in \<^try>\<open>
-       wrapper (auto'i improved override id) (ctxt', sequent)
+       wrapper (auto'i timeout_opt improved override id) (ctxt', sequent)
        catch Auto_Fail _ => error (error_message ctxt sequent)
            | exn => (case Par_Exn.dest exn of
                SOME exns =>
@@ -939,11 +1101,20 @@ fun auto improved override id timeout_opt ctxt sequent =
      \<close>
   end
 
+fun auto_raw improved override id timeout_opt ctxt sequent =
+  let val ctxt' = case timeout_opt of
+          NONE => ctxt
+        | SOME t => Config.map sledgehammer_params
+                      (fn s => "timeout = " ^ string_of_int (Time.toSeconds t)
+                               ^ (if s = "" then "" else ", " ^ s)) ctxt
+  in wrapper (auto'i timeout_opt improved override id) (ctxt', sequent)
+  end
+
 fun all_auto improved override id ctxt sequent =
   let fun loop sequent =
         if Thm.no_prems sequent
         then ([], sequent)
-        else let val (prf, sequent') = wrapper (auto'i improved override id) (ctxt,sequent)
+        else let val (prf, sequent') = wrapper (auto'i NONE improved override id) (ctxt,sequent)
           in loop sequent'
           |> apfst (fn L => prf :: L)
          end
@@ -1044,6 +1215,13 @@ Method.setup \<^binding>\<open>raw_sledgehammers\<close> (Scan.lift (
     end))
 )))
   "Apply sledgehammer repeated to every goals and record the outcome."
+#>
+Method.setup \<^binding>\<open>fast_mepo\<close>
+  (Scan.lift (Scan.option Parse.nat) -- Method.sections Clasimp.clasimp_modifiers >>
+    (fn (timeout_opt, _) =>
+      let val timeout = Time.fromSeconds (case timeout_opt of SOME n => n | NONE => 10)
+      in SIMPLE_METHOD' o fast_mepo_tac timeout end))
+  "fastforce + smt with MePo-guided fact selection from local context"
 )
 
 end
