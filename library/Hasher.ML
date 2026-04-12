@@ -56,6 +56,7 @@ val sort  : sort -> digest
 val typ  : typ -> digest
 val term : term -> digest
 val goal : context_state -> digest
+val goal_at : int -> context_state -> digest
 
 end
 
@@ -189,14 +190,21 @@ fun typ ty = word64_to_hex (hash_typ ty fnv_offset_basis)
 
 fun term t = word64_to_hex (hash_term t fnv_offset_basis)
 
-fun goal (ctxt, stat) =
+fun hash_in_context ctxt term =
   let
     val thy_name = Context.theory_name {long=false} (Proof_Context.theory_of ctxt)
     val h0 = hash_string thy_name fnv_offset_basis
     val h1 = fold (hash_term o Thm.term_of) (Assumption.all_assms_of ctxt) h0
-    val h2 = hash_term (Thm.prop_of stat) h1
+    val h2 = hash_term term h1
   in
     word64_to_hex h2
   end
+
+(* goal_at 0 hashes the whole proposition (all subgoals + conclusion);
+   goal_at i for i >= 1 hashes the i-th subgoal in isolation. *)
+fun goal_at 0 (ctxt, stat) = hash_in_context ctxt (Thm.prop_of stat)
+  | goal_at i (ctxt, stat) = hash_in_context ctxt (Logic.get_goal (Thm.prop_of stat) i)
+
+fun goal cs = goal_at 0 cs
 
 end

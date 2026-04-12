@@ -43,6 +43,16 @@ val try_cached_proof_by_hash :
       -> context_state
       -> (Time.time * proof) * context_state
 
+(*Variant keyed by Hasher.goal_at i — caches a per-subgoal proof.
+  Use i = 0 to mean "the whole sequent" (equivalent to try_cached_proof_by_hash);
+  use i >= 1 to key on the i-th subgoal in isolation.*)
+val try_cached_proof_by_hash_at :
+         int (*subgoal index, 0 = whole sequent*)
+      -> (Time.time -> proof -> context_state -> context_state option) (*evaluator*)
+      -> (string option (*original cached proof*) -> (Time.time * proof) * context_state)
+      -> context_state
+      -> (Time.time * proof) * context_state
+
 val enable_proof_cache : bool Config.T
 
 end
@@ -251,8 +261,8 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') = (
 type proof = string
 val time_delt = Time.fromMilliseconds 1000
 
-fun try_cached_proof_by_hash evaluator fallback (ctxt, sequent) =
-  let val hash = Hasher.goal (ctxt, sequent)
+fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) =
+  let val hash = key_fn (ctxt, sequent)
       fun fallback' origin_prf =
             let val (prf', ret) = fallback origin_prf
              in update_cache_by_hash hash prf' (ctxt, sequent)
@@ -270,5 +280,9 @@ fun try_cached_proof_by_hash evaluator fallback (ctxt, sequent) =
               end
     else fallback NONE
   end
+
+val try_cached_proof_by_hash = try_cached_proof_by_hash_with_key Hasher.goal
+
+fun try_cached_proof_by_hash_at i = try_cached_proof_by_hash_with_key (Hasher.goal_at i)
 
 end

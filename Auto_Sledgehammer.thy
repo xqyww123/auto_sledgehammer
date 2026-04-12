@@ -7,6 +7,7 @@ begin
 ML_file \<open>library/helpers0.ML\<close>
 ML_file \<open>library/Hasher.ML\<close>
 ML_file \<open>library/cache_file.ML\<close>
+ML_file \<open>library/split.ML\<close>
 ML_file \<open>library/sledgehammer_solver.ML\<close>
 
 (*
@@ -20,9 +21,11 @@ ML \<open>Options.default_int \<^system_option>\<open>sledgehammer_timeout\<clos
 declare [[fast_mepo_max_facts = 10]]
 lemma \<open>x + y = z\<close> if "x = (1::nat)" and "y = 2" and "z = 3" and "True" and "x = y"
   by fast_mepo
+ 
+              
+lemma \<open>a + b = c\<close> if "a = (2::int)" and "b = 3" and "c = 5"
+  by (fast_mepo 1)
+*)
 
-
-lemma \<open>False\<close>
-  by (fast_mepo 1) *)
 
 end
