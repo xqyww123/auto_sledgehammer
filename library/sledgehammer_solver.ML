@@ -236,7 +236,7 @@ end
 
 fun need_standard_tac ctxt st =
   let val thy = Proof_Context.theory_of ctxt
-      val [\<^Const>\<open>Trueprop\<close> $ goal] = Thm.prems_of st
+      val (\<^Const>\<open>Trueprop\<close> $ goal) = Thm.major_prem_of st
       val Const(name, _) = head_of goal
       fun pass [] = []
         | pass ["class", x] = [x]
@@ -901,17 +901,36 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
                                             of NONE =>
                                   let val subgoal_raw = hd (Thm.prems_of (#goal (Proof.raw_goal s)))
                                       val params = Logic.strip_params subgoal_raw
+                                      val hyps = Logic.strip_assums_hyp subgoal_raw
                                       val concl = Logic.strip_assums_concl subgoal_raw
                                       val concl0 = Logic.strip_assums_concl goal_term
                                       val _ = if not (concl aconv concl0)
-                                        then let val subgoal = HOLogic.mk_Trueprop (
-                                                fold_rev (fn (name, T) => fn body =>
-                                                  HOLogic.mk_all (name, T, body))
-                                                params (HOLogic.dest_Trueprop concl))
-                                              handle TERM _ => concl
-                                          in if smart_size_of_term subgoal <= 50
-                                            then failed_subgoal := SOME subgoal
-                                            else ()
+                                        then let
+                                               val (hyps', concl') =
+                                                 case (concl, hyps)
+                                                   of (Const(\<^const_name>\<open>Trueprop\<close>, _)
+                                                         $ Const(\<^const_name>\<open>False\<close>, _),
+                                                       _ :: _) =>
+                                                        (case List.last hyps
+                                                           of Const(\<^const_name>\<open>Trueprop\<close>, _) $ A =>
+                                                                (List.take (hyps, length hyps - 1),
+                                                                 HOLogic.mk_Trueprop
+                                                                   (HOLogic.mk_not A))
+                                                            | _ => (hyps, concl))
+                                                    | _ => (hyps, concl)
+                                               fun close body =
+                                                 fold_rev (fn (n, T) => fn b =>
+                                                     Logic.all_const T $ Abs (n, T, b))
+                                                   params body
+                                               val whole =
+                                                 Object_Logic.atomize_term ctxt
+                                                   (close (Logic.list_implies (hyps', concl')))
+                                               val concl_only =
+                                                 Object_Logic.atomize_term ctxt (close concl')
+                                          in case List.find (fn t => smart_size_of_term t <= 50)
+                                                               [whole, concl_only]
+                                               of SOME t => failed_subgoal := SOME t
+                                                | NONE => ()
                                          end
                                         else ()
                                    in raise Auto_Fail Application_Fails
