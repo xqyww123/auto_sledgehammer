@@ -787,10 +787,9 @@ fun run_mepo_and_render timeout ctxt i st =
       (Method.insert_tac ctxt insert_thms i THEN Clasimp.fast_force_tac ctxt' i) st
 
     val start = Time.now ()
-    val seq = Timeout.apply timeout fastforce_branch ()
-              handle Timeout.TIMEOUT _ => Seq.empty
   in
-    case Seq.pull seq of
+    case Timeout.apply timeout (fn () => Seq.pull (fastforce_branch ())) ()
+              handle Timeout.TIMEOUT _ => NONE of
       NONE => raise Auto_Fail Application_Fails
     | SOME (st', _) =>
         let val elapsed = Time.- (Time.now (), start)
