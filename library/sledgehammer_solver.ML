@@ -16,6 +16,15 @@ val assync_proof : bool Config.T
 
 val sledgehammer_params : string Config.T
 val classical_prover_timeout : int Config.T
+val try_parallel_smt_cvc5 : bool Config.T
+
+(* Exposed for testing: given a raw Sledgehammer proof string (e.g. "by (metis foo bar)"),
+   tokenize, strip any leading `using` keyword, detect whether the tactic head is `metis`,
+   and produce both the canonical proof string (as used today) and a `smt (cvc5) …`
+   variant when applicable. Does NOT consult the `try_parallel_smt_cvc5` config — the
+   smt variant is always returned when `is_metis` holds; call sites gate on the config. *)
+val mk_proof_candidates :
+      string -> {is_metis : bool, metis_prf : string, smt_prf_opt : string option}
 
 datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal_unsolved | Unknown
                      | Prelude_Timeout | Subgoal_Fail of term
@@ -65,6 +74,8 @@ val sledgehammer_params_fixed = [("isar_proofs", "false")]
 
 val sledgehammer_params = Attrib.setup_config_string \<^binding>\<open>auto_sledgehammer_params\<close> (K "")
 val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 10)
+val try_parallel_smt_cvc5 =
+  Attrib.setup_config_bool \<^binding>\<open>auto_sledgehammer_try_parallel_smt_cvc5\<close> (K false)
 
 fun get_sledgehammer_params ctxt =
   Config.get ctxt sledgehammer_params
@@ -409,6 +420,69 @@ val keywords = Keyword.no_major_keywords full_keywords
 
 val hasty_mode = Attrib.setup_config_bool \<^binding>\<open>auto_sledgehammer_hasty\<close> (K false)
 
+local
+  fun is_open_paren  t = Token.keyword_with (fn s => s = "(") t
+  fun is_close_paren t = Token.keyword_with (fn s => s = ")") t
+  fun drop_leading_paren_group (t :: rest) =
+        if is_open_paren t
+        then let fun skip d (x :: xs) =
+                      if is_open_paren  x then skip (d+1) xs
+                      else if is_close_paren x then
+                           if d <= 1 then xs else skip (d-1) xs
+                      else skip d xs
+                  | skip _ [] = []
+              in skip 1 rest end
+        else t :: rest
+    | drop_leading_paren_group [] = []
+  fun build_variant replace_metis toks1 =
+    let val sep = find_index (fn tok => Token.is_command tok andalso
+                                        (Token.content_of tok = "apply" orelse
+                                         Token.content_of tok = "by")) toks1
+        val (using, tac) = if sep = ~1 then raise Fail "internal bug #e12asfwgy44"
+                           else (take sep toks1, drop (sep+1) toks1)
+        val (lead_open, body) =
+              case tac of
+                (t :: rest) => if is_open_paren t then ([t], rest) else ([], tac)
+              | [] => ([], tac)
+        val (is_metis, body') =
+              case body of
+                (t :: rest) =>
+                  if Token.content_of t = "metis" andalso not (Token.is_command t)
+                  then (true, drop_leading_paren_group rest)
+                  else (false, body)
+              | [] => (false, body)
+        fun unparse toks = String.concatWith " " (map Token.unparse toks)
+        fun unparse_tac (tok1::tok2::R) =
+              if Token.keyword_with (fn s => s = "[") tok2
+                 andalso not (Token.keyword_with (K true) tok1)
+              then "(" ^ unparse [tok1] ^ ")" ^ unparse (tok2::R)
+              else unparse (tok1::tok2::R)
+          | unparse_tac toks = unparse toks
+        val rhs =
+              if is_metis andalso replace_metis
+              then unparse lead_open ^ "smt (cvc5) " ^ unparse body'
+              else unparse_tac tac
+     in (is_metis,
+         (if null using then "" else "(insert " ^ unparse using ^ ")[1], ") ^ rhs)
+    end
+in
+fun mk_proof_candidates s_prf =
+  let val tokens = Input.string s_prf
+                      |> Input.source_explode
+                      |> Token.tokenize full_keywords {strict = true}
+                      |> filter Token.is_proper
+      val toks1 = case tokens of
+                    [] => raise Fail "internal bug #e12asfwgy43"
+                  | (tok::L) =>
+                      if Token.is_command tok andalso Token.content_of tok = "using"
+                      then L else tok::L
+      val (is_metis, prf) = build_variant false toks1
+      val smt_prf_opt =
+            if is_metis then SOME (#2 (build_variant true toks1)) else NONE
+   in {is_metis = is_metis, metis_prf = prf, smt_prf_opt = smt_prf_opt}
+  end
+end
+
 fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, provers=provers,
                  abduce=abduce, falsify=falsify, type_enc=type_enc, strict=strict, lam_trans=lam_trans,
                  uncurried_aliases=uncurried_aliases, learn=learn, fact_filter=fact_filter,
@@ -473,40 +547,22 @@ fun raw_sledgehammer timeout_opt override hasty stat =
               val i4 = List.nth (inds, 3)
               val s_prf = String.substring (s, i2+1, i3 - 1 -i2)
               val preplay_succeeded = is_some (CharVector.findi (fn (i,c) => i > i4 andalso c = #"(") s)
-              fun trans toks =
-                let val toks1 = case toks of [] => raise Fail "internal bug #e12asfwgy43"
-                                           | (tok::L) =>
-                                       if Token.is_command tok andalso Token.content_of tok = "using"
-                                       then L else tok::L
-                    val sep = find_index (fn tok => Token.is_command tok andalso
-                                                    (Token.content_of tok = "apply" orelse
-                                                     Token.content_of tok = "by")) toks1
-                    val (using, tac) = if sep = ~1 then raise Fail "internal bug #e12asfwgy44"
-                                       else (take sep toks1, drop (sep+1) toks1)
-                    fun unparse toks = String.concatWith " " (map Token.unparse toks)
-                    fun unparse_tac (tok1::tok2::R) =
-                          if Token.keyword_with (fn s => s = "[") tok2
-                             andalso not (Token.keyword_with (K true) tok1)
-                          then "(" ^ unparse [tok1] ^ ")" ^ unparse (tok2::R)
-                          else unparse (tok1::tok2::R)
-                      | unparse_tac toks = unparse toks
-
-                  in (if null using then "" else "(insert " ^ unparse using ^ ")[1], ") ^ unparse_tac tac
-                 end
-              val prf = trans (Input.string s_prf
-                            |> Input.source_explode
-                            |> Token.tokenize full_keywords {strict = true}
-                            |> filter Token.is_proper)
+              val {is_metis = _, metis_prf = prf, smt_prf_opt = raw_smt_opt} =
+                    mk_proof_candidates s_prf
+              val smt_prf_opt =
+                    if Config.get (Proof.context_of stat) try_parallel_smt_cvc5
+                    then raw_smt_opt else NONE
               val _ = tracing s
               fun eval_future () =
-                let val future = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
-                    [fn () =>
-                      case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE prf)) stat
-                        of SOME ret => (
-                             (Single_Assignment.assign shortcut ret handle Fail _ => ())
-                           ; Future.cancel_group group)
-                         | NONE => ()]
-                 in Synchronized.change futures (fn L => future @ L)
+                let val candidates = prf :: (case smt_prf_opt of SOME s => [s] | NONE => [])
+                    val new_futures = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
+                      (map (fn p => fn () =>
+                        case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE p)) stat
+                          of SOME ret => (
+                               (Single_Assignment.assign shortcut ret handle Fail _ => ())
+                             ; Future.cancel_group group)
+                           | NONE => ()) candidates)
+                 in Synchronized.change futures (fn L => new_futures @ L)
                 end
               in if preplay_succeeded
                then case try (eval_prf_str_stat keywords 3 NONE prf) stat
