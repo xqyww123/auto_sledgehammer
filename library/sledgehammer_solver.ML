@@ -227,15 +227,29 @@ end
 fun with_rule add name rule ctxt =
   Thm.apply_attribute (modifier_of add (infer_type_of_rule name rule)) rule ctxt |> snd
 
+fun may_entail_false prop =
+  let fun go_prop (Const (\<^const_name>\<open>Trueprop\<close>, _) $ t) = go t
+        | go_prop (Const (\<^const_name>\<open>Pure.imp\<close>, _) $ _ $ B) = go_prop B
+        | go_prop (Const (\<^const_name>\<open>Pure.all\<close>, _) $ Abs (_, _, t)) = go_prop t
+        | go_prop _ = false
+      and go (Const (\<^const_name>\<open>False\<close>, _)) = true
+        | go (Const (\<^const_name>\<open>conj\<close>, _) $ A $ B) = go A orelse go B
+        | go (Const (\<^const_name>\<open>HOL.implies\<close>, _) $ _ $ B) = go B
+        | go (Const (\<^const_name>\<open>All\<close>, _) $ Abs (_, _, t)) = go t
+        | go (Const (\<^const_name>\<open>Ex\<close>, _) $ Abs (_, _, t)) = go t
+        | go _ = false
+  in go_prop prop end
+
 fun should_be_inserted ctxt  =
   let val outter = try Local_Theory.target_of ctxt
       fun is_new name = case outter of NONE => true
                                      | SOME ctxt' => Variable.is_newly_fixed ctxt ctxt' name
    in fn rule =>
+      may_entail_false rule orelse (
       Term.add_free_names rule []
    |> filter is_new
    |> null
-   |> not
+   |> not)
   end
 
 end
@@ -629,6 +643,24 @@ fun assync_prove f (ctxt,sequent) =
            end
   end
 
+fun find_local_may_false ctxt =
+  let
+    val local_facts = Proof_Context.facts_of ctxt
+    val outer_facts = try Local_Theory.target_of ctxt
+                   |> Option.map Proof_Context.facts_of
+                   |> the_list
+  in
+    Facts.dest_static false outer_facts local_facts
+    |> filter (fn ("local.this", _) => false | _ => true)
+    |> get_first (fn (name0, ths) =>
+         get_first (fn th =>
+           let val th' = Thm.transfer' ctxt th
+           in if may_entail_false (Thm.prop_of th')
+              then SOME (Facts.extern ctxt local_facts name0, th')
+              else NONE
+           end) ths)
+  end
+
 fun wrapper f (ctxt,sequent) =
   if Thm.no_prems sequent
   then ("", sequent)
@@ -636,12 +668,18 @@ fun wrapper f (ctxt,sequent) =
     of Const (\<^const_name>\<open>Trueprop\<close>, _) $ \<^const>\<open>True\<close> =>
             ("rule TrueI", @{thm TrueI} RS sequent)
      | _ => if getenv "DEBUG_DISABLE_SH" = "yes"
-            then (* let
-                 val (_, (_, ret)) = eval_prf_str keywords (Time.fromSeconds 3) "safe" (ctxt, sequent)
-              in ("safe", ret)
-             end handle Auto_Fail _ => *)
-                 error "Proof fails and Sledgehammer is disable due to debugging"
-            else f (ctxt,sequent)
+            then error "Proof fails and Sledgehammer is disable due to debugging"
+            else
+              let val (sequent', insert_prefix) =
+                    case find_local_may_false ctxt of
+                      SOME (name, th) =>
+                        (case Seq.pull (Method.insert_tac ctxt [th] 1 sequent) of
+                           SOME (s', _) =>
+                             (s', "insert " ^ Phi_Help.quote_fact name ^ ", ")
+                         | NONE => (sequent, ""))
+                    | NONE => (sequent, "")
+                  val (prf, result) = f (ctxt, sequent')
+              in (insert_prefix ^ prf, result) end
 
 
 val time_delt = Time.fromMilliseconds 1000
@@ -824,6 +862,10 @@ fun run_mepo_and_render timeout ctxt i st =
 
     val selected = Sledgehammer_MePo.mepo_suggested_facts
                      ctxt mepo_dummy_params max_facts NONE hyp_ts concl_t lazy_facts
+    (* MePo treats False/True as invisible connectives, so goals composed entirely
+       of them yield zero features and an empty selection.  Fall back to all local facts. *)
+    val selected = if null selected then map Sledgehammer_Fact.fact_of_lazy_fact lazy_facts
+                   else selected
 
     val sbi = should_be_inserted ctxt
     val (to_insert, to_add) =
