@@ -5,15 +5,13 @@ begin
 section \<open>Unit tests for `mk_proof_candidates`\<close>
 
 text \<open>
-  Tests the pure transformation behind the `auto_sledgehammer_try_parallel_smt_cvc5`
-  option. `mk_proof_candidates` takes a raw Sledgehammer proof string (as extracted
-  from the `dirty_hack` callback) and returns
+  Tests the pure transformation in `mk_proof_candidates`.  It takes a raw
+  Sledgehammer proof string (as extracted from the `dirty_hack` callback) and returns
 
     \<^item> \<open>is_metis\<close>   — whether the tactic head is `metis`
-    \<^item> \<open>metis_prf\<close>  — the canonical proof string preplayed today (same as the
-                    pre-refactor `trans` output)
+    \<^item> \<open>metis_prf\<close>  — the canonical proof string preplayed today
     \<^item> \<open>smt_prf_opt\<close> — the parallel `smt (cvc5) \<dots>` variant (always present
-                     when \<open>is_metis\<close> holds; the call site gates on the config)
+                     when \<open>is_metis\<close> holds; call sites gate on \<open>smt_oracle\<close>)
 \<close>
 
 ML \<open>

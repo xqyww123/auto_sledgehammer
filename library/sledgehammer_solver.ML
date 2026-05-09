@@ -16,13 +16,12 @@ val assync_proof : bool Config.T
 
 val sledgehammer_params : string Config.T
 val classical_prover_timeout : int Config.T
-val try_parallel_smt_cvc5 : bool Config.T
 
 (* Exposed for testing: given a raw Sledgehammer proof string (e.g. "by (metis foo bar)"),
    tokenize, strip any leading `using` keyword, detect whether the tactic head is `metis`,
    and produce both the canonical proof string (as used today) and a `smt (cvc5) …`
-   variant when applicable. Does NOT consult the `try_parallel_smt_cvc5` config — the
-   smt variant is always returned when `is_metis` holds; call sites gate on the config. *)
+   variant when applicable. The smt variant is always returned when `is_metis` holds;
+   call sites gate on `smt_oracle` before actually evaluating it. *)
 val mk_proof_candidates :
       string -> {is_metis : bool, metis_prf : string, smt_prf_opt : string option}
 
@@ -56,6 +55,9 @@ val auto_raw : bool -> Sledgehammer.fact_override -> Phi_Cache_DB.proof_id optio
 val fast_mepo_max_facts : int Config.T
 val fast_mepo_tac : Time.time -> Proof.context -> int -> tactic
 
+val eval_prf_str_stat : Keyword.keywords -> int -> (unit -> string * Proof.state) option
+                     -> string -> Proof.state -> string * Proof.state
+
 end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
@@ -74,8 +76,6 @@ val sledgehammer_params_fixed = [("isar_proofs", "false")]
 
 val sledgehammer_params = Attrib.setup_config_string \<^binding>\<open>auto_sledgehammer_params\<close> (K "")
 val preplay_timeout = Attrib.setup_config_int \<^binding>\<open>auto_sledgehammer_preplay_timeout\<close> (K 10)
-val try_parallel_smt_cvc5 =
-  Attrib.setup_config_bool \<^binding>\<open>auto_sledgehammer_try_parallel_smt_cvc5\<close> (K false)
 
 fun get_sledgehammer_params ctxt =
   Config.get ctxt sledgehammer_params
@@ -524,6 +524,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
       val sledgehammer_params = get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
       val pptimeout = Config.get ctxt preplay_timeout
+      val try_cvc5 = Config.get ctxt SMT_Config.oracle
       val group = Future.new_group (Future.worker_group ())
       val effective_timeout = case timeout_opt of
             SOME t => SOME t
@@ -563,9 +564,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
               val preplay_succeeded = is_some (CharVector.findi (fn (i,c) => i > i4 andalso c = #"(") s)
               val {is_metis = _, metis_prf = prf, smt_prf_opt = raw_smt_opt} =
                     mk_proof_candidates s_prf
-              val smt_prf_opt =
-                    if Config.get (Proof.context_of stat) try_parallel_smt_cvc5
-                    then raw_smt_opt else NONE
+              val smt_prf_opt = if try_cvc5 then raw_smt_opt else NONE
               val _ = tracing s
               fun eval_future () =
                 let val candidates = prf :: (case smt_prf_opt of SOME s => [s] | NONE => [])
