@@ -8,6 +8,7 @@ ML_file \<open>library/helpers0.ML\<close>
 ML_file \<open>library/Hasher.ML\<close>
 ML_file \<open>library/cache_file.ML\<close>
 ML_file \<open>library/split.ML\<close>
+ML_file \<open>library/looping_simp.ML\<close>
 ML_file \<open>library/sledgehammer_solver.ML\<close>
 
 
