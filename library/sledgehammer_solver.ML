@@ -770,28 +770,15 @@ end
 
 (** MePo-guided fastforce **)
 
-local
-
-val mepo_dummy_params = {
-  debug = false, verbose = false, overlord = false, spy = false,
-  provers = [], abduce = NONE, falsify = NONE, type_enc = NONE,
-  strict = false, lam_trans = NONE, uncurried_aliases = NONE,
-  learn = false, fact_filter = NONE, induction_rules = NONE,
-  max_facts = NONE, fact_thresholds = (0.45, 0.85),
-  max_mono_iters = NONE, max_new_mono_instances = NONE,
-  max_proofs = 1, isar_proofs = NONE, compress = NONE,
-  try0 = false, smt_proofs = false, minimize = false,
-  slices = 1, timeout = Time.fromSeconds 5,
-  preplay_timeout = Time.fromSeconds 1, expect = ""
-} : Sledgehammer_Prover.params
-
-fun local_facts_as_mepo_lazy_facts ctxt =
+fun facts_as_mepo_lazy_facts local_only ctxt =
   let
     val transfer = Thm.transfer' ctxt
     val local_facts = Proof_Context.facts_of ctxt
-    val outer_facts = try Local_Theory.target_of ctxt
-                   |> Option.map Proof_Context.facts_of
-                   |> the_list
+    val outer_facts =
+      if local_only
+      then try Local_Theory.target_of ctxt
+           |> Option.map Proof_Context.facts_of |> the_list
+      else []
     val named_locals = Facts.dest_static false outer_facts local_facts
                     |> filter (fn ("local.this", _) => false | _ => true)
   in
@@ -812,9 +799,24 @@ fun local_facts_as_mepo_lazy_facts ctxt =
     ) named_locals
   end
 
+local
+
+val mepo_dummy_params = {
+  debug = false, verbose = false, overlord = false, spy = false,
+  provers = [], abduce = NONE, falsify = NONE, type_enc = NONE,
+  strict = false, lam_trans = NONE, uncurried_aliases = NONE,
+  learn = false, fact_filter = NONE, induction_rules = NONE,
+  max_facts = NONE, fact_thresholds = (0.45, 0.85),
+  max_mono_iters = NONE, max_new_mono_instances = NONE,
+  max_proofs = 1, isar_proofs = NONE, compress = NONE,
+  try0 = false, smt_proofs = false, minimize = false,
+  slices = 1, timeout = Time.fromSeconds 5,
+  preplay_timeout = Time.fromSeconds 1, expect = ""
+} : Sledgehammer_Prover.params
+
 (* Render the cached Isar method string from MePo's selection.
    to_insert / to_add are (name_string, thm) pairs. The name strings produced
-   by `local_facts_as_mepo_lazy_facts`'s `get_name ()` are already valid Isar
+   by `facts_as_mepo_lazy_facts`'s `get_name ()` are already valid Isar
    fact references in all three shapes it can produce:
      - "name"           — singleton bundle
      - "name(N)"        — j-th member of an N-member bundle (valid Isar selector)
@@ -822,26 +824,35 @@ fun local_facts_as_mepo_lazy_facts ctxt =
    and the cartouche content is pre-stripped of YXML markup by
    `hackish_string_of_term` inside `Sledgehammer_Fact.cartouche_thm`. So we
    can splice the name strings directly into the generated method text. *)
-fun render_fast_mepo_proof to_insert to_add =
+fun render_fast_mepo_proof to_insert to_add del_pairs =
   let
     val ithm = if null to_insert then ""
                else "insert " ^ space_implode " " (map fst to_insert) ^ ", "
-    fun clause label ty =
+    fun clause label ty pairs =
           map_filter (fn (name, th) =>
-            if infer_type_of_rule name th = ty then SOME name else NONE) to_add
+            if infer_type_of_rule name th = ty then SOME name else NONE) pairs
        |> (fn [] => ""
             | L => " " ^ label ^ ": " ^ space_implode " " L)
-    val simps  = clause "simp"  T_SIMP
-    val unkns  = clause "simp"  T_UNKNOWN  (* modifier_of true T_UNKNOWN = simp_add *)
-    val intros = clause "intro" T_INTRO
-    val elims  = clause "elim"  T_ELIM
-    val dests  = clause "dest"  T_DEST
-    val congs  = clause "cong"  T_CONG
-    val splits = clause "split" T_SPLIT
-    val iffs   = clause "iff"   T_IFF
+    val simps  = clause "simp"  T_SIMP  to_add
+    val unkns  = clause "simp"  T_UNKNOWN to_add
+    val intros = clause "intro" T_INTRO to_add
+    val elims  = clause "elim"  T_ELIM  to_add
+    val dests  = clause "dest"  T_DEST  to_add
+    val congs  = clause "cong"  T_CONG  to_add
+    val splits = clause "split" T_SPLIT to_add
+    val iffs   = clause "iff"   T_IFF   to_add
+    val dsimps  = clause "simp del"  T_SIMP  del_pairs
+    val dcongs  = clause "cong del"  T_CONG  del_pairs
+    val dsplits = clause "split del" T_SPLIT del_pairs
+    val diffs   = clause "iff del"   T_IFF   del_pairs
+    val del_gen = map_filter (fn (name, th) =>
+        let val ty = infer_type_of_rule name th
+        in if ty = T_INTRO orelse ty = T_ELIM orelse ty = T_DEST orelse ty = T_UNKNOWN
+           then SOME name else NONE end) del_pairs
+      |> (fn [] => "" | L => " del: " ^ space_implode " " L)
   in
     String.concat ["(", ithm, "fastforce", simps, unkns, intros, elims, dests,
-                   congs, splits, iffs, ")"]
+                   congs, splits, iffs, dsimps, dcongs, dsplits, diffs, del_gen, ")"]
   end
 
 in
@@ -849,28 +860,38 @@ in
 (* Run MePo + fastforce on the i-th subgoal. On success returns the proved
    sequent, the rendered Isar replay string, and the fastforce-only elapsed
    time (NOT including MePo selection time, since the cache replay only
-   re-runs fastforce, not MePo). On failure raises Auto_Fail. *)
-fun run_mepo_and_render timeout ctxt i st =
+   re-runs fastforce, not MePo). On failure raises Auto_Fail.
+   lazy_facts: pool for MePo selection (empty = skip MePo).
+   extra_pairs: user-provided (name, thm) pairs always included.
+   del_pairs: user-provided del facts applied to base context. *)
+fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt i st =
   let
-    val max_facts = Config.get ctxt fast_mepo_max_facts
-    val lazy_facts = local_facts_as_mepo_lazy_facts ctxt
+    val ctxt = fold (fn (name, th) => fn c =>
+      with_rule false name th (Context.Proof c) |> Context.proof_of) del_pairs ctxt
 
-    val goal_term = Logic.get_goal (Thm.prop_of st) i
-    val hyp_ts = Logic.strip_assums_hyp goal_term
-    val concl_t = Logic.strip_assums_concl goal_term
+    val mepo_pairs =
+      if null lazy_facts then []
+      else
+        let
+          val goal_term = Logic.get_goal (Thm.prop_of st) i
+          val hyp_ts = Logic.strip_assums_hyp goal_term
+          val concl_t = Logic.strip_assums_concl goal_term
+          val selected = Sledgehammer_MePo.mepo_suggested_facts
+                           ctxt mepo_dummy_params max_facts NONE hyp_ts concl_t lazy_facts
+          val selected = if null selected
+                         then map Sledgehammer_Fact.fact_of_lazy_fact lazy_facts
+                         else selected
+        in map (fn ((name, _), th) => (name, th)) selected end
 
-    val selected = Sledgehammer_MePo.mepo_suggested_facts
-                     ctxt mepo_dummy_params max_facts NONE hyp_ts concl_t lazy_facts
-    (* MePo treats False/True as invisible connectives, so goals composed entirely
-       of them yield zero features and an empty selection.  Fall back to all local facts. *)
-    val selected = if null selected then map Sledgehammer_Fact.fact_of_lazy_fact lazy_facts
-                   else selected
+    val all_pairs =
+      let val extra_thms = map snd extra_pairs
+          fun is_extra th = exists (fn e => Thm.eq_thm_prop (th, e)) extra_thms
+      in filter (fn (_, th) => not (is_extra th)) mepo_pairs @ extra_pairs end
 
-    val selected_pairs = map (fn ((name, _), th) => (name, th)) selected
     val (safe_pairs, ctxt) =
       Looping_Simp.pass_looping_simps
         {only_check_local = false, ignore_cond = false, local_ignore_cond = false}
-        ctxt selected_pairs
+        ctxt all_pairs
 
     val sbi = should_be_inserted ctxt
     val (to_insert, to_add) =
@@ -896,7 +917,7 @@ fun run_mepo_and_render timeout ctxt i st =
       NONE => raise Auto_Fail Application_Fails
     | SOME (st', _) =>
         let val elapsed = Time.- (Time.now (), start)
-            val prf_str = render_fast_mepo_proof to_insert to_add
+            val prf_str = render_fast_mepo_proof to_insert to_add del_pairs
         in (st', prf_str, elapsed) end
   end
 
@@ -918,29 +939,33 @@ fun replay_mepo_proof kws timeout i prf (ctxt, st) =
 
 fun fast_mepo_tac timeout ctxt i st =
   if Thm.nprems_of st < i then Seq.empty
-  else if not (Config.get ctxt Phi_Cache_DB.enable_proof_cache) then
-    ((case run_mepo_and_render timeout ctxt i st of
-        (st', _, _) => Seq.single st')
-     handle Auto_Fail _ => Seq.empty
-          | Timeout.TIMEOUT _ => Seq.empty)
   else
-    let
-      val thy = Proof_Context.theory_of ctxt
-      val kws = Keyword.no_major_keywords (Thy_Header.get_keywords thy)
-
-      fun evaluator t prf cs =
-            SOME (replay_mepo_proof kws t i prf cs)
-            handle Auto_Fail _ => NONE
-                 | Timeout.TIMEOUT _ => NONE
-
-      fun fallback _ =
-            let val (st', prf_str, elapsed) = run_mepo_and_render timeout ctxt i st
-             in ((elapsed, prf_str), (ctxt, st')) end
-    in
-      ((case Phi_Cache_DB.try_cached_proof_by_hash_at i evaluator fallback (ctxt, st) of
-          (_, (_, st')) => Seq.single st')
+    let val max_facts = Config.get ctxt fast_mepo_max_facts
+        val lazy_facts = facts_as_mepo_lazy_facts true ctxt
+        fun run () = run_mepo_and_render timeout max_facts lazy_facts [] [] ctxt i st
+    in if not (Config.get ctxt Phi_Cache_DB.enable_proof_cache) then
+      ((case run () of (st', _, _) => Seq.single st')
        handle Auto_Fail _ => Seq.empty
             | Timeout.TIMEOUT _ => Seq.empty)
+    else
+      let
+        val thy = Proof_Context.theory_of ctxt
+        val kws = Keyword.no_major_keywords (Thy_Header.get_keywords thy)
+
+        fun evaluator t prf cs =
+              SOME (replay_mepo_proof kws t i prf cs)
+              handle Auto_Fail _ => NONE
+                   | Timeout.TIMEOUT _ => NONE
+
+        fun fallback _ =
+              let val (st', prf_str, elapsed) = run ()
+               in ((elapsed, prf_str), (ctxt, st')) end
+      in
+        ((case Phi_Cache_DB.try_cached_proof_by_hash_at i evaluator fallback (ctxt, st) of
+            (_, (_, st')) => Seq.single st')
+         handle Auto_Fail _ => Seq.empty
+              | Timeout.TIMEOUT _ => Seq.empty)
+      end
     end
 
 end
@@ -1067,84 +1092,57 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
       fun bare_hammer () =
           hammer raw_override ("-", stat)
 
+      fun expand_fact_refs origin =
+        let
+          fun nth_iv' i (Facts.FromTo (j,k) :: L) =
+                if i < k-j+1 then SOME [Facts.Single (j+i)]
+                else nth_iv' (i - (k-j+1)) L
+            | nth_iv' i [Facts.From j] = SOME [Facts.Single (j+i)]
+            | nth_iv' i (Facts.Single j :: L) = nth_iv' i (Facts.FromTo (j,j) :: L)
+            | nth_iv' _ _ = NONE
+          fun nth_iv N i iv =
+            if i + 1 = N then NONE
+            else case iv
+              of NONE => SOME [Facts.Single (i+1)]
+               | SOME ivs => ivs |> sort iv_ord |> nth_iv' i
+        in
+          maps (fn (ths, (Facts.Named ((name, pos), iv), atts)) =>
+              let val N = length ths
+              in map_index (fn (i, th) =>
+                  (restore_ref' (Facts.Named ((name, pos), nth_iv N i iv), atts), th)
+                ) ths
+              end
+            | ([th], (fact_ref, atts)) => [(restore_ref' (fact_ref, atts), th)]
+            | _ => []) origin
+        end
+
       fun fastforce () =
-        let val ctxt = Proof.context_of stat
-            fun nth_iv' i (Facts.FromTo (j,k) :: L) =
-                  if i < k-j+1
-                  then SOME [Facts.Single (j+i)]
-                  else nth_iv' (i - (k-j+1)) L
-              | nth_iv' i [Facts.From j] = SOME [Facts.Single (j+i)]
-              | nth_iv' i (Facts.Single j :: L) = nth_iv' i (Facts.FromTo (j,j) :: L)
-              | nth_iv' _ _ = error "BUG SH fastforce() nth_iv"
-            
-            fun nth_iv N i iv =
-                  if i + 1 = N then NONE
-                  else case iv
-                    of NONE => SOME [Facts.Single (i+1)]
-                     | SOME ivs => ivs
-                                |> sort iv_ord
-                                |> nth_iv' i
-            val type_of_thms = maps (
-                  fn (ths, (Facts.Named ((name, pos), iv), atts)) =>
-                      let val N = length ths
-                       in map_index (fn (i,th) =>
-                            (infer_type_of_rule name th,
-                             (Facts.Named ((name, pos), nth_iv N i iv), atts))
-                          ) ths
-                      end
-                   | ([th], fact as (Facts.Fact _, _)) =>
-                        [(infer_type_of_rule "" th, fact)]
-                   | _ => error "BUG SH fastforce() 2"
-                    )
-            val thms = type_of_thms OA
-            val dthms= type_of_thms origin_del
-            val simps  = map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) thms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " simp: " ^ space_implode " " (map restore_ref' L))
-            val intros = map_filter (fn (ty, x) => if ty = T_INTRO then SOME x else NONE) thms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L => " intro: " ^ space_implode " " (map restore_ref' L))
-            val elims  = map_filter (fn (ty, x) => if ty = T_ELIM then SOME x else NONE) thms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " elim: " ^ space_implode " " (map restore_ref' L))
-            val dests  = map_filter (fn (ty, x) => if ty = T_DEST then SOME x else NONE) thms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " dest: " ^ space_implode " " (map restore_ref' L))
-            val congs  = map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) thms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " cong: " ^ space_implode " " (map restore_ref' L))
-            val splits = map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) thms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L => " split: " ^ space_implode " " (map restore_ref' L))
-            val iffs   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) thms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>   " iff: " ^ space_implode " " (map restore_ref' L))
+        let
+          val ctxt = Proof.context_of stat
+          val st = #goal (Proof.goal stat)
 
-            val dsimps= map_filter (fn (ty, x) => if ty = T_SIMP then SOME x else NONE) dthms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " simp del: " ^ space_implode " " (map restore_ref' L))
-            val dcongs= map_filter (fn (ty, x) => if ty = T_CONG then SOME x else NONE) dthms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " cong del: " ^ space_implode " " (map restore_ref' L))
-            val dsplits= map_filter (fn (ty, x) => if ty = T_SPLIT then SOME x else NONE) dthms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " split del: " ^ space_implode " " (map restore_ref' L))
-            val diff   = map_filter (fn (ty, x) => if ty = T_IFF then SOME x else NONE) dthms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " iff del: " ^ space_implode " " (map restore_ref' L))
-            val del    = map snd dthms
-                      |> merge_facts ctxt
-                      |> (fn [] => "" | L =>  " del: " ^ space_implode " " (map restore_ref' L))
+          val user_add = expand_fact_refs origin_add
+          val user_del = expand_fact_refs origin_del
 
+          val local_lazy = facts_as_mepo_lazy_facts true ctxt
+          val all_lazy = Lazy.lazy (fn () => facts_as_mepo_lazy_facts false ctxt)
 
-            val src = String.concat ["(",
-                        ithm, "fastforce", simps, intros, elims, dests, congs, splits, iffs,
-                        dsimps, dcongs, dsplits, diff, del,
-                      ")"]
-         in (* tracing src
-          ; *) eval_prf_str_stat kws 5 NONE src (
-                Proof.map_context (Context_Position.set_visible false) stat)
-         |> apsnd (#goal o Proof.goal)
+          fun try_stage timeout max_mf lazy_facts =
+            let val (st', prf_str, _) =
+                  run_mepo_and_render (Time.fromSeconds timeout)
+                    max_mf lazy_facts user_add user_del ctxt 1 st
+            in SOME (prf_str, st') end
+            handle Auto_Fail _ => NONE | Timeout.TIMEOUT _ => NONE
+        in
+          case try_stage 6  0  []
+           of SOME r => r | NONE =>
+          case try_stage 10 12 local_lazy
+           of SOME r => r | NONE =>
+          case try_stage 15 24 (Lazy.force all_lazy)
+           of SOME r => r | NONE =>
+          case try_stage 15 50 (Lazy.force all_lazy)
+           of SOME r => r | NONE =>
+          raise Auto_Fail Application_Fails
         end
 
       fun smt () =
