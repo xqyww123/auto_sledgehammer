@@ -866,13 +866,19 @@ fun run_mepo_and_render timeout ctxt i st =
     val selected = if null selected then map Sledgehammer_Fact.fact_of_lazy_fact lazy_facts
                    else selected
 
+    val selected_pairs = map (fn ((name, _), th) => (name, th)) selected
+    val (safe_pairs, ctxt) =
+      Looping_Simp.pass_looping_simps
+        {only_check_local = false, ignore_cond = false, local_ignore_cond = false}
+        ctxt selected_pairs
+
     val sbi = should_be_inserted ctxt
     val (to_insert, to_add) =
-      fold_rev (fn ((name, _), th) => fn (ins, add) =>
+      fold_rev (fn (name, th) => fn (ins, add) =>
         if sbi (Thm.prop_of th)
         then ((name, th) :: ins, add)
         else (ins, (name, th) :: add)
-      ) selected ([], [])
+      ) safe_pairs ([], [])
 
     val ctxt' = fold (fn (name, th) => fn c =>
       with_rule true name th (Context.Proof c) |> Context.proof_of

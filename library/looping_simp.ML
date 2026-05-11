@@ -1,6 +1,13 @@
 signature LOOPING_SIMP = sig
   type config = {only_check_local: bool, ignore_cond: bool, local_ignore_cond: bool}
   val simp_rule_may_loop : config -> Proof.context -> term -> bool
+  val thms_to_once_simprocs : Proof.context -> thm list -> simproc list
+
+  (* Pre-process a list of (name, thm) facts: remove looping simp rules and
+     install them as once-firing simprocs in the returned context.
+     Non-equation facts and non-looping equations pass through unchanged. *)
+  val pass_looping_simps : config -> Proof.context -> (string * thm) list
+                         -> (string * thm) list * Proof.context
 end
 
 structure Looping_Simp : LOOPING_SIMP = struct
@@ -59,5 +66,33 @@ fun simp_rule_may_loop (cfg: config) ctxt prop =
                   orelse (not (#local_ignore_cond cfg) orelse has_local))
          andalso (not (#only_check_local cfg) orelse has_local)
       end
+
+fun thms_to_once_simprocs ctxt (thms: thm list) : simproc list =
+  let
+    val meta_rules = maps (Raw_Simplifier.mksimps ctxt) thms
+    fun mk_once (i, rule) =
+      let
+        val fired = Unsynchronized.ref false
+        val (lhs, _) = Logic.dest_equals
+              (Logic.strip_imp_concl (Thm.prop_of rule))
+        fun proc _ _ =
+          if !fired then NONE
+          else (fired := true; SOME rule)
+      in
+        SOME (Simplifier.make_simproc ctxt
+          { name = "once_simproc_" ^ string_of_int i,
+            lhss = [lhs],
+            proc = K proc,
+            identifier = [] })
+      end handle TERM _ => NONE
+  in map_filter I (map_index mk_once meta_rules) end
+
+fun pass_looping_simps cfg ctxt facts =
+  let
+    val (looping, safe) = List.partition (fn (_, th) =>
+        simp_rule_may_loop cfg ctxt (Thm.prop_of th)) facts
+    val simprocs = thms_to_once_simprocs ctxt (map snd looping)
+    val ctxt' = ctxt addsimprocs simprocs
+  in (safe, ctxt') end
 
 end
