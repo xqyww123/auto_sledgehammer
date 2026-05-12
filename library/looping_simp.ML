@@ -25,29 +25,20 @@ in
   fun var_perm (t, u) = vperm (t, u) andalso Vars.eq_set (apply2 vars_set (t, u))
 end
 
-fun matches_subterm_of thy pat (t as (f $ x)) =
-      ((Pattern.match thy (pat, t) (Vartab.empty, Vartab.empty); true)
-       handle Pattern.MATCH =>
-         matches_subterm_of thy pat f orelse matches_subterm_of thy pat x)
-  | matches_subterm_of thy pat (Abs (_, _, body)) =
-      ((Pattern.match thy (pat, body) (Vartab.empty, Vartab.empty); true)
-       handle Pattern.MATCH => matches_subterm_of thy pat body)
-  | matches_subterm_of thy pat t =
-      (Pattern.match thy (pat, t) (Vartab.empty, Vartab.empty); true)
-      handle Pattern.MATCH => false
-
 fun dest_simp_eq prop =
   let
-    fun go prems (\<^Const>\<open>Pure.imp\<close> $ P $ Q) = go (P :: prems) Q
-      | go prems (\<^Const>\<open>Pure.all _\<close> $ Abs (_, _, body)) = go prems body
-      | go prems (\<^Const>\<open>Trueprop\<close> $ X) = go_obj prems X
-      | go prems (\<^Const>\<open>Pure.eq _\<close> $ lhs $ rhs) = SOME (rev prems, lhs, rhs)
-      | go _ _ = NONE
-    and go_obj prems (\<^Const>\<open>HOL.implies\<close> $ P $ Q) = go_obj (P :: prems) Q
-      | go_obj prems (\<^Const>\<open>HOL.All _\<close> $ Abs (_, _, body)) = go_obj prems body
-      | go_obj prems (\<^Const>\<open>HOL.eq _\<close> $ lhs $ rhs) = SOME (rev prems, lhs, rhs)
-      | go_obj _ _ = NONE
-  in go [] prop end
+    fun go bvs prems (\<^Const>\<open>Pure.imp\<close> $ P $ Q) = go bvs (P :: prems) Q
+      | go bvs prems (\<^Const>\<open>Pure.all _\<close> $ Abs (name, T, body)) =
+          go ((name, T) :: bvs) prems body
+      | go bvs prems (\<^Const>\<open>Trueprop\<close> $ X) = go_obj bvs prems X
+      | go bvs prems (\<^Const>\<open>Pure.eq _\<close> $ lhs $ rhs) = SOME (bvs, rev prems, lhs, rhs)
+      | go _ _ _ = NONE
+    and go_obj bvs prems (\<^Const>\<open>HOL.implies\<close> $ P $ Q) = go_obj bvs (P :: prems) Q
+      | go_obj bvs prems (\<^Const>\<open>HOL.All _\<close> $ Abs (name, T, body)) =
+          go_obj ((name, T) :: bvs) prems body
+      | go_obj bvs prems (\<^Const>\<open>HOL.eq _\<close> $ lhs $ rhs) = SOME (bvs, rev prems, lhs, rhs)
+      | go_obj _ _ _ = NONE
+  in go [] [] prop end
 
 fun has_local_free_vars ctxt t =
   if Local_Theory.level ctxt = 0
@@ -57,10 +48,11 @@ fun has_local_free_vars ctxt t =
 fun simp_rule_may_loop (cfg: config) ctxt prop =
   case dest_simp_eq prop of
     NONE => false
-  | SOME (prems, lhs, rhs) =>
+  | SOME (bvs, prems, lhs, rhs) =>
       let val thy = Proof_Context.theory_of ctxt
           val has_local = has_local_free_vars ctxt lhs orelse has_local_free_vars ctxt rhs
-      in matches_subterm_of thy lhs rhs
+          val closed_lhs = Term.subst_bounds (map Free bvs, lhs)
+      in PLPR_Pattern.matches_subterm_of thy bvs closed_lhs rhs
          andalso not (var_perm (lhs, rhs))
          andalso (null prems orelse #ignore_cond cfg
                   orelse (not (#local_ignore_cond cfg) orelse has_local))

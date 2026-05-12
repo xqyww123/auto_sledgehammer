@@ -119,6 +119,7 @@ fun dest_eq (\<^Const>\<open>Trueprop\<close> $ X) = dest_eq X
   | dest_eq (\<^Const>\<open>Pure.eq _\<close> $ A $ B) = SOME (A,B)
   | dest_eq (\<^Const>\<open>HOL.implies\<close> $ _ $ X) = dest_eq X
   | dest_eq (\<^Const>\<open>HOL.All _\<close> $ Abs (_, _, X)) = dest_eq X
+  | dest_eq (Const (\<^const_name>\<open>Pure.imp\<close>, _) $ _ $ X) = dest_eq X
   | dest_eq _ = NONE
 
 val chk_simp = is_some o dest_eq
@@ -892,7 +893,6 @@ fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt 
       Looping_Simp.pass_looping_simps
         {only_check_local = false, ignore_cond = false, local_ignore_cond = false}
         ctxt all_pairs
-
     val sbi = should_be_inserted ctxt
     val (to_insert, to_add) =
       fold_rev (fn (name, th) => fn (ins, add) =>
@@ -1174,7 +1174,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
    of SOME (prf, sequent') =>
         if hasty
         then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
-        else eval_prf_str kws Time.zeroTime prf (ctxt,sequent)
+        else eval_prf_str kws (Time.fromSeconds 180) prf (ctxt,sequent)
     | NONE => (case !failed_subgoal
                  of SOME t => raise Auto_Fail (Subgoal_Fail t)
                   | NONE => raise Auto_Fail Application_Fails)
