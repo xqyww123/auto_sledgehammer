@@ -1020,11 +1020,14 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
                                   raise Auto_Fail Too_Many_Subgoals)
                             else ()
 
+          val iter_timeout = Option.map (fn t => t + Time.fromSeconds 120) timeout_opt
+
           val (prfs, final_state) =
             funpow' N (fn j => fn (ps,s) =>
                         let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
-                            val (p',s') = case raw_sledgehammer timeout_opt override hasty s
+                            fun do_iter () =
+                            case raw_sledgehammer timeout_opt override hasty s
                                             of NONE =>
                                   let val subgoal_raw = hd (Thm.prems_of (#goal (Proof.raw_goal s)))
                                       val params = Logic.strip_params subgoal_raw
@@ -1063,6 +1066,9 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
                                    in raise Auto_Fail Application_Fails
                                   end
                                | SOME prf => prf
+                            val (p',s') = case iter_timeout
+                                  of SOME t => Timeout.apply t do_iter ()
+                                   | NONE => do_iter ()
                          in (p'::ps, s') end)
                      ((if prf0 = "" then [] else [prf0]),stat0)
     
