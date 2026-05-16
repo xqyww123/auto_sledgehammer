@@ -156,12 +156,26 @@ fun chk_cong th =
        | _ => false
 
 fun lower_name name =
-  let fun chk _ []  = NONE
-        | chk N [#"I"] = if N >= 2 then SOME T_INTRO else NONE
-        | chk N [#"E"] = if N >= 2 then SOME T_ELIM  else NONE
-        | chk N [#"D"] = if N >= 2 then SOME T_DEST  else NONE
-        | chk N (c::cs) = if Char.isUpper c then chk 0 cs else chk (N+1) cs
-   in chk 0 (String.explode name)
+  let val len = size name
+   in if len < 3 then NONE
+   else let
+      val last = String.sub (name, len - 1)
+      val (suffix_len, result) =
+            if last = #"I" then
+              if String.sub (name, len - 2) = #"C" then (2, T_INTRO) else (1, T_INTRO)
+            else if last = #"E" then (1, T_ELIM)
+            else if last = #"D" then (1, T_DEST)
+            else (0, T_UNKNOWN)
+    in if suffix_len = 0 then NONE
+    else let
+      val stop = len - suffix_len
+      val N = Unsynchronized.ref 0
+      val i = Unsynchronized.ref 0
+    in while !i < stop do (
+         if Char.isUpper (String.sub (name, !i)) then N := 0 else N := !N + 1;
+         i := !i + 1);
+       if !N >= 2 then SOME result else NONE
+    end end
   end
 
 in
@@ -852,7 +866,8 @@ fun render_fast_mepo_proof to_insert to_add del_pairs =
            then SOME name else NONE end) del_pairs
       |> (fn [] => "" | L => " del: " ^ space_implode " " L)
   in
-    String.concat ["(", ithm, "fastforce", simps, unkns, intros, elims, dests,
+    String.concat ["(", ithm, "fastforce del: disjCI insertCI intro: disjCI insertCI",
+                   simps, unkns, intros, elims, dests,
                    congs, splits, iffs, dsimps, dcongs, dsplits, diffs, del_gen, ")"]
   end
 
@@ -902,9 +917,16 @@ fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt 
         else (ins, (name, th) :: add)
       ) safe_pairs ([], [])
 
+    val ctxt' = Context.Proof ctxt
+      |> (fn gc => Thm.apply_attribute Classical.rule_del @{thm disjCI} gc |> snd)
+      |> (fn gc => Thm.apply_attribute Classical.rule_del @{thm insertCI} gc |> snd)
+      |> (fn gc => Thm.apply_attribute (Classical.unsafe_intro NONE) @{thm disjCI} gc |> snd)
+      |> (fn gc => Thm.apply_attribute (Classical.unsafe_intro NONE) @{thm insertCI} gc |> snd)
+      |> Context.proof_of
+
     val ctxt' = fold (fn (name, th) => fn c =>
       with_rule true name th (Context.Proof c) |> Context.proof_of
-    ) to_add ctxt
+    ) to_add ctxt'
 
     val insert_thms = map snd to_insert
 
