@@ -1,5 +1,6 @@
 signature LOOPING_SIMP = sig
-  type config = {only_check_local: bool, ignore_cond: bool, local_ignore_cond: bool}
+  type config = {only_check_local: bool, ignore_cond: bool, local_ignore_cond: bool,
+                 schematize_local_frees: bool}
   val simp_rule_may_loop : config -> Proof.context -> term -> bool
   val thms_to_once_simprocs : Proof.context -> thm list -> simproc list
 
@@ -12,7 +13,8 @@ end
 
 structure Looping_Simp : LOOPING_SIMP = struct
 
-type config = {only_check_local: bool, ignore_cond: bool, local_ignore_cond: bool}
+type config = {only_check_local: bool, ignore_cond: bool, local_ignore_cond: bool,
+               schematize_local_frees: bool}
 
 local
   fun vperm (Var _, Var _) = true
@@ -45,14 +47,33 @@ fun has_local_free_vars ctxt t =
   then Term.exists_subterm is_Free t
   else not (null (Variable.add_newly_fixed ctxt (Local_Theory.target_of ctxt) t []))
 
+fun schematize_local_frees ctxt pat0 =
+  let
+    val is_keep =
+      if Local_Theory.level ctxt > 0
+      then Variable.is_fixed (Local_Theory.target_of ctxt)
+      else K false
+    val frees = Term.add_frees pat0 []
+    val idx = maxidx_of_term pat0 + 1
+    val (_, subst) = fold (fn (n, T) => fn (i, acc) =>
+      if is_keep n then (i, acc)
+      else (i + 1, (Free (n, T), Var ((n, i), T)) :: acc))
+      frees (idx, [])
+  in Term.subst_free subst pat0 end
+
 fun simp_rule_may_loop (cfg: config) ctxt prop =
   case dest_simp_eq prop of
     NONE => false
   | SOME (bvs, prems, lhs, rhs) =>
       let val thy = Proof_Context.theory_of ctxt
           val has_local = has_local_free_vars ctxt lhs orelse has_local_free_vars ctxt rhs
-          val closed_lhs = Term.subst_bounds (map Free bvs, lhs)
-      in PLPR_Pattern.matches_subterm_of thy bvs closed_lhs rhs
+          val idx = maxidx_of_term lhs + 1
+          val closed_lhs = Term.subst_bounds
+                (map_index (fn (i, (n, T)) => Var ((n, idx + i), T)) bvs, lhs)
+          val pat = if #schematize_local_frees cfg
+                    then schematize_local_frees ctxt closed_lhs
+                    else closed_lhs
+      in PLPR_Pattern.matches_subterm_of thy bvs pat rhs
          andalso not (var_perm (lhs, rhs))
          andalso (null prems orelse #ignore_cond cfg
                   orelse (not (#local_ignore_cond cfg) orelse has_local))

@@ -891,7 +891,8 @@ fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt 
 
     val (safe_pairs, ctxt) =
       Looping_Simp.pass_looping_simps
-        {only_check_local = false, ignore_cond = false, local_ignore_cond = false}
+        {only_check_local = false, ignore_cond = false, local_ignore_cond = false,
+         schematize_local_frees = false}
         ctxt all_pairs
     val sbi = should_be_inserted ctxt
     val (to_insert, to_add) =
