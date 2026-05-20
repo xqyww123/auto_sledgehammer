@@ -1214,6 +1214,7 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
   let
     val id = case id of SOME some => some
                       | _ => Hasher.goal (ctxt,sequent)
+    val sequent = Pre_Simproc.pre_simproc_on_concl ctxt sequent
     val hasty = Config.get ctxt hasty_mode
 
     val thy = Proof_Context.theory_of ctxt
