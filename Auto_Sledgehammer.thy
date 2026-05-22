@@ -10,6 +10,24 @@ ML_file \<open>library/cache_file.ML\<close>
 ML_file \<open>library/split.ML\<close>
 ML_file \<open>library/looping_simp.ML\<close>
 ML_file \<open>library/pre_simproc.ML\<close>
+
+lemma strip_Trueprop_eq: \<open>(Trueprop P \<equiv> Trueprop Q) \<Longrightarrow> P \<equiv> Q\<close>
+unfolding atomize_eq
+proof rule
+  assume A: \<open>Trueprop P \<equiv> Trueprop Q\<close>
+     and B: P
+  from B[unfolded A]
+  show "Q" .
+next
+  assume A: \<open>Trueprop P \<equiv> Trueprop Q\<close>
+     and B: Q
+  show "P"
+    unfolding A
+    using B .
+qed
+
+ML_file \<open>library/ground_eval.ML\<close>
+
 ML_file \<open>library/sledgehammer_solver.ML\<close>
 
 
