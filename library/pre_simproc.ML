@@ -1,4 +1,5 @@
 structure Pre_Simproc : sig
+  val simplify_timeout_seconds : int Config.T
   datatype scope = Everywhere | Concl_Only
   type entry = {name: string, pattern: term,
                 proc: Proof.context -> cterm -> thm option, scope: scope}
@@ -10,6 +11,8 @@ structure Pre_Simproc : sig
   (* For HAMMER/auto_sledgehammer: ALL entries on conclusion only *)
   val pre_simproc_on_concl : Proof.context -> thm -> thm
 end = struct
+
+val simplify_timeout_seconds = Config.declare_int ("Pre_Simproc.simplify_timeout_seconds", \<^here>) (K 10)
 
 datatype scope = Everywhere | Concl_Only
 
