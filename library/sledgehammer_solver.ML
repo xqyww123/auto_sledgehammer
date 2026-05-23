@@ -62,6 +62,23 @@ end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
 
+local
+  val log_path_ref: Path.T option Unsynchronized.ref = Unsynchronized.ref NONE
+  fun get_log_path () =
+    case !log_path_ref of
+      SOME p => p
+    | NONE =>
+        let val home = getenv "ISABELLE_HOME_USER"
+            val dir = Path.append (Path.explode home) (Path.basic "logs")
+            val _ = Isabelle_System.make_directory dir
+            val p = Path.append dir (Path.basic "auto_sledgehammer.log")
+            val _ = log_path_ref := SOME p
+        in p end
+in
+  fun sh_log msg =
+    \<^try>\<open>File.append (get_log_path ()) (msg ^ "\n") catch _ => ()\<close>
+end
+
 (*** Preliminaries ***)
 
 (** Options **)
@@ -399,10 +416,10 @@ fun eval_prf_str _ timeout "" (ctxt,sequent) =
             Position.setmp_thread_data Position.none auto_obligation_solver1)
          ) (ctxt,sequent) |> apfst (fn {elapsed=time,...} => (time,""))
          catch Timeout.TIMEOUT _               => raise Auto_Fail Timeout
-                  |  err => (tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
+                  |  err => (sh_log ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
                              raise Auto_Fail Unknown)\<close>
   | eval_prf_str kws timeout prf (ctxt,sequent) = \<^try>\<open>
-      let val _ = tracing ("[eval_prf_str] replaying: " ^ quote prf)
+      let val _ = sh_log ("[eval_prf_str] replaying: " ^ quote prf)
           val protected = Goal.protect 1 sequent
           val seq =
             Method.evaluate (
@@ -419,7 +436,7 @@ fun eval_prf_str _ timeout "" (ctxt,sequent) =
               | _ => raise Auto_Fail Application_Fails
       end catch Timeout.TIMEOUT _ => raise Auto_Fail Timeout
               | Auto_Fail err => Exn.reraise (Auto_Fail err)
-              | err => (tracing ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
+              | err => (sh_log ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
                                  Runtime.exn_message err);
                          raise Auto_Fail Unknown) \<close>
 
@@ -435,11 +452,11 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
            | _ => case F_None of SOME f => f()
                                | NONE => raise Auto_Fail Application_Fails)
         catch Timeout.TIMEOUT _ => (
-          tracing "The proof fails due to timeout. Re-searching proofs...";
+          sh_log "The proof fails due to timeout. Re-searching proofs...";
           raise Auto_Fail Timeout)
             | Auto_Fail reason => raise Auto_Fail reason
             | err => (
-          tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
+          sh_log ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
           raise Auto_Fail Unknown) \<close>
     end
 
@@ -572,7 +589,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
             fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
             val inds = find #"\^E" s
          in if length inds < 4
-            then tracing s
+            then sh_log s
             else let
               val i2 = List.nth (inds, 1)
               val i3 = List.nth (inds, 2)
@@ -582,7 +599,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
               val {is_metis = _, metis_prf = prf, smt_prf_opt = raw_smt_opt} =
                     mk_proof_candidates s_prf
               val smt_prf_opt = if try_cvc5 then raw_smt_opt else NONE
-              val _ = tracing s
+              val _ = sh_log s
               fun eval_future () =
                 let val candidates = prf :: (case smt_prf_opt of SOME s => [s] | NONE => [])
                     val new_futures = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
@@ -607,7 +624,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
       val watchdog = Option.map (fn dl =>
             Event_Timer.request {physical = true} (Time.now () + dl) (fn () =>
               if not (Synchronized.value found_proof)
-              then (tracing "no proof found. give up in advance"; Future.cancel_group group)
+              then (sh_log "no proof found. give up in advance"; Future.cancel_group group)
               else ()))
           deadline
 
@@ -1041,7 +1058,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
           val N = Thm.nprems_of (@{print} (#goal (Proof.raw_goal stat0)))
           val Ns = string_of_int N
 
-          val _ = if N > 30 then (tracing ("The prompt generates too many subgoals (" ^
+          val _ = if N > 30 then (sh_log ("The prompt generates too many subgoals (" ^
                                     string_of_int N ^ "). give up...");
                                   raise Auto_Fail Too_Many_Subgoals)
                             else ()
@@ -1050,7 +1067,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
 
           val (prfs, final_state) =
             funpow' N (fn j => fn (ps,s) =>
-                        let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
+                        let val _ = sh_log ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
                             fun do_iter () =
                             case raw_sledgehammer timeout_opt override hasty s
@@ -1207,7 +1224,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
         if hasty
         then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
         else let val composed = "Auto_Sledgehammer.pre_simproc_on_concl, " ^ prf
-                 val _ = tracing ("[sledgehammer] verifying composed proof: " ^ quote composed)
+                 val _ = sh_log ("[sledgehammer] verifying composed proof: " ^ quote composed)
               in eval_prf_str kws (Time.fromSeconds 180) composed (ctxt,sequent)
              end
     | NONE => (case !failed_subgoal
@@ -1228,23 +1245,23 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
 
     fun try_cached_proof fallback =
      (case Phi_Cache_DB.get_cached_proof thy id
-        of NONE => (tracing ("[auto'i] cache MISS for id " ^ quote id); fallback true)
+        of NONE => (sh_log ("[auto'i] cache MISS for id " ^ quote id); fallback true)
          | SOME (time,prf) =>
-            let val _ = tracing ("[auto'i] cache HIT for id " ^ quote id ^
+            let val _ = sh_log ("[auto'i] cache HIT for id " ^ quote id ^
                                  ", replaying: " ^ quote prf)
                 val nprem = Thm.nprems_of sequent
                 val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
              in (case eval_prf_str kws (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
                    of (_, (_, sequent')) =>
                       if Thm.nprems_of sequent' < nprem
-                      then (tracing "[auto'i] cache replay OK"; (prf, sequent'))
+                      then (sh_log "[auto'i] cache replay OK"; (prf, sequent'))
                       else raise Auto_Fail Subgoal_unsolved )
                 handle Auto_Fail _ =>
-                  (tracing "[auto'i] cache replay FAILED, re-searching"; fallback false)
+                  (sh_log "[auto'i] cache replay FAILED, re-searching"; fallback false)
             end )
 
     fun update_cache hash (prf', (ctxt, sequent')) = (
-           tracing (
+           sh_log (
               "Find proof (" ^ id ^ ", time: " ^ Value.print_time (fst prf') ^ "): " ^
                (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
            ) ;
@@ -1264,7 +1281,7 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
             tracing "Proof search by default tactic fails. Invoking sledgehammer..."; *)
             sledgehammer timeout_opt improved hasty kws override (ctxt, sequent) )
       handle Timeout.TIMEOUT _ => (
-        tracing "Proof search by default tactic times out. Invoking sledgehammer...";
+        sh_log "Proof search by default tactic times out. Invoking sledgehammer...";
         sledgehammer timeout_opt improved hasty kws override (ctxt, sequent) )
 
     in if not (Config.get ctxt Phi_Cache_DB.enable_proof_cache)
@@ -1285,7 +1302,7 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
           val prf_result =
                 case prf_result' of SOME ret => ret
                    | NONE => (if no_cache
-                              then (tracing ("Proof cache miss, " ^ id))
+                              then (sh_log ("Proof cache miss, " ^ id))
                               else (warning "A cached proof fails. Re-searching proofs...";
                                     Phi_Cache_DB.invalidate_proof_cache (not no_cache) id thy) ;
                               find_proof ())
