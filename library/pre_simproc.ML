@@ -104,3 +104,10 @@ val _ = Theory.setup (
             THEN Clasimp.mk_auto_tac ctxt m n)))))
     "pre-simproc preprocessing followed by auto"
 )
+
+val _ = Theory.setup (
+  Method.setup \<^binding>\<open>pre_simproc_on_concl\<close>
+    (Scan.succeed (fn ctxt =>
+       SIMPLE_METHOD (PRIMITIVE (Pre_Simproc.pre_simproc_on_concl ctxt))))
+    "apply pre-simproc simplifications to the conclusion of subgoal 1"
+)

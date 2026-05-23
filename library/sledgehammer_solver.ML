@@ -402,10 +402,11 @@ fun eval_prf_str _ timeout "" (ctxt,sequent) =
                   |  err => (tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
                              raise Auto_Fail Unknown)\<close>
   | eval_prf_str kws timeout prf (ctxt,sequent) = \<^try>\<open>
-      let val protected = Goal.protect 1 sequent
+      let val _ = tracing ("[eval_prf_str] replaying: " ^ quote prf)
+          val protected = Goal.protect 1 sequent
           val seq =
             Method.evaluate (
-              Parse.read_embedded ctxt kws Method.parse (Input.string prf)
+              Parse.read_embedded ctxt kws (Method.parser 0) (Input.string prf)
                 |> fst
                 |> Method.check_text ctxt
               ) ctxt [] (ctxt, protected)
@@ -418,7 +419,8 @@ fun eval_prf_str _ timeout "" (ctxt,sequent) =
               | _ => raise Auto_Fail Application_Fails
       end catch Timeout.TIMEOUT _ => raise Auto_Fail Timeout
               | Auto_Fail err => Exn.reraise (Auto_Fail err)
-              | err => (tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
+              | err => (tracing ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
+                                 Runtime.exn_message err);
                          raise Auto_Fail Unknown) \<close>
 
 
@@ -1022,6 +1024,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
       val need_standard = need_standard_tac ctxt sequent
 
       val stat = Proof.theorem NONE (K I) [[(goal_term, [])]] ctxt
+                 |> Proof.refine_primitive Pre_Simproc.pre_simproc_on_concl
 
       fun eval_prf_strs_stat [] _ = raise Auto_Fail Application_Fails
         | eval_prf_strs_stat [prf] stat = eval_prf_str_stat kws 30 NONE prf stat
@@ -1203,7 +1206,10 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
    of SOME (prf, sequent') =>
         if hasty
         then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
-        else eval_prf_str kws (Time.fromSeconds 180) prf (ctxt,sequent)
+        else let val composed = "Auto_Sledgehammer.pre_simproc_on_concl, " ^ prf
+                 val _ = tracing ("[sledgehammer] verifying composed proof: " ^ quote composed)
+              in eval_prf_str kws (Time.fromSeconds 180) composed (ctxt,sequent)
+             end
     | NONE => (case !failed_subgoal
                  of SOME t => raise Auto_Fail (Subgoal_Fail t)
                   | NONE => raise Auto_Fail Application_Fails)
@@ -1214,7 +1220,6 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
   let
     val id = case id of SOME some => some
                       | _ => Hasher.goal (ctxt,sequent)
-    val sequent = Pre_Simproc.pre_simproc_on_concl ctxt sequent
     val hasty = Config.get ctxt hasty_mode
 
     val thy = Proof_Context.theory_of ctxt
@@ -1223,16 +1228,19 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
 
     fun try_cached_proof fallback =
      (case Phi_Cache_DB.get_cached_proof thy id
-        of NONE => fallback true
+        of NONE => (tracing ("[auto'i] cache MISS for id " ^ quote id); fallback true)
          | SOME (time,prf) =>
-            let val nprem = Thm.nprems_of sequent
+            let val _ = tracing ("[auto'i] cache HIT for id " ^ quote id ^
+                                 ", replaying: " ^ quote prf)
+                val nprem = Thm.nprems_of sequent
                 val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
              in (case eval_prf_str kws (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
                    of (_, (_, sequent')) =>
                       if Thm.nprems_of sequent' < nprem
-                      then (prf, sequent')
+                      then (tracing "[auto'i] cache replay OK"; (prf, sequent'))
                       else raise Auto_Fail Subgoal_unsolved )
-                handle Auto_Fail _ => fallback false
+                handle Auto_Fail _ =>
+                  (tracing "[auto'i] cache replay FAILED, re-searching"; fallback false)
             end )
 
     fun update_cache hash (prf', (ctxt, sequent')) = (
@@ -1259,7 +1267,10 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
         tracing "Proof search by default tactic times out. Invoking sledgehammer...";
         sledgehammer timeout_opt improved hasty kws override (ctxt, sequent) )
 
-    in try_cached_proof (fn no_cache' => (let
+    in if not (Config.get ctxt Phi_Cache_DB.enable_proof_cache)
+       then let val ((_, prf'), (_, sequent')) = find_proof ()
+             in (prf', sequent') end
+       else try_cached_proof (fn no_cache' => (let
           val hash = Hasher.goal (ctxt,sequent)
           val (no_cache, prf_result') =
                 case Phi_Cache_DB.access_hash_cache hash
