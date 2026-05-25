@@ -251,7 +251,7 @@ fun clean_hash_cache () =
 
 fun update_cache_by_hash hash prf' (ctxt, sequent') = (
        tracing (
-          "Find proof (" ^ hash ^ ", time: " ^ Value.print_time (fst prf') ^ "): " ^
+          "Find proof (" ^ hash ^ ", time: " ^ Time.toString (fst prf') ^ "): " ^
            (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
        ) ;
        update_hash_cache hash prf';
