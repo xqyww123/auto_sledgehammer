@@ -94,6 +94,7 @@ fun thms_to_once_simprocs ctxt (thms: thm list) : simproc list =
       in
         SOME (Simplifier.make_simproc ctxt
           { name = "once_simproc_" ^ string_of_int i,
+            kind = Simproc,
             lhss = [lhs],
             proc = K proc,
             identifier = [] })

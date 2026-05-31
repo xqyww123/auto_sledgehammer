@@ -46,7 +46,7 @@ fun smart_split_tac ctxt = SUBGOAL (fn (goal, i) =>
   end)
 
 fun add_smart_split ctxt =
-  ctxt addloop ("smart_split", smart_split_tac)
+  Simplifier.add_loop ("smart_split", smart_split_tac) ctxt
 
 val _ = Theory.setup
   (Method.setup \<^binding>\<open>auto_split\<close>
