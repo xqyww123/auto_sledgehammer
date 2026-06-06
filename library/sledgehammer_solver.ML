@@ -118,6 +118,16 @@ fun error_message ctxt sequent =
 
 datatype type_of_rule = T_SIMP | T_INTRO | T_ELIM | T_DEST | T_CONG | T_SPLIT | T_IFF | T_UNKNOWN
 
+(* True iff the theorem's proposition mentions any class-membership constraint
+   OFCLASS(_, _) anywhere (conclusion or premises). Such "of class" theorems
+   (e.g. `*_class.super`, `*.intro_of_class`) have a raw Pure-prop conclusion
+   `OFCLASS(?'a, c_class)` rather than `Trueprop (_::bool)`; they are useless to
+   object-level proof search and, fed into `Simpdata.mk_eq` (via `chk_split` /
+   `infer_type_of_rule`), make its `RS Eq_TrueI` fallback raise a raw
+   `THM "RSN: no unifiers"`. We drop them at every fact entry point. *)
+fun is_of_class_thm th =
+  Term.exists_subterm (fn t => can Logic.dest_of_class t) (Thm.prop_of th)
+
 fun chk_elim th =
   case Thm.concl_of th
     of \<^Const>\<open>Trueprop\<close> $ (Var C) =>
@@ -146,7 +156,9 @@ fun chk_split thm =
       (case strip_comb t of
         (Const p, _) => true
       | _ => false)
-  | _ => false);
+  | _ => false)
+  handle THM _ => false;  (* Simpdata.mk_eq's `RS Eq_TrueI` fallback fails on
+                             non-Trueprop (e.g. OFCLASS) conclusions *)
 
 local
 
@@ -831,6 +843,7 @@ fun facts_as_mepo_lazy_facts local_only ctxt =
         end
       ) ths end
     ) named_locals
+    |> filter_out (fn (_, th) => is_of_class_thm th)  (* drop OFCLASS lemmas *)
   end
 
 local
@@ -1020,8 +1033,11 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
 
       val pass_thms  = filter (can (Attrib.eval_thms ctxt) o single)
       val pass_thms' = map_filter (fn th => try (rpair th o Attrib.eval_thms ctxt) [th])
-      val origin_add = pass_thms' (#add override0)
-      val origin_del = pass_thms' (#del override0)
+      (* silently discard user-supplied OFCLASS lemmas at this entry point *)
+      val drop_of_class =
+        filter_out (fn (ths, _) => not (null ths) andalso List.all is_of_class_thm ths)
+      val origin_add = drop_of_class (pass_thms' (#add override0))
+      val origin_del = drop_of_class (pass_thms' (#del override0))
 
       val sbi = should_be_inserted ctxt
       val (ithms, sthms, OA) = fold_rev (fn (th', th) => fn (I,S,OA) =>
