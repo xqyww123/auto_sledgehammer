@@ -157,8 +157,10 @@ fun chk_split thm =
         (Const p, _) => true
       | _ => false)
   | _ => false)
-  handle THM _ => false;  (* Simpdata.mk_eq's `RS Eq_TrueI` fallback fails on
+  handle THM _ => false   (* Simpdata.mk_eq's `RS Eq_TrueI` fallback fails on
                              non-Trueprop (e.g. OFCLASS) conclusions *)
+       | TERM _ => false; (* fastype_of: Bound when mk_eq decomposes a quantified
+                             fact whose body has loose de Bruijn indices *)
 
 local
 
@@ -915,7 +917,8 @@ in
 fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt i st =
   let
     val ctxt = fold (fn (name, th) => fn c =>
-      with_rule false name th (Context.Proof c) |> Context.proof_of) del_pairs ctxt
+      (with_rule false name th (Context.Proof c) |> Context.proof_of)
+      handle TERM _ => c) del_pairs ctxt
 
     val mepo_pairs =
       if null lazy_facts then []
@@ -957,7 +960,8 @@ fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt 
       |> Context.proof_of
 
     val ctxt' = fold (fn (name, th) => fn c =>
-      with_rule true name th (Context.Proof c) |> Context.proof_of
+      (with_rule true name th (Context.Proof c) |> Context.proof_of)
+      handle TERM _ => c
     ) to_add ctxt'
 
     val insert_thms = map snd to_insert
@@ -968,7 +972,8 @@ fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt 
     val start = Time.now ()
   in
     case Timeout.apply timeout (fn () => Seq.pull (fastforce_branch ())) ()
-              handle Timeout.TIMEOUT _ => NONE of
+              handle Timeout.TIMEOUT _ => NONE
+                   | TERM _ => NONE of
       NONE => raise Auto_Fail Application_Fails
     | SOME (st', _) =>
         let val elapsed = Time.- (Time.now (), start)
