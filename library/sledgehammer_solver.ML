@@ -343,9 +343,12 @@ fun string_of_proof_method ss meth =
   let
     val meth_s =
       (case meth of
-        Metis_Method (NONE, NONE) => "metis"
-      | Metis_Method (type_enc_opt, lam_trans_opt) =>
-        "metis (" ^ commas (map_filter I [type_enc_opt, lam_trans_opt]) ^ ")"
+        Metis_Method (NONE, NONE, additional_fact_names) =>
+        space_implode " " ("metis" :: additional_fact_names)
+      | Metis_Method (type_enc_opt, lam_trans_opt, additional_fact_names) =>
+        space_implode " "
+          (("metis (" ^ commas (map_filter I [type_enc_opt, lam_trans_opt]) ^ ")")
+            :: additional_fact_names)
       | Meson_Method => "meson"
       | SMT_Method SMT_Z3 => "smt (z3)"
       | SMT_Method (SMT_Verit strategy) =>
@@ -386,10 +389,10 @@ fun one_line_proof_text (used_facts, meth, subgoal_count) =
 end
 
 val silence_state =
-      Proof.map_contexts (Try0.silence_methods false #> Config.put SMT_Config.verbose false)
+      Proof.map_contexts (Try0_HOL.silence_methods #> Config.put SMT_Config.verbose false)
 
 val debug_state =
-      Proof.map_contexts (Try0.silence_methods false #> Config.put SMT_Config.verbose true
+      Proof.map_contexts (Try0_HOL.silence_methods #> Config.put SMT_Config.verbose true
           #> Config.put SMT_Config.trace true #> Config.put SMT_Config.statistics true )
 
 fun time_ord (t1 : Time.time, t2) =
@@ -858,9 +861,9 @@ val mepo_dummy_params = {
   max_facts = NONE, fact_thresholds = (0.45, 0.85),
   max_mono_iters = NONE, max_new_mono_instances = NONE,
   max_proofs = 1, isar_proofs = NONE, compress = NONE,
-  try0 = false, smt_proofs = false, minimize = false,
+  try0 = false, smt_proofs = false, instantiate = NONE, minimize = false,
   slices = 1, timeout = Time.fromSeconds 5,
-  preplay_timeout = Time.fromSeconds 1, expect = ""
+  preplay_timeout = Time.fromSeconds 1, expect = "", cache_dir = NONE
 } : Sledgehammer_Prover.params
 
 (* Render the cached Isar method string from MePo's selection.
@@ -1283,7 +1286,7 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
 
     fun update_cache hash (prf', (ctxt, sequent')) = (
            sh_log (
-              "Find proof (" ^ id ^ ", time: " ^ Value.print_time (fst prf') ^ "): " ^
+              "Find proof (" ^ id ^ ", time: " ^ Time.toString (fst prf') ^ "): " ^
                (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
            ) ;
            Phi_Cache_DB.update_hash_cache hash prf';
