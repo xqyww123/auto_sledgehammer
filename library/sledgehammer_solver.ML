@@ -212,23 +212,37 @@ fun lower_name name =
 in
 
 fun infer_type_of_rule name th =
-  if String.isSuffix "_intro" name orelse
-     String.isSuffix ".intro" name
+  if String.isSuffix "_intro"  name orelse
+     String.isSuffix ".intro"  name orelse
+     String.isSuffix "_intros" name orelse
+     String.isSuffix ".intros" name
      then T_INTRO
-  else if String.isSuffix "_elim" name orelse
-          String.isSuffix ".elim" name
+  else if String.isSuffix "_elim"  name orelse
+          String.isSuffix ".elim"  name orelse
+          String.isSuffix "_elims" name orelse
+          String.isSuffix ".elims" name
        then T_ELIM
-  else if String.isSuffix "_simp"  name orelse
-          String.isSuffix ".simp"  name orelse
-          String.isSuffix "_simps" name orelse
-          String.isSuffix ".simps" name orelse
-          String.isSuffix "_iff"   name
+  else if String.isSuffix "_simp"   name orelse
+          String.isSuffix ".simp"   name orelse
+          String.isSuffix "_simps"  name orelse
+          String.isSuffix ".simps"  name orelse
+          String.isSuffix "_iff"    name orelse
+          String.isSuffix "_unfold" name
        then T_SIMP
   else if String.isSuffix "_def" name then T_IFF
-  else if String.isSuffix ".splits" name then T_SPLIT
+  else if String.isSuffix "_split"     name orelse
+          String.isSuffix ".split"     name orelse
+          String.isSuffix "_splits"    name orelse
+          String.isSuffix ".splits"    name orelse
+          String.isSuffix "_split_asm" name orelse
+          String.isSuffix ".split_asm" name
+       then T_SPLIT
   else if String.isSuffix "_dest" name orelse
           String.isSuffix ".dest" name
        then T_DEST
+  else if String.isSuffix "_cong" name orelse
+          String.isSuffix ".cong" name
+       then T_CONG
   else if chk_cong th then T_CONG
   else if chk_split th then T_SPLIT
   else if chk_elim th then T_ELIM
