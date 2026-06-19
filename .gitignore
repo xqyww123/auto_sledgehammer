@@ -16,3 +16,5 @@ src/__pycache__/
 test_1/log
 test_1/test_1_Proof_Server.thy
 Auto_Sledgehammer_Doc.proof-cache
+*.proof-cache.lock
+*.proof-cache.tmp
