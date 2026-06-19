@@ -237,12 +237,18 @@ fun read_file_state path =
         else Symtab.empty
     end
 
-(* Atomically write the proof table as a fresh new-format file (tmp + rename). *)
+(* process id, used to make the compaction temp file unique across processes *)
+val proc_pid = SysWord.toString (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))
+
+(* Atomically write the proof table as a fresh new-format file (tmp + rename).
+   The temp file name carries the pid so two processes compacting the same
+   theory never write the same temp path (they are already serialised by the
+   fcntl lock, but a unique name removes that dependence). *)
 fun write_state_new path proofs =
   let val payload =
         String.concat (Symtab.fold (fn (k,(t,v)) => fn acc =>
                           encode_put (k, Time.toMilliseconds t, v) :: acc) proofs [])
-      val tmp = Path.ext "tmp" path
+      val tmp = Path.ext ("tmp." ^ proc_pid) path
    in File.write tmp payload;
       OS.FileSys.rename {old = File.platform_path tmp, new = File.platform_path path}
   end
@@ -362,13 +368,19 @@ fun store_cache thy = compact_cache thy
 fun store_and_close_cache thy =
   Synchronized.change openning_caches (Symtab.delete_safe (Context.theory_name {long=true} thy))
 
+(* Drop the data file and reset the in-memory entry as ONE per-theory critical
+   section (under the same `v` that serialises appends), so a concurrent append
+   cannot slip between the disk-rm and the memory-reset. Lock order here is
+   v -> fcntl -> openning_caches; nothing acquires v while holding
+   openning_caches, so there is no cycle. *)
 fun invalidate_cache thy =
- (Synchronized.change openning_caches
-    (Symtab.update (Context.theory_name {long=true} thy, (empty_cache, true)));
-  Synchronized.change (theory_append_var (Context.theory_name {long=true} thy)) (fn _ =>
+  let val name = Context.theory_name {long=true} thy in
+  Synchronized.change (theory_append_var name) (fn _ =>
     (with_file_lock (lock_path thy) (fn () =>
        if File.is_file (cache_path thy) then File.rm (cache_path thy) else ());
-     false)))
+     Synchronized.change openning_caches (Symtab.update (name, (empty_cache, true)));
+     false))
+  end
 
 fun get_cached_proof thy = Symtab.lookup (#proofs (get_cache thy))
 
@@ -426,10 +438,12 @@ fun check_cache doc_id ctxt =
 
 
 (* At theory end, compact the append log (dedup + drop superseded/tombstoned
-   records, upgrade legacy). Appends are already durable, so we only defer the
-   COMPACTION behind any still-running async proof tasks -- this also prevents a
-   late async append (after store_and_close) from resurrecting the closed theory
-   into openning_caches. *)
+   records). Appends are already durable, so we only defer the COMPACTION behind
+   still-running async proof tasks REGISTERED via register_async_task: it lets
+   those tasks' appends land before we rewrite. A late append from a registered
+   task after store_and_close still goes to disk durably; it would re-insert a
+   stale in-memory openning_caches entry (harmless, dropped next load) -- the
+   deferral keeps that from happening for the registered tasks. *)
 val _ = Theory.setup (Theory.at_end (fn thy => (
   let val tasks = #async_tasks (get_cache thy)
     in if null tasks then (compact_cache thy; store_and_close_cache thy)
