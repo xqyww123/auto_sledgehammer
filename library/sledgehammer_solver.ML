@@ -1238,6 +1238,16 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
          |> apsnd (#goal o Proof.goal)
         end
 
+      (* Ground-evaluation backend: if the goal is variable-free, try to close
+         it by code evaluation (the same oracle AoA's Compute uses).  The
+         oracle itself rejects non-ground / non-executable goals, so this fails
+         fast and cheaply otherwise. *)
+      fun ground () =
+        let val src = "ground_eval"
+         in eval_prf_str_stat kws 5 NONE src stat
+         |> apsnd (#goal o Proof.goal)
+        end
+
       fun simp () =
         let val src = "(insert " ^ athms ^ ", simp)"
             val n0 = Thm.nprems_of (#goal (Proof.goal stat))
@@ -1249,6 +1259,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
 
       val prf = if improved
         then Par_List.get_some (fn F => SOME (F ()) handle Auto_Fail _ => NONE) [
+            ground,
             hammer',
             bare_hammer,
             fastforce,

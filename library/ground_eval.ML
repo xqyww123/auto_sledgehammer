@@ -6,6 +6,7 @@ structure Eval_Thunk_Data = Proof_Data(
 structure Ground_Eval : sig
   val is_ground : term -> bool
   val eval_ground : int -> Proof.context -> cterm -> thm option
+  val eval_ground_tac : int -> Proof.context -> int -> tactic
 end = struct
 
 fun has_typ_vars_or_frees t =
@@ -112,4 +113,34 @@ fun eval_ground seconds ctxt ct =
      else NONE
   end
 
+(* Discharge a ground (variable-free) leading goal by code evaluation.
+   Reuses the same code-evaluation oracle as AoA's Compute operation: the goal
+   conclusion is evaluated; if it reduces to True, the goal is closed; otherwise
+   (False, non-ground, or non-executable) the tactic fails and other backends
+   take over. *)
+fun eval_ground_tac secs ctxt =
+  CSUBGOAL (fn (csubgoal, i) =>
+    case Thm.term_of csubgoal of
+      \<^Const_>\<open>Trueprop\<close> $ _ =>
+        let val cP = Thm.dest_arg csubgoal in
+          case eval_ground secs ctxt cP of
+            SOME meta_eq =>
+              if Thm.term_of (Thm.rhs_of meta_eq) = \<^Const>\<open>True\<close>
+              then resolve_tac ctxt
+                     [(meta_eq RS @{thm meta_eq_to_obj_eq}) RS @{thm eqTrueE}] i
+              else no_tac
+          | NONE => no_tac
+        end
+    | _ => no_tac)
+
 end
+
+val ground_eval_timeout =
+  Attrib.setup_config_int \<^binding>\<open>ground_eval_timeout\<close> (K 10)
+
+val _ = Theory.setup (
+  Method.setup \<^binding>\<open>ground_eval\<close>
+    (Scan.succeed (fn ctxt =>
+       SIMPLE_METHOD' (Ground_Eval.eval_ground_tac
+                         (Config.get ctxt ground_eval_timeout) ctxt)))
+    "discharge a ground (variable-free) goal by code evaluation (oracle)")
