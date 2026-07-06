@@ -617,16 +617,25 @@ fun raw_sledgehammer timeout_opt override hasty stat =
         else
         let val _ = if String.isSubstring "found a proof" s
                     then Synchronized.change found_proof (K true) else ()
-            fun find c s = CharVector.foldri (fn (i, c', ret) => if c' = c then i :: ret else ret) [] s
-            val inds = find #"\^E" s
-         in if length inds < 4
-            then sh_log s
-            else let
-              val i2 = List.nth (inds, 1)
-              val i3 = List.nth (inds, 2)
-              val i4 = List.nth (inds, 3)
-              val s_prf = String.substring (s, i2+1, i3 - 1 -i2)
-              val preplay_succeeded = is_some (CharVector.findi (fn (i,c) => i > i4 andalso c = #"(") s)
+            fun tree_text (XML.Elem (_, ts)) = String.concat (map tree_text ts)
+              | tree_text (XML.Text t) = t
+            fun find_sendback (XML.Elem ((name, _), ts)) =
+                  if name = Markup.sendbackN then SOME (String.concat (map tree_text ts))
+                  else get_first find_sendback ts
+              | find_sendback (XML.Text _) = NONE
+         (* Isabelle2025-2: the proof command lives inside a `sendback` markup
+            element (Active.sendback_markup_command); the old 2nd/3rd-ENQ slice
+            now lands on an inserted `Markup.break " "` (a single space).
+            Non-suggestion messages ("... found a proof ...", "Duplicate proof")
+            carry no sendback element and are just logged. *)
+         in case get_first find_sendback (YXML.parse_body s)
+            of NONE => sh_log s
+             | SOME s_prf => let
+              (* preplay time suffix "(NN ms)"/"(NN s)": a "(" followed by a digit.
+                 Proof-command parens ("(metis ...", "(smt ...") are followed by a
+                 letter, so this reliably detects a successful preplay. *)
+              val preplay_succeeded = is_some (CharVector.findi (fn (i, c) =>
+                    c = #"(" andalso i + 1 < size s andalso Char.isDigit (String.sub (s, i + 1))) s)
               val {is_metis = _, metis_prf = prf, smt_prf_opt = raw_smt_opt} =
                     mk_proof_candidates s_prf
               val smt_prf_opt = if try_cvc5 then raw_smt_opt else NONE
