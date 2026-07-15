@@ -736,7 +736,9 @@ fun find_local_may_false ctxt =
 
 fun wrapper f (ctxt,sequent) =
   if Thm.no_prems sequent
-  then ("", sequent)
+  (* "-", not "": `""` already means "proved by classical automation" (see the
+     reports below) and does not parse as a method, so it cannot be replayed. *)
+  then ("-", sequent)
   else case Thm.major_prem_of sequent
     of Const (\<^const_name>\<open>Trueprop\<close>, _) $ \<^const>\<open>True\<close> =>
             ("rule TrueI", @{thm TrueI} RS sequent)
