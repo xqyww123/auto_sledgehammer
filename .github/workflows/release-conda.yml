@@ -1,0 +1,265 @@
+# Release this repo as the conda package `auto-sledgehammer` on
+# https://conda.qiyuan.me.
+#
+# This repo owns its own release: bump ./VERSION, push a `v*` tag, done.  The only thing
+# it does not own is the R2 publish step, which is shared with every other Isabelle conda
+# package via a reusable workflow in xqyww123/isabelle-packaging-ci -- so the
+# channel-indexing rules exist in exactly one place.
+#
+# The R2 CREDENTIALS cannot be centralised the same way: a reusable workflow receives the
+# CALLING repo's secrets, and a personal account has no org-level secrets.  They must be
+# set on THIS repo (see the `publish` job below) and are passed explicitly, never with
+# `secrets: inherit`.
+name: release-conda
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "conda build number - BUMP if republishing the same VERSION with changed content"
+        type: string
+        default: "0"
+  push:
+    tags: ['v*']
+
+# Two releases of THIS package must never overlap.  (Overlap with a DIFFERENT package's
+# release is handled in publish-conda.yml, which can only ever add to the channel.)
+concurrency:
+  group: release-conda
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "Build auto-sledgehammer (noarch)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Read the version from ./VERSION"
+        id: ver
+        run: |
+          set -euo pipefail
+          v="$(tr -d '[:space:]' < VERSION)"
+          # conda versions may not contain '-'; catch a bad VERSION here rather than in a
+          # confusing rattler-build error.
+          case "$v" in
+            ''|*-*) echo "::error::VERSION is '$v' -- must be non-empty and contain no '-'"; exit 1 ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "building auto-sledgehammer $v"
+
+      - name: "The tag must agree with ./VERSION"
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$tag" = "${{ steps.ver.outputs.version }}" ] || {
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION=${{ steps.ver.outputs.version }}"
+            exit 1; }
+
+          # `concurrency: release-conda` above holds at most ONE pending run: pushing
+          # several accumulated tags at once (git push --tags) makes each new pending run
+          # supersede the previous one, so every tag but the first and the last is
+          # dropped -- and a superseded run renders grey, not red, so nothing notifies.
+          # Refuse to pass quietly in that state.  Do NOT "fix" it by keying the
+          # concurrency group on github.ref: that would let two releases of this package
+          # publish concurrently, which is exactly what the group exists to prevent.
+          git fetch --tags --force --quiet
+          newest="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+          [ "$newest" = "$GITHUB_REF_NAME" ] || {
+            echo "::error::$GITHUB_REF_NAME is not the newest v* tag (newest is $newest)."
+            echo "          Releases are serialised, so pushing several tags at once drops"
+            echo "          the middle ones.  Release one tag at a time, then re-run this."
+            exit 1; }
+
+      - name: Install rattler-build
+        run: |
+          set -euo pipefail
+          # Downloaded directly: installing it through conda goes via a proxy that
+          # intercepts conda-forge and fails TLS.
+          curl -fsSL -o /tmp/rattler-build \
+            https://github.com/prefix-dev/rattler-build/releases/download/v0.69.1/rattler-build-x86_64-unknown-linux-musl
+          chmod +x /tmp/rattler-build
+          /tmp/rattler-build --version
+
+      - name: Build the package
+        env:
+          ISA_COMPONENT_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          /tmp/rattler-build build \
+            --recipe conda/recipe.yaml \
+            --output-dir "$GITHUB_WORKSPACE/out" \
+            --build-num "${{ inputs.build_number || '0' }}" \
+            --no-test
+          echo "===== built ====="
+          find "$GITHUB_WORKSPACE/out" -name '*.conda' -printf '  %10s  %p\n'
+
+      - name: "Sanity: the package really contains the session and BOTH hook sets"
+        run: |
+          set -euo pipefail
+          pkg=$(find "$GITHUB_WORKSPACE/out" -name 'auto-sledgehammer-*.conda' | head -1)
+          [ -n "$pkg" ] || { echo "::error::no package was produced"; exit 1; }
+
+          # A .conda is a zip of two zstd tarballs, so listing the zip alone only shows
+          # ['metadata.json', 'pkg-*.tar.zst', 'info-*.tar.zst'] and proves nothing.
+          # Extract the payload and assert the files that actually matter -- above all the
+          # Windows .bat hooks, which no linux smoke test can ever exercise.
+          pip install --quiet zstandard
+          work=$(mktemp -d)
+          # One line on purpose: a heredoc body would have to sit at column 0 to keep
+          # its terminator recognisable, and column 0 ends this YAML block scalar.
+          python3 -c "import sys,zipfile,tarfile,io,zstandard; z=zipfile.ZipFile(sys.argv[1]); b=next(n for n in z.namelist() if n.startswith('pkg-') and n.endswith('.tar.zst')); r=zstandard.ZstdDecompressor().stream_reader(io.BytesIO(z.read(b))); tarfile.open(fileobj=io.BytesIO(r.read())).extractall(sys.argv[2])" "$pkg" "$work"
+          echo "===== payload ====="
+          find "$work" -maxdepth 3 | sort
+
+          for want in \
+            share/auto-sledgehammer/ROOT \
+            share/auto-sledgehammer/Auto_Sledgehammer.thy \
+            bin/.auto-sledgehammer-post-link.sh \
+            bin/.auto-sledgehammer-pre-unlink.sh \
+            Scripts/.auto-sledgehammer-post-link.bat \
+            Scripts/.auto-sledgehammer-pre-unlink.bat ; do
+            [ -e "$work/$want" ] || { echo "::error::missing from the package: $want"; exit 1; }
+            echo "  OK  $want"
+          done
+
+          # The hooks address the component by a path literal; a divergence from where the
+          # files were actually installed builds and installs green and dies later as an
+          # unknown session.  Assert the two agree.
+          grep -qF 'share/auto-sledgehammer' "$work/bin/.auto-sledgehammer-post-link.sh" \
+            || { echo "::error::post-link.sh does not point at the shipped directory"; exit 1; }
+          grep -qF 'share\auto-sledgehammer' "$work/Scripts/.auto-sledgehammer-post-link.bat" \
+            || { echo "::error::post-link.bat does not point at the shipped directory"; exit 1; }
+          # ...and the .bat must be CRLF, or cmd.exe mis-parses it.
+          grep -qU $'\r' "$work/Scripts/.auto-sledgehammer-post-link.bat" \
+            || { echo "::error::post-link.bat is not CRLF"; exit 1; }
+          echo "  OK  hook path literals agree with the install location; .bat is CRLF"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conda-packages
+          path: out/**/*.conda
+          if-no-files-found: error
+
+  # Install and USE the package BEFORE it is published.  Publishing is the point of no
+  # return: publish-conda.yml uploads first and the channel never deletes, so a package
+  # with a broken post-link would become the newest resolvable version and stay broken
+  # until someone hand-deletes the object from R2.  The base repo already gates its
+  # release this way (build.yml Job F installs from a file:// channel); this is the
+  # component-repo equivalent.
+  verify:
+    name: "Verify before publishing: install + build the session"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conda-packages
+          path: ${{ runner.temp }}/pkgs
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+
+      - name: Index the freshly built package into a local channel
+        run: |
+          set -euo pipefail
+          conda install -y -n base -c conda-forge conda-index -q
+          CH="$RUNNER_TEMP/local-channel"
+          mkdir -p "$CH/noarch"
+          find "$RUNNER_TEMP/pkgs" -name '*.conda' -exec cp {} "$CH/noarch/" \;
+          python -m conda_index "$CH" --no-zst --no-bz2 --channeldata --channel-name local
+          echo "CH=$CH" >> "$GITHUB_ENV"
+          ls -l "$CH/noarch/"
+
+      - name: "Install it -- local channel for US, conda.qiyuan.me for the base isabelle"
+        run: |
+          set -euo pipefail
+          # Unlike the base repo we have no local `isabelle` artifact to solve against, so
+          # the run dependency comes from the published channel while the package under
+          # test comes from the local one.  --override-channels keeps conda-forge (which
+          # this stack needs nothing from) out of a proxy that breaks TLS here.
+          conda create -y -n v \
+            -c "file://$CH" -c https://conda.qiyuan.me --override-channels \
+            auto-sledgehammer
+          conda activate v
+          conda list isabelle
+
+      - name: "The post-link registered it"
+        run: |
+          set -euo pipefail
+          conda activate v
+          comp="$(isabelle getenv -b ISABELLE_HOME_USER)/etc/components"
+          cat "$comp"
+          grep -q 'auto-sledgehammer' "$comp" \
+            || { echo "::error::post-link did not register the component"; exit 1; }
+
+      - name: "...and the session builds"
+        run: |
+          set -euo pipefail
+          conda activate v
+          isabelle build -v Auto_Sledgehammer
+
+  publish:
+    needs: verify
+    uses: xqyww123/isabelle-packaging-ci/.github/workflows/publish-conda.yml@main
+    with:
+      artifact: conda-packages
+      package_name: auto-sledgehammer
+    # Passed explicitly, NOT `inherit`.  A reusable workflow receives the CALLING repo's
+    # secrets, and `inherit` silently forwards empty strings when this repo has none --
+    # while also disabling publish-conda.yml's `required: true` checks.  Naming them makes
+    # an unseeded repo fail at workflow-resolution time with the secret's name in the
+    # error.  Seed them with:
+    #   gh secret set CONDA_R2_ACCESS_KEY_ID     -R xqyww123/auto_sledgehammer
+    #   gh secret set CONDA_R2_SECRET_ACCESS_KEY -R xqyww123/auto_sledgehammer
+    secrets:
+      CONDA_R2_ACCESS_KEY_ID:     ${{ secrets.CONDA_R2_ACCESS_KEY_ID }}
+      CONDA_R2_SECRET_ACCESS_KEY: ${{ secrets.CONDA_R2_SECRET_ACCESS_KEY }}
+
+  # The only test that means anything: install it the way a user does, and BUILD the
+  # session against the base `isabelle` package.  That exercises the post-link
+  # registration (`isabelle components -u`) end to end -- if registration silently did
+  # nothing, the session is unknown and this reddens.
+  smoke:
+    name: "Smoke: conda install + isabelle build"
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+
+      - name: "conda install -c https://conda.qiyuan.me auto-sledgehammer"
+        run: |
+          set -euo pipefail
+          # --override-channels: the runner's default channels go through a proxy that
+          # breaks TLS for conda-forge; this package needs nothing from there anyway.
+          conda create -y -n t -c https://conda.qiyuan.me --override-channels \
+            auto-sledgehammer
+
+      - name: "It registered itself as an Isabelle component"
+        run: |
+          set -euo pipefail
+          conda activate t
+          echo "--- \$ISABELLE_HOME_USER/etc/components ---"
+          comp="$(isabelle getenv -b ISABELLE_HOME_USER)/etc/components"
+          cat "$comp"
+          grep -q 'auto-sledgehammer' "$comp" || {
+            echo "::error::post-link did not register the component"; exit 1; }
+
+      - name: "...and the session actually builds"
+        run: |
+          set -euo pipefail
+          conda activate t
+          isabelle build -v Auto_Sledgehammer

@@ -1,0 +1,165 @@
+schema_version: 1
+
+# auto-sledgehammer: the Auto_Sledgehammer Isabelle session -- Sledgehammer wrapped as a
+# tactic (`by auto_sledgehammer`), with proof caching -- as a conda add-on to the patched
+# `isabelle` package.  noarch: it ships only source (ROOT + theory + ML + document) and
+# registers itself with `isabelle components -u`; Isabelle builds the heap on demand.
+#
+# Same shape as isabelle-performant-ml; see that recipe for the reasoning behind the
+# hook generation, which is reproduced here rather than shared, so each repo stays
+# self-contained.
+#
+# The version is NOT duplicated here: CI reads ./VERSION and exports it.  Releasing is
+# therefore "bump VERSION, tag" and nothing in this file changes.
+
+context:
+  version: ${{ env.get("ISA_COMPONENT_VERSION", default="0.0.0") }}
+
+source:
+  - path: ../
+
+package:
+  name: auto-sledgehammer
+  version: ${{ version }}
+
+build:
+  number: 0
+  noarch: generic
+  script:
+    interpreter: bash
+    content: |
+      set -euo pipefail
+
+      # ONE definition of where the component lives; the hooks below address it by a
+      # literal, and a divergence would install green and die later as an unknown session.
+      name=auto-sledgehammer
+      dest="$PREFIX/share/$name"
+
+      mkdir -p "$dest"
+      cp -a "$SRC_DIR/ROOT"                  "$dest/"
+      cp -a "$SRC_DIR/Auto_Sledgehammer.thy" "$dest/"
+      # library/ wholesale, not a file list: Phi_ID.ML is reached only indirectly (used by
+      # library/cache_file.ML, never ML_file'd from the theory), so enumerating the
+      # ML_file lines would silently drop it.
+      cp -a "$SRC_DIR/library"               "$dest/"
+      # ROOT's `document_files "root.tex"` makes this mandatory, not decorative.
+      cp -a "$SRC_DIR/document"              "$dest/"
+
+      # Editor backups (there are many here) and the committed proof caches must not ship.
+      # The caches are environment-specific, and the cache file is written at USE time
+      # anyway -- see the note under `requirements` about where that write lands.
+      find "$dest" -name '*~' -delete
+      find "$dest" \( -name '*.proof-cache' -o -name '*.proof-cache.lock' \) -delete
+
+      test -f "$dest/ROOT"
+      test -f "$dest/document/root.tex"      # ROOT declares it; a missing one fails builds
+
+      # ---------------------------------------------------------------------------
+      # Link hooks.  BOTH the unix and the Windows set are written UNCONDITIONALLY.
+      #
+      # This is `noarch: generic`, so one artifact installs on every platform including
+      # win-64 (and `isabelle` is built for Windows).  conda picks the hook by the RUNNING
+      # platform -- Scripts/*.bat there, bin/*.sh elsewhere -- and returns success in
+      # silence when the file is absent.  Shipping only .sh therefore means: installs
+      # cleanly on Windows, shows up in `conda list`, and is never registered.
+      #
+      # Do NOT guard these with `case "$target_platform" in win-*)`: for noarch,
+      # target_platform is `noarch`, so that branch can never match -- a fix that looks
+      # applied and isn't.
+      #
+      # Every hook exits 0 unconditionally.  A nonzero post-link makes conda roll the
+      # whole install back (verified on Windows); a failed registration merely surfaces
+      # later as a clear "unknown session".
+      #
+      # printf, one argument per line -- NOT a heredoc.  A heredoc body would have to sit
+      # at column 0 to keep its terminator recognisable, and column 0 ends this YAML block
+      # scalar.
+      # ---------------------------------------------------------------------------
+      mkdir -p "$PREFIX/bin" "$PREFIX/Scripts"
+
+      for spec in post-link:-u pre-unlink:-x; do
+        action=${spec%%:*}
+        verb=${spec##*:}
+
+        # \$PREFIX stays literal: conda expands it at link time, not now.
+        printf '%s\n' \
+          '#!/bin/bash' \
+          "\"\$PREFIX/isa/bin/isabelle\" components $verb \"\$PREFIX/share/$name\" 2>/dev/null \\" \
+          "  || echo \"warning: 'isabelle components $verb $name' failed; the session may be unavailable\"" \
+          'exit 0' \
+          > "$PREFIX/bin/.$name-$action.sh"
+        chmod +x "$PREFIX/bin/.$name-$action.sh"
+
+        # Windows.  CRLF (printf '%s\r\n'), and `exit /b 0` on every path.
+        #
+        # The path may NOT be handed over in native form: `isabelle components` parses it
+        # with Path.explode, whose Path.check_elem rejects the characters `/\$:"'<>|?*`,
+        # so `%PREFIX%\share\...` raises "Illegal character" -- and with the mandatory
+        # `exit /b 0` that failure is invisible, i.e. exactly as broken as shipping no
+        # .bat at all.  So convert to Cygwin form: strip `C:`, flip \ to /, prepend
+        # /cygdrive/<drive>.  Pure batch, because cygpath.exe printed NOTHING on a
+        # windows-latest runner (measured by isabelle-packaging-ci's preunlink-probe).
+        # The drive letter needs no lowercasing -- Isabelle accepts /cygdrive/C/... and
+        # lowercases it itself when writing etc/components.
+        #
+        # The `getenv -b ISABELLE_HOME` line is a THROWAWAY WARM-UP, and it is the
+        # difference between this hook working and silently doing nothing.  Cygwin heals
+        # itself on the FIRST isabelle call, but that call's Java classpath is computed
+        # before the heal completes -- so the first invocation is precisely the one that
+        # cannot run a Scala tool, and `components` IS a Scala tool ("Could not find or load
+        # main class isabelle.Components", measured on a cold prefix).  A bash-only
+        # subcommand absorbs the cold start.  Both hooks need it.  Its exit status is
+        # ignored and `call` does not propagate failure, so `exit /b 0` still holds.
+        # Verified end to end on windows-latest: isabelle-packaging-ci run 29637825807.
+        printf '%s\r\n' \
+          '@echo off' \
+          "set \"COMP=%PREFIX%\\share\\$name\"" \
+          'set "DL=%COMP:~0,1%"' \
+          'set "REST=%COMP:~2%"' \
+          'set "REST=%REST:\=/%"' \
+          'set "CYG=/cygdrive/%DL%%REST%"' \
+          'call "%PREFIX%\isa\bin\isabelle.bat" getenv -b ISABELLE_HOME >nul 2>&1' \
+          "call \"%PREFIX%\\isa\\bin\\isabelle.bat\" components $verb \"%CYG%\" >nul 2>&1" \
+          'exit /b 0' \
+          > "$PREFIX/Scripts/.$name-$action.bat"
+      done
+
+      grep -qF "share/$name" "$PREFIX/bin/.$name-post-link.sh"
+      test "$dest" = "$PREFIX/share/$name"
+
+requirements:
+  run:
+    # Bounded to the Isabelle SERIES this session is written against; the base package
+    # keeps a constant name at a per-release version, so an unbounded dep would let conda
+    # pair this with a future Isabelle it was never built for -- installing cleanly and
+    # then failing in `isabelle build` on ML API drift.
+    - isabelle >=2025.2,<2025.3
+    # ROOT:3 `sessions Performant_Isabelle_ML`, and Auto_Sledgehammer.thy:2 imports it.
+    # Without this the session does not build at all.
+    - isabelle-performant-ml
+
+  # On the proof cache under a conda prefix -- handled upstream, not worked around here.
+  #
+  # library/cache_file.ML derives the cache path from `Resources.master_directory thy`,
+  # which for the theory shipped in this package is $PREFIX/share/auto-sledgehammer -- a
+  # directory that may be read-only or shared between users.  As of the "degrade gracefully
+  # when the cache location is not writable" change, that no longer raises: the location is
+  # probed once per theory, a non-writable one produces a single warning, and the cache is
+  # read but not recorded.  So a read-only prefix is safe, and this recipe needs no
+  # workaround.
+  #
+  # Worth knowing: the blast radius was always narrow.  master_directory is per THEORY, so
+  # a user's own theories cache next to their own sources and were never affected by a
+  # read-only prefix.  The only cache under the prefix belongs to the shipped
+  # Auto_Sledgehammer.thy, which makes no auto_sledgehammer call and so is always empty.
+
+about:
+  homepage: https://github.com/xqyww123/auto_sledgehammer
+  summary: "Sledgehammer as a tactic (`by auto_sledgehammer`), with proof caching"
+  description: |
+    The Auto_Sledgehammer Isabelle session, packaged as a conda add-on to the patched
+    `isabelle` distribution.  Wraps Sledgehammer so it can be used directly as a proof
+    method and caches successful proofs.  Ships source only and registers itself as an
+    Isabelle component; the heap is built on demand.
+  license: BSD-3-Clause
+  repository: https://github.com/xqyww123/auto_sledgehammer
