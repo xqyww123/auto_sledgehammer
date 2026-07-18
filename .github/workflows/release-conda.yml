@@ -241,13 +241,26 @@ jobs:
   # session against the base `isabelle` package.  That exercises the post-link
   # registration (`isabelle components -u`) end to end -- if registration silently did
   # nothing, the session is unknown and this reddens.
+  # Installs the way a user does, from the live channel, and asserts the two things
+  # that fail SILENTLY: that the post-link registered the component, and that the
+  # pre-unlink unregistered it again.  Both legs matter -- a Windows registration
+  # failure is invisible (install succeeds, `conda list` shows it, nothing is
+  # registered), which is exactly how the Cygwin cold-start bug hid for so long.
+  # This logic was validated against the live channel first, by
+  # isabelle-packaging-ci's smoke-logic-probe.
   smoke:
-    name: "Smoke: conda install + isabelle build"
+    name: "Smoke: conda install from conda.qiyuan.me (${{ matrix.os }})"
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     defaults:
       run:
+        # bash -l (LOGIN shell): without it the Windows runner's Git-Bash starts
+        # --noprofile --norc and conda is not on PATH at all.
         shell: bash -l {0}
     steps:
       - uses: conda-incubator/setup-miniconda@v3
@@ -257,23 +270,92 @@ jobs:
       - name: "conda install -c https://conda.qiyuan.me auto-sledgehammer"
         run: |
           set -euo pipefail
-          # --override-channels: the runner's default channels go through a proxy that
-          # breaks TLS for conda-forge; this package needs nothing from there anyway.
-          conda create -y -n t -c https://conda.qiyuan.me --override-channels \
+          conda create -y -n t \
+            -c https://conda.qiyuan.me --override-channels \
             auto-sledgehammer
+          conda activate t
+          conda list auto-sledgehammer
 
-      - name: "It registered itself as an Isabelle component"
+      - name: "the post-link REGISTERED the component"
         run: |
           set -euo pipefail
           conda activate t
-          echo "--- \$ISABELLE_HOME_USER/etc/components ---"
-          comp="$(isabelle getenv -b ISABELLE_HOME_USER)/etc/components"
-          cat "$comp"
-          grep -q 'auto-sledgehammer' "$comp" || {
-            echo "::error::post-link did not register the component"; exit 1; }
+          # The ENV entry point, <prefix>/bin/isabelle or <prefix>/Scripts/isabelle.bat --
+          # NOT <prefix>/isa/bin/isabelle, which is the distribution's own unix launcher.
+          # That file ships on Windows too and Git-Bash calls it executable, so an `-x`
+          # test picks it and Isabelle dies with "Failed to determine hardware and
+          # operating system type!".  Dispatch on the OS, never on a file mode.
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            ISA="$CONDA_PREFIX/Scripts/isabelle.bat"
+          else
+            ISA="$CONDA_PREFIX/bin/isabelle"
+          fi
+          # `isabelle getenv` hands back a CYGWIN path on Windows (/cygdrive/c/...),
+          # which Git-Bash cannot open -- it wants /c/...
+          raw="$("$ISA" getenv -b ISABELLE_HOME_USER)"
+          case "$raw" in
+            /cygdrive/*) home="/${raw#/cygdrive/}" ;;
+            *)           home="$raw" ;;
+          esac
+          comp="$home/etc/components"
+          [ -f "$comp" ] || { echo "::error::no etc/components -- nothing registered"; exit 1; }
+          echo "----- etc/components -----"; cat "$comp"
+          grep -q 'auto-sledgehammer' "$comp" \
+            || { echo "::error::post-link did NOT register auto-sledgehammer"; exit 1; }
+          echo "  OK  registered"
 
-      - name: "...and the session actually builds"
+      - name: "...and the session builds (linux only -- too slow on Windows)"
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           conda activate t
-          isabelle build -v Auto_Sledgehammer
+          # The ENV entry point, <prefix>/bin/isabelle or <prefix>/Scripts/isabelle.bat --
+          # NOT <prefix>/isa/bin/isabelle, which is the distribution's own unix launcher.
+          # That file ships on Windows too and Git-Bash calls it executable, so an `-x`
+          # test picks it and Isabelle dies with "Failed to determine hardware and
+          # operating system type!".  Dispatch on the OS, never on a file mode.
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            ISA="$CONDA_PREFIX/Scripts/isabelle.bat"
+          else
+            ISA="$CONDA_PREFIX/bin/isabelle"
+          fi
+          "$ISA" build -v Auto_Sledgehammer
+
+      - name: "the pre-unlink UNREGISTERED it"
+        run: |
+          set -euo pipefail
+          conda activate t
+          # The ENV entry point, <prefix>/bin/isabelle or <prefix>/Scripts/isabelle.bat --
+          # NOT <prefix>/isa/bin/isabelle, which is the distribution's own unix launcher.
+          # That file ships on Windows too and Git-Bash calls it executable, so an `-x`
+          # test picks it and Isabelle dies with "Failed to determine hardware and
+          # operating system type!".  Dispatch on the OS, never on a file mode.
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            ISA="$CONDA_PREFIX/Scripts/isabelle.bat"
+          else
+            ISA="$CONDA_PREFIX/bin/isabelle"
+          fi
+          # `isabelle getenv` hands back a CYGWIN path on Windows (/cygdrive/c/...),
+          # which Git-Bash cannot open -- it wants /c/...
+          raw="$("$ISA" getenv -b ISABELLE_HOME_USER)"
+          case "$raw" in
+            /cygdrive/*) home="/${raw#/cygdrive/}" ;;
+            *)           home="$raw" ;;
+          esac
+          comp="$home/etc/components"
+
+          # --force removes ONLY this package.  A plain `conda remove` would take the
+          # base `isabelle` with it, and isabelle's OWN pre-unlink deletes the whole
+          # namespaced ISABELLE_HOME_USER -- so etc/components would vanish wholesale
+          # and the check below would pass without proving anything.  That confound
+          # made an earlier "PASS" vacuous.
+          conda remove -y --force auto-sledgehammer
+
+          [ -f "$comp" ] || { echo "::error::etc/components vanished -- the removal took"
+                              echo "::error::isabelle with it; this assertion is vacuous"
+                              exit 1; }
+          echo "----- etc/components after removal -----"; cat "$comp"
+          ! grep -q 'auto-sledgehammer' "$comp" \
+            || { echo "::error::pre-unlink did NOT unregister auto-sledgehammer"; exit 1; }
+          echo "  OK  unregistered, and isabelle is still installed"
+          "$ISA" version
