@@ -339,67 +339,52 @@ fun with_file_lock lk body =
     in Exn.release result end)
 end
 
-(* Per-CACHE-PATH append var: doubles as the in-process append mutex (so sibling
-   threads of THIS process don't interleave writes to the same file -- fcntl
-   locks are per-process and don't serialise sibling threads) and caches whether
-   the on-disk file has been confirmed/upgraded to the new format this process.
+(* Per-CACHE-FILE append lock: the in-process append mutex (so sibling threads of
+   THIS process don't interleave writes to the same file -- fcntl locks are
+   per-process and don't serialise sibling threads).  The bool it carries is
+   `confirmed`: whether the on-disk file has been upgraded to the new format
+   this process, so a repeat append can skip ensure_new_format.
 
-   Keyed on the path, like writable_vars and for the same reason: both things it
-   holds are properties of the FILE, not of the theory.  A long-theory-name key
-   got this wrong in both directions -- same name in two directories shared one
-   `confirmed` flag (so a stale true skipped ensure_new_format and appended new
-   frames onto a foreign file, losing that run's records), and two different long
-   names whose SHORT names collide in one directory share a file yet would get
-   two different mutexes.
+   Keyed on the cache FILE, not the theory: both things this holds are properties
+   of the file.  A long-theory-name key was wrong in both directions -- same long
+   name in two directories shared one `confirmed` flag (a stale true skips
+   ensure_new_format and appends frames onto a foreign file, losing that run's
+   records), while two different long names whose SHORT names collide in one
+   directory share a file yet got two different mutexes.
 
-   NOT evicted in store_and_close_cache, deliberately, unlike writable_vars: this
-   var IS the append mutex, and dropping it while another thread sits inside
-   `Synchronized.change v` lets the next theory_append_var mint a fresh var, so
-   two threads then append unserialised -- reachable via the async at_end branch.
-   Deleting while HOLDING v does not help either: the blocked thread already has
-   the reference.  A safe eviction needs refcounting the holders.
+   NEVER evicted, deliberately.  This var IS the mutex: dropping it while another
+   thread sits inside `Synchronized.change v` lets the next cache_append_lock
+   mint a fresh var, so two threads then append unserialised -- reachable via the
+   async at_end branch.  Deleting while HOLDING v does not help either, since the
+   blocked thread already has the reference; a safe eviction would need
+   refcounting the holders.  So the table grows with the number of distinct cache
+   files touched, and a path key grows it faster than a name key did (Isa-REPL
+   gives every client connection its own base_dir while clients reuse one scratch
+   theory name).  That is the price of correctness here, recorded rather than
+   hidden. *)
 
-   Evicting would bound the table, and a path key makes that MORE relevant, not
-   less: the old name key was bounded by the number of distinct theory names,
-   this one by the number of distinct (directory, short name) pairs -- and
-   Isa-REPL gives every client connection its own base_dir while clients reuse
-   one scratch theory name, so N connections now cost N entries where the name
-   key cost 1.  Each entry holds a mutex and a condition variable, permanently
-   reachable.  That is the price of correctness here, recorded rather than
-   hidden; it is not a reason to evict unsafely.
+(* Strhashtab is MUTABLE, so unlike a Symtab-in-a-Synchronized.var it is not
+   thread-safe by construction: the lookup-or-insert below is a compound
+   operation and must happen inside `append_locks_guard`, or two threads racing
+   on a fresh key would mint two locks for one file and append unserialised.
+   Nothing outside this function may touch the table. *)
+val append_locks : bool Synchronized.var Strhashtab.table = Strhashtab.empty 16
 
-   One residual: File.symbolic_path does not absolutise, so a client passing
-   base_dir "foo" and another passing "/abs/foo" denote one file but yield two
-   keys, hence two mutexes.  Interleaved appends then produce crc-failing frames
-   that the scanner resynchronises past -- records lost, never a wrong record
-   accepted (see the format contract above).  Using File.standard_path here would
-   close it, at the cost of changing the writable_vars key semantics too. *)
-val append_vars : bool Synchronized.var Symtab.table Synchronized.var =
-  Synchronized.var "phi_cache.append_vars" Symtab.empty
+val append_locks_guard : unit Synchronized.var =
+  Synchronized.var "phi_cache.append_locks" ()
 
-fun theory_append_var name =
-  Synchronized.change_result append_vars (fn tab =>
-    case Symtab.lookup tab name of
-      SOME v => (v, tab)
-    | NONE => let val v = Synchronized.var ("phi_cache.append." ^ name) false
-               in (v, Symtab.update_new (name, v) tab) end)
+fun cache_append_lock key =
+  Synchronized.change_result append_locks_guard (fn () =>
+    (case Strhashtab.lookup append_locks key of
+       SOME v => (v, ())
+     | NONE =>
+         let val v = Synchronized.var ("phi_cache.append." ^ key) false
+          in Strhashtab.update append_locks (key, v); (v, ()) end))
 
-(* Per-theory writability verdict (see probe_writable), memoised alongside the
-   append vars so a write costs one Symtab lookup, not five syscalls. A write
-   that fails anyway -- a race with a remount, ENOSPC, an NFS refusal -- flips
-   the entry to false through note_write_failure, so we do not pay a doomed
-   open() per proof afterwards. The entry is dropped at theory end (see
-   store_and_close_cache): without that, a `chmod u+w` could never take effect
-   in a long-lived process, and two theories of the same short name from
-   different directories would share one verdict.
-   Because the verdict is re-probed after every eviction, the WARNING is not
-   gated on it but on a process-global set of already-reported directories --
-   it is the location, not the theory instance, the user has to fix.
-   writable_vars and warned_dirs are leaf locks (probe_writable takes none), so
-   they add no cycle to the v -> fcntl -> openning_caches order below. *)
-val writable_vars : bool Symtab.table Synchronized.var =
-  Synchronized.var "phi_cache.writable" Symtab.empty
-
+(* The warning is emitted at most once per LOCATION, not once per theory or per
+   proof: it is the directory the user has to fix, and a theory can reach a write
+   site many times.  warned_dirs is a leaf lock (probe_writable takes none), so it
+   adds no cycle to the v -> fcntl -> openning_caches order below. *)
 val warned_dirs : unit Symtab.table Synchronized.var =
   Synchronized.var "phi_cache.warned_dirs" Symtab.empty
 
@@ -413,30 +398,43 @@ fun warn_not_writable thy =
                     "); cached proofs will be read but not recorded.")
   end
 
-(* Keyed on the probed PATH, not on the theory name.  probe_writable is a
-   predicate over cache_path/lock_path/master_directory, none of which is a
-   function of the theory name alone: two theories sharing a long name but living
-   in different directories denote DIFFERENT cache files, and a name key makes
-   them share one verdict -- so a read-only directory's `false` poisons a
-   perfectly writable one, which then records nothing, silently (the warning
-   fires only on the NONE branch).  Constructible today: Resources.begin_theory
-   has no global name registry and Isa-REPL takes base_dir per request, with only
-   a thread-local duplicate-name guard.  This key matches probe_writable's
-   granularity exactly, and agrees with warned_dirs' location key. *)
-fun writable_key thy = Path.implode (cache_path thy)
+(* Identifies the cache FILE, and is used ONLY as the append-lock key -- never
+   dereferenced, never opened, never written anywhere.  So the only property that
+   matters is: same file <-> same string.
 
+   Normalised on every use rather than taken as spelled, so two spellings of one
+   directory cannot yield two locks for one file and let appends interleave.
+
+   File.standard_path = Path.implode o Path.expand, and expand is what does the
+   work: begin_theory stores File.symbolic_path master_dir (resources.ML:243),
+   and with `~` in ISABELLE_DIRECTORIES almost every master_dir here comes out
+   variable-rooted -- `~/Current/...`, for which Path.is_absolute is FALSE.
+   expand resolves $USER_HOME / $ISABELLE_HOME / $AFP to a root, so those
+   canonicalise fully.  That is the common case, and the one a bare Path.implode
+   would have got wrong.
+
+   Deliberately NOT File.absolute_path, which differs only by resolving a
+   genuinely relative path against OS.FileSys.getDir ().  That is the one thing
+   we must not do: Isa-REPL chdirs per master_dir group while loading
+   (REPL.ML:376), process-globally, so a cwd-dependent key could give ONE theory
+   two keys at two moments -- splitting its own lock and interleaving appends for
+   real.  A stable key with a coarse alias is strictly better than an unstable
+   one.  Isa-REPL now absolutises its base dir on entry (Server.ML `startup` and
+   the \x05file handler), so a genuinely relative master_dir should not arise;
+   expand-only normalisation here is the defence that holds even if one does. *)
+fun cache_file_key thy = File.standard_path (cache_path thy)
+
+(* NOT memoised, deliberately.  Measured on this machine: the probe is 10.4 us
+   and a memo lookup 0.24 us, against a call site that only runs when a proof is
+   about to be WRITTEN -- i.e. right after a sledgehammer success (seconds) and
+   right before a file append.  Saving 10 us there is unmeasurable, while the
+   memo cost real correctness: a verdict cached under one key poisoned another
+   location, a `chmod u+w` could not take effect until the entry was evicted, and
+   the table grew without bound.  Probing every time makes all of that vanish and
+   is what a user expects -- fix the permissions, caching resumes at once. *)
 fun cache_is_writable thy =
-  let val name = writable_key thy
-   in Synchronized.change_result writable_vars (fn tab =>
-        case Symtab.lookup tab name of
-          SOME b => (b, tab)
-        | NONE => let val b = probe_writable thy
-                      val _ = if b then () else warn_not_writable thy
-                   in (b, Symtab.update_new (name, b) tab) end)
-  end
-
-fun note_write_failure thy =
-  Synchronized.change writable_vars (Symtab.update (writable_key thy, false))
+  let val ok = probe_writable thy
+   in if ok then () else warn_not_writable thy; ok end
 
 (* Run a durable-write body only if the cache location is writable, and never
    let a filesystem failure escape into the proof -- a cache is an optimisation,
@@ -444,7 +442,10 @@ fun note_write_failure thy =
    the Timeout that wraps sledgehammer. *)
 fun try_write thy body =
   if not (cache_is_writable thy) then ()
-  else \<^try>\<open>body () catch _ => note_write_failure thy\<close>
+  else \<^try>\<open>body () catch _ => ()\<close>
+    (* Nothing to demote: the verdict is re-probed on the next attempt, so a
+       transient failure (ENOSPC clearing, a remount, an NFS hiccup) recovers by
+       itself instead of disabling the cache for the rest of the process. *)
 
 (* Before appending, if the on-disk file exists but is NOT in the new format
    (an old/incompatible/corrupt file), discard it so we never append binary
@@ -467,7 +468,7 @@ fun ensure_new_format path =
    falsely upgraded. *)
 fun append_record thy bytes =
   let val path = cache_path thy
-      val v = theory_append_var (writable_key thy)
+      val v = cache_append_lock (cache_file_key thy)
    in Synchronized.change v (fn confirmed =>
         if not (cache_is_writable thy) then confirmed
         else \<^try>\<open>
@@ -475,7 +476,7 @@ fun append_record thy bytes =
             ((if confirmed then () else ensure_new_format path);
              File.append path bytes;
              true))
-          catch _ => (note_write_failure thy; confirmed)\<close>)
+          catch _ => confirmed\<close>)
   end
 
 (* Compaction: under the lock, re-read the file (capturing every process's
@@ -486,14 +487,14 @@ fun append_record thy bytes =
    as a spurious error long after the theory has finished. *)
 fun compact_cache thy =
   let val path = cache_path thy
-      val v = theory_append_var (writable_key thy)
+      val v = cache_append_lock (cache_file_key thy)
    in Synchronized.change v (fn confirmed =>
         if not (cache_is_writable thy) then confirmed
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
             (if File.is_file path then write_state_new path (read_file_state_exn path) else ();
              true))
-          catch _ => (note_write_failure thy; confirmed)\<close>)
+          catch _ => confirmed\<close>)
   end
 
 val openning_caches : (cache * bool) Symtab.table Synchronized.var
@@ -530,11 +531,11 @@ fun register_async_task task thy =
 fun store_cache thy = compact_cache thy
 
 fun store_and_close_cache thy =
-  (* TWO keys: openning_caches is per theory, writable_vars is per cache path. *)
-  let val name = Context.theory_name {long=true} thy
-   in Synchronized.change openning_caches (Symtab.delete_safe name);
-      Synchronized.change writable_vars (Symtab.delete_safe (writable_key thy))
-  end
+  (* Only the in-memory proof table is per-theory state to drop here.  There is no
+     writability verdict to evict any more (it is probed, not cached), and the
+     append lock must NOT be evicted -- see cache_append_lock. *)
+  Synchronized.change openning_caches
+    (Symtab.delete_safe (Context.theory_name {long=true} thy))
 
 (* Drop the data file and reset the in-memory entry as ONE per-theory critical
    section (under the same `v` that serialises appends), so a concurrent append
@@ -544,10 +545,10 @@ fun store_and_close_cache thy =
    when the disk half is skipped, a bad cached proof is still dropped for this
    session, we merely cannot record the tombstone durably. *)
 fun invalidate_cache thy =
-  (* two keys, as in store_and_close_cache: the mutex/flag is per cache PATH,
-     the openning_caches entry below is per theory. *)
+  (* two keys: the mutex/flag is per cache FILE, the openning_caches entry below
+     is per theory. *)
   let val name = Context.theory_name {long=true} thy in
-  Synchronized.change (theory_append_var (writable_key thy)) (fn _ =>
+  Synchronized.change (cache_append_lock (cache_file_key thy)) (fn _ =>
     (try_write thy (fn () =>
        with_file_lock (lock_path thy) (fn () =>
          if File.is_file (cache_path thy) then File.rm (cache_path thy) else ()));
