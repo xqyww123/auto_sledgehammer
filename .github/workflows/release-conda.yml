@@ -15,6 +15,10 @@ name: release-conda
 on:
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: "Build and verify only -- do NOT publish to the channel"
+        type: boolean
+        default: false
       build_number:
         description: "conda build number - BUMP if republishing the same VERSION with changed content"
         type: string
@@ -208,6 +212,13 @@ jobs:
 
   publish:
     needs: verify
+    # A dry run stops here: build and verify have already proved the package is
+    # sound, and publishing is the irreversible step (bytes go up before the index
+    # is rebuilt, and a published name may never be reused).  `smoke` needs this
+    # job, and a skipped `needs` skips the dependant too, so both drop out.
+    #
+    # Empty on a tag push -- `!''` is true -- so a real release is unaffected.
+    if: ${{ !inputs.dry_run }}
     uses: xqyww123/isabelle-packaging-ci/.github/workflows/publish-conda.yml@main
     with:
       artifact: conda-packages
