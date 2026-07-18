@@ -257,13 +257,34 @@ fun probe_writable thy =
    are discarded. Best-effort: a decode failure degrades to empty, and so does
    an unreadable file -- a cache primed by another user under a tight umask
    would otherwise raise EACCES from Bytes.read straight into the user's proof
-   (the read happens before any write, so the writability probe cannot help). *)
-fun read_file_state path =
+   (the read happens before any write, so the writability probe cannot help).
+
+   TWO readers, deliberately, because there are two callers with OPPOSITE needs.
+
+   `read_file_state_exn` lets an I/O failure escape, and is what compaction must
+   use: `compact_cache` feeds this result straight back to `write_state_new`, so
+   a reader that degrades to `Symtab.empty` there does not degrade -- it TRUNCATES
+   the user's cache to nothing and renames the empty payload over it.  Letting the
+   exception out instead aborts the rewrite with the file byte-intact, and
+   `compact_cache`'s own handler demotes the verdict.  Triggers are not only
+   permissions: EIO, an NFS ESTALE, EMFILE under a parallel build, or Size on a
+   large cache all raise here from an ordinary mode-0644 file.
+
+   `read_file_state` degrades, and is what the pure read path uses.
+
+   In BOTH, a decode failure still discards: a corrupt or truncated file is
+   treated as empty, which is the pre-existing contract and is unchanged. *)
+fun read_file_state_exn path =
   if not (File.is_file path) then Symtab.empty
-  else \<^try>\<open>
-    let val raw = Bytes.content (Bytes.read path)
-     in if is_new_format raw then replay (scan raw) else Symtab.empty end
-    catch _ => Symtab.empty\<close>
+  else
+    let val raw = Bytes.content (Bytes.read path)   (* I/O failure escapes, by design *)
+     in if is_new_format raw
+        then \<^try>\<open>replay (scan raw) catch _ => Symtab.empty\<close>
+        else Symtab.empty
+    end
+
+fun read_file_state path =
+  \<^try>\<open>read_file_state_exn path catch _ => Symtab.empty\<close>
 
 (* process id, used to make the compaction temp file unique across processes *)
 val proc_pid = SysWord.toString (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))
@@ -318,10 +339,24 @@ fun with_file_lock lk body =
     in Exn.release result end)
 end
 
-(* Per-theory append var: doubles as the in-process append mutex (so sibling
+(* Per-CACHE-PATH append var: doubles as the in-process append mutex (so sibling
    threads of THIS process don't interleave writes to the same file -- fcntl
    locks are per-process and don't serialise sibling threads) and caches whether
-   the on-disk file has been confirmed/upgraded to the new format this process. *)
+   the on-disk file has been confirmed/upgraded to the new format this process.
+
+   Keyed on the path, like writable_vars and for the same reason: both things it
+   holds are properties of the FILE, not of the theory.  A long-theory-name key
+   got this wrong in both directions -- same name in two directories shared one
+   `confirmed` flag (so a stale true skipped ensure_new_format and appended new
+   frames onto a foreign file, losing that run's records), and two different long
+   names whose SHORT names collide in one directory share a file yet would get
+   two different mutexes.
+
+   NOT evicted in store_and_close_cache, deliberately, unlike writable_vars: this
+   var IS the append mutex, and dropping it while another thread sits inside
+   `Synchronized.change v` lets the next theory_append_var mint a fresh var, so
+   two threads then append unserialised -- reachable via the async at_end branch.
+   With a path key there is nothing to gain from evicting it anyway. *)
 val append_vars : bool Synchronized.var Symtab.table Synchronized.var =
   Synchronized.var "phi_cache.append_vars" Symtab.empty
 
@@ -361,8 +396,20 @@ fun warn_not_writable thy =
                     "); cached proofs will be read but not recorded.")
   end
 
+(* Keyed on the probed PATH, not on the theory name.  probe_writable is a
+   predicate over cache_path/lock_path/master_directory, none of which is a
+   function of the theory name alone: two theories sharing a long name but living
+   in different directories denote DIFFERENT cache files, and a name key makes
+   them share one verdict -- so a read-only directory's `false` poisons a
+   perfectly writable one, which then records nothing, silently (the warning
+   fires only on the NONE branch).  Constructible today: Resources.begin_theory
+   has no global name registry and Isa-REPL takes base_dir per request, with only
+   a thread-local duplicate-name guard.  This key matches probe_writable's
+   granularity exactly, and agrees with warned_dirs' location key. *)
+fun writable_key thy = Path.implode (cache_path thy)
+
 fun cache_is_writable thy =
-  let val name = Context.theory_name {long=true} thy
+  let val name = writable_key thy
    in Synchronized.change_result writable_vars (fn tab =>
         case Symtab.lookup tab name of
           SOME b => (b, tab)
@@ -372,8 +419,7 @@ fun cache_is_writable thy =
   end
 
 fun note_write_failure thy =
-  Synchronized.change writable_vars
-    (Symtab.update (Context.theory_name {long=true} thy, false))
+  Synchronized.change writable_vars (Symtab.update (writable_key thy, false))
 
 (* Run a durable-write body only if the cache location is writable, and never
    let a filesystem failure escape into the proof -- a cache is an optimisation,
@@ -404,7 +450,7 @@ fun ensure_new_format path =
    falsely upgraded. *)
 fun append_record thy bytes =
   let val path = cache_path thy
-      val v = theory_append_var (Context.theory_name {long=true} thy)
+      val v = theory_append_var (writable_key thy)
    in Synchronized.change v (fn confirmed =>
         if not (cache_is_writable thy) then confirmed
         else \<^try>\<open>
@@ -423,12 +469,12 @@ fun append_record thy bytes =
    as a spurious error long after the theory has finished. *)
 fun compact_cache thy =
   let val path = cache_path thy
-      val v = theory_append_var (Context.theory_name {long=true} thy)
+      val v = theory_append_var (writable_key thy)
    in Synchronized.change v (fn confirmed =>
         if not (cache_is_writable thy) then confirmed
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
-            (if File.is_file path then write_state_new path (read_file_state path) else ();
+            (if File.is_file path then write_state_new path (read_file_state_exn path) else ();
              true))
           catch _ => (note_write_failure thy; confirmed)\<close>)
   end
@@ -467,9 +513,10 @@ fun register_async_task task thy =
 fun store_cache thy = compact_cache thy
 
 fun store_and_close_cache thy =
+  (* TWO keys: openning_caches is per theory, writable_vars is per cache path. *)
   let val name = Context.theory_name {long=true} thy
    in Synchronized.change openning_caches (Symtab.delete_safe name);
-      Synchronized.change writable_vars (Symtab.delete_safe name)
+      Synchronized.change writable_vars (Symtab.delete_safe (writable_key thy))
   end
 
 (* Drop the data file and reset the in-memory entry as ONE per-theory critical
@@ -480,8 +527,10 @@ fun store_and_close_cache thy =
    when the disk half is skipped, a bad cached proof is still dropped for this
    session, we merely cannot record the tombstone durably. *)
 fun invalidate_cache thy =
+  (* two keys, as in store_and_close_cache: the mutex/flag is per cache PATH,
+     the openning_caches entry below is per theory. *)
   let val name = Context.theory_name {long=true} thy in
-  Synchronized.change (theory_append_var name) (fn _ =>
+  Synchronized.change (theory_append_var (writable_key thy)) (fn _ =>
     (try_write thy (fn () =>
        with_file_lock (lock_path thy) (fn () =>
          if File.is_file (cache_path thy) then File.rm (cache_path thy) else ()));
