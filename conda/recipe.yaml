@@ -136,7 +136,16 @@ requirements:
     - isabelle >=2025.2,<2025.3
     # ROOT:3 `sessions Performant_Isabelle_ML`, and Auto_Sledgehammer.thy:2 imports it.
     # Without this the session does not build at all.
-    - isabelle-performant-ml
+    #
+    # Bounded for the same reason as `isabelle` above, and the coupling is direct ML,
+    # not merely session-level: library/looping_simp.ML:76 calls
+    # PLPR_Pattern.matches_subterm_of, which exists only in that package
+    # (Performant_Isabelle_ML/library/pattern.ML) -- Isabelle's own Pure Pattern has no
+    # such function.  An unbounded dep would let a future 0.2.0 that renames it install
+    # green and fail later inside `isabelle build`.  An explicit bound is the only
+    # mechanism available: performant-ml declares no run_exports, and this package is
+    # noarch source-only with no host dependency, so run_exports could never fire.
+    - isabelle-performant-ml >=0.1.0,<0.2.0
 
   # On the proof cache under a conda prefix -- handled upstream, not worked around here.
   #

@@ -178,7 +178,10 @@ jobs:
           CH="$RUNNER_TEMP/local-channel"
           mkdir -p "$CH/noarch"
           find "$RUNNER_TEMP/pkgs" -name '*.conda' -exec cp {} "$CH/noarch/" \;
-          python -m conda_index "$CH" --no-zst --no-bz2 --channeldata --channel-name local
+          # $CONDA/bin/python, not bare `python`: setup-miniconda leaves /usr/bin/python
+          # first on PATH, and conda-index was just installed into the BASE env.
+          # publish-conda.yml already spells it this way; these two must agree.
+          "$CONDA/bin/python" -m conda_index "$CH" --no-zst --no-bz2 --channeldata --channel-name local
           echo "CH=$CH" >> "$GITHUB_ENV"
           ls -l "$CH/noarch/"
 
