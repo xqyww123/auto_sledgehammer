@@ -356,7 +356,24 @@ end
    var IS the append mutex, and dropping it while another thread sits inside
    `Synchronized.change v` lets the next theory_append_var mint a fresh var, so
    two threads then append unserialised -- reachable via the async at_end branch.
-   With a path key there is nothing to gain from evicting it anyway. *)
+   Deleting while HOLDING v does not help either: the blocked thread already has
+   the reference.  A safe eviction needs refcounting the holders.
+
+   Evicting would bound the table, and a path key makes that MORE relevant, not
+   less: the old name key was bounded by the number of distinct theory names,
+   this one by the number of distinct (directory, short name) pairs -- and
+   Isa-REPL gives every client connection its own base_dir while clients reuse
+   one scratch theory name, so N connections now cost N entries where the name
+   key cost 1.  Each entry holds a mutex and a condition variable, permanently
+   reachable.  That is the price of correctness here, recorded rather than
+   hidden; it is not a reason to evict unsafely.
+
+   One residual: File.symbolic_path does not absolutise, so a client passing
+   base_dir "foo" and another passing "/abs/foo" denote one file but yield two
+   keys, hence two mutexes.  Interleaved appends then produce crc-failing frames
+   that the scanner resynchronises past -- records lost, never a wrong record
+   accepted (see the format contract above).  Using File.standard_path here would
+   close it, at the cost of changing the writable_vars key semantics too. *)
 val append_vars : bool Synchronized.var Symtab.table Synchronized.var =
   Synchronized.var "phi_cache.append_vars" Symtab.empty
 
