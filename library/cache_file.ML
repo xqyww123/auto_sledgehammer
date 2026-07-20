@@ -621,11 +621,11 @@ fun check_cache doc_id ctxt =
 val _ = Theory.setup (Theory.at_end (fn thy => (
   let val tasks = #async_tasks (get_cache thy)
     in if null tasks then (compact_cache thy; store_and_close_cache thy)
-       else (tracing "There are asynchronous proof tasks. The proof cache will be compacted \
-                     \once they are finished." ;
+       else ((* tracing "There are asynchronous proof tasks. The proof cache will be compacted \
+                       \once they are finished." ; *)
              Future.forks {name="\<phi>System.compact_cache", group=NONE, deps = tasks, pri=1, interrupts=false}
-              [(fn _ => (compact_cache thy; store_and_close_cache thy;
-                         tracing "The proof cache has been compacted."))] ;
+              [(fn _ => (compact_cache thy; store_and_close_cache thy
+                         (* ; tracing "The proof cache has been compacted." *)))] ;
             ())
     end
   ; NONE)))
@@ -646,10 +646,13 @@ fun clean_hash_cache () =
   Synchronized.change hash_cache (K Symtab.empty)
 
 fun update_cache_by_hash hash prf' (ctxt, sequent') = (
+       (* Silenced: the same message is already logged to the auto_sledgehammer
+          log file by `sh_log` in sledgehammer_solver.ML; this panel copy was the
+          un-migrated twin.
        tracing (
           "Find proof (" ^ hash ^ ", time: " ^ Time.toString (fst prf') ^ "): " ^
            (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
-       ) ;
+       ) ; *)
        update_hash_cache hash prf';
        update_cached_proof (Proof_Context.theory_of ctxt) (hash, prf') ;
        (snd prf', sequent'))

@@ -1104,7 +1104,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
 
       fun hammer override (prf0,stat0) =
         let
-          val N = Thm.nprems_of (@{print} (#goal (Proof.raw_goal stat0)))
+          val N = Thm.nprems_of (#goal (Proof.raw_goal stat0))
           val Ns = string_of_int N
 
           val _ = if N > 30 then (sh_log ("The prompt generates too many subgoals (" ^
