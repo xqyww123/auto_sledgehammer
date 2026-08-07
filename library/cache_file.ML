@@ -171,6 +171,12 @@ val update_hash_cache : Hasher.digest -> proof_cache -> unit
 val clean_hash_cache  : unit -> unit
 
 type proof = string
+
+(*Budget for replaying a cached proof: the time recorded when it was found, plus
+  slack for a machine that is busier now than it was then.  Overrunning it
+  invalidates the entry and re-searches the proof from scratch.*)
+val tolerant_time : Time.time -> Time.time
+
 val try_cached_proof_by_hash :
          (Time.time -> proof -> context_state -> context_state option) (*evaluator*)
       -> (string option (*original cached proof*) -> (Time.time * proof) * context_state)
@@ -659,6 +665,7 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') = (
 
 type proof = string
 val time_delt = Time.fromMilliseconds 1000
+fun tolerant_time t = Time.scale 1.5 t + time_delt
 
 fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) =
   let val hash = key_fn (ctxt, sequent)
@@ -672,7 +679,7 @@ fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) 
           of NONE => fallback' NONE
            | SOME (time,prf) =>
               let val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
-               in case ( evaluator (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
+               in case ( evaluator (tolerant_time time) prf (ctxt', sequent)
                          handle Timeout.TIMEOUT _ => NONE )
                     of SOME ret => ((time,prf), ret)
                      | NONE => fallback' (SOME prf)

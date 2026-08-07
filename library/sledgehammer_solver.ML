@@ -757,9 +757,6 @@ fun wrapper f (ctxt,sequent) =
               in (insert_prefix ^ prf, result) end
 
 
-val time_delt = Time.fromMilliseconds 1000
-fun folerant_time t = Time.scale 1.3 t + time_delt
-
 fun funpow' (0: int) _ x = x
   | funpow' n f x = funpow' (n - 1) f (f n x)
 
@@ -1311,7 +1308,7 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
                                  ", replaying: " ^ quote prf)
                 val nprem = Thm.nprems_of sequent
                 val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
-             in (case eval_prf_str kws (Time.scale 1.5 time + time_delt) prf (ctxt', sequent)
+             in (case eval_prf_str kws (Phi_Cache_DB.tolerant_time time) prf (ctxt', sequent)
                    of (_, (_, sequent')) =>
                       if Thm.nprems_of sequent' < nprem
                       then (sh_log "[auto'i] cache replay OK"; (prf, sequent'))
@@ -1354,7 +1351,7 @@ fun auto'i timeout_opt improved override id (ctxt,sequent) =
                   of SOME (t, prf) =>
                       let val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
                        in ((false, SOME (
-                                  eval_prf_str kws (folerant_time t) prf (ctxt',sequent)))
+                                  eval_prf_str kws (Phi_Cache_DB.tolerant_time t) prf (ctxt',sequent)))
                            handle Auto_Fail _ => (false, NONE))
                       end
                    | NONE => (no_cache', NONE)
