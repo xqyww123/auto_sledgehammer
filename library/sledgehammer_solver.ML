@@ -113,23 +113,6 @@ end
 
 structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
 
-local
-  val log_path_ref: Path.T option Unsynchronized.ref = Unsynchronized.ref NONE
-  fun get_log_path () =
-    case !log_path_ref of
-      SOME p => p
-    | NONE =>
-        let val home = getenv "ISABELLE_HOME_USER"
-            val dir = Path.append (Path.explode home) (Path.basic "logs")
-            val _ = Isabelle_System.make_directory dir
-            val p = Path.append dir (Path.basic "auto_sledgehammer.log")
-            val _ = log_path_ref := SOME p
-        in p end
-in
-  fun sh_log msg =
-    \<^try>\<open>File.append (get_log_path ()) (msg ^ "\n") catch _ => ()\<close>
-end
-
 (*** Preliminaries ***)
 
 (** Options **)
@@ -552,7 +535,7 @@ fun auto_obligation_solver1 (ctxt, th) = th
    rule: the parser rejects them, which lands in the catch-all below, which the
    caching layer reads as "cached proof no longer works, search again". *)
 fun eval_prf_str kws n timeout prf (ctxt,sequent) = \<^try>\<open>
-      let val _ = sh_log ("[eval_prf_str] replaying: " ^ quote prf)
+      let val _ = tracing ("[eval_prf_str] replaying: " ^ quote prf)
           val protected = Goal.protect n sequent
           val seq =
             Method.evaluate (
@@ -569,7 +552,7 @@ fun eval_prf_str kws n timeout prf (ctxt,sequent) = \<^try>\<open>
               | _ => raise Auto_Fail Application_Fails
       end catch Timeout.TIMEOUT _ => raise Auto_Fail Timeout
               | Auto_Fail err => Exn.reraise (Auto_Fail err)
-              | err => (sh_log ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
+              | err => (tracing ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
                                  Runtime.exn_message err);
                          raise Auto_Fail (Unknown (Runtime.exn_message err))) \<close>
 
@@ -585,11 +568,11 @@ fun eval_prf_str_stat kws timeout F_None prf stat =
            | _ => case F_None of SOME f => f()
                                | NONE => raise Auto_Fail Application_Fails)
         catch Timeout.TIMEOUT _ => (
-          sh_log "The proof fails due to timeout. Re-searching proofs...";
+          tracing "The proof fails due to timeout. Re-searching proofs...";
           raise Auto_Fail Timeout)
             | Auto_Fail reason => raise Auto_Fail reason
             | err => (
-          sh_log ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
+          tracing ("Unexpected error, maybe a bug: " ^ Runtime.exn_message err);
           raise Auto_Fail (Unknown (Runtime.exn_message err))) \<close>
     end
 
@@ -731,7 +714,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
             Non-suggestion messages ("... found a proof ...", "Duplicate proof")
             carry no sendback element and are just logged. *)
          in case get_first find_sendback (YXML.parse_body s)
-            of NONE => sh_log s
+            of NONE => tracing s
              | SOME s_prf => let
               (* preplay time suffix "(NN ms)"/"(NN s)": a "(" followed by a digit.
                  Proof-command parens ("(metis ...", "(smt ...") are followed by a
@@ -741,7 +724,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
               val {is_metis = _, metis_prf = prf, smt_prf_opt = raw_smt_opt} =
                     mk_proof_candidates s_prf
               val smt_prf_opt = if try_cvc5 then raw_smt_opt else NONE
-              val _ = sh_log s
+              val _ = tracing s
               fun eval_future () =
                 let val candidates = prf :: (case smt_prf_opt of SOME s => [s] | NONE => [])
                     val new_futures = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
@@ -766,7 +749,7 @@ fun raw_sledgehammer timeout_opt override hasty stat =
       val watchdog = Option.map (fn dl =>
             Event_Timer.request {physical = true} (Time.now () + dl) (fn () =>
               if not (Synchronized.value found_proof)
-              then (sh_log "no proof found. give up in advance"; Future.cancel_group group)
+              then (tracing "no proof found. give up in advance"; Future.cancel_group group)
               else ()))
           deadline
 
@@ -790,9 +773,10 @@ datatype goal_scope = Leading | Each_Goal | All_At_Once
 
 local
 
-(* The ONE guard, and it is a kernel constraint rather than a policy: the
-   proposition promised to Goal.future_result must be free of schematic
-   variables or the kernel refuses it outright.
+(* One of TWO kernel constraints guarding the fork (the other, proof terms, is
+   tested at the forking decision below): the proposition promised to
+   Goal.future_result must be free of schematic variables or the kernel refuses
+   it outright.
 
    Term.maxidx_term, NEVER Thm.maxidx_of_cterm: Thm.cprem_of copies the WHOLE
    sequent's maxidx into each premise's cterm, and in this system the protected
@@ -826,16 +810,19 @@ fun fork_state ctxt f (goal : cterm, goal_state : thm) =
           else raise THM ("async_prove: the solver returned a conclusion that is \
                           \not the one it was given", 0, [th])
       in (a, th) end
-    val future = Execution.fork {name = "\<phi>System-async-proof", pos = pos, pri = ~1} (fn _ =>
-      case Exn.capture_body body of
-        Exn.Res r => r
-        (* execution.ML hardcodes `if exec_id = 0 then ()`, so under batch builds
-           and Isa-REPL a failing fork body prints NOTHING.  The third component
-           must be NONE for the message to be printed unconditionally. *)
-      | Exn.Exn exn =>
-          (if Exn.is_interrupt exn then ()
-           else Future.error_message pos ((serial (), Runtime.exn_message exn), NONE);
-           Exn.reraise exn))
+    (*Plain Future.forks, NOT Execution.fork -- that is PIDE document machinery,
+      not for tools.  Cancellation still works: group = NONE forks into a
+      worker_subgroup, and group cancellation follows the parent chain.  A failing
+      body prints nothing by itself; the NONE makes the report unconditional.*)
+    val future = (singleton o Future.forks)
+      {name = "\<phi>System-async-proof", group = NONE, deps = [], pri = ~1, interrupts = true}
+      (fn () =>
+        case Exn.capture_body body of
+          Exn.Res r => r
+        | Exn.Exn exn =>
+            (if Exn.is_interrupt exn then ()
+             else Future.error_message pos ((serial (), Runtime.exn_message exn), NONE);
+             Exn.reraise exn))
     val _ = Phi_Proof_Store.register_async_task (Future.task_of future)
               (Proof_Context.theory_of ctxt)
     val proved =
@@ -872,14 +859,20 @@ fun async_prove async scope f (ctxt, sequent) =
     val targets = case scope of Leading => [hd cprems] | _ => cprems
     val assms_ok = not (exists (is_schematic o Thm.term_of) (Assumption.all_assms_of ctxt))
     val bad = find_index (is_schematic o Thm.term_of) targets
-    val forking = async andalso assms_ok andalso bad < 0
+    (*Thm.future refuses promises while proof terms are recorded.  Test at the
+      decision point: inside fork_state the fork would already be running.*)
+    val proofs_ok = not (Proofterm.any_proofs_enabled ())
+    val forking = async andalso assms_ok andalso bad < 0 andalso proofs_ok
     val _ =
       if async andalso not forking
-      then sh_log ("[async_prove] running synchronously instead: " ^
+      then tracing ("[async_prove] running synchronously instead: " ^
                    (if not assms_ok
                     then "a context assumption contains a schematic variable"
-                    else "subgoal " ^ string_of_int (bad + 1) ^
-                         " contains a schematic variable"))
+                    else if bad >= 0
+                    then "subgoal " ^ string_of_int (bad + 1) ^
+                         " contains a schematic variable"
+                    else "proof term recording is enabled, and the kernel \
+                         \refuses promised theorems (Thm.future)"))
       else ()
   in
     check_exit scope nprems (
@@ -1336,7 +1329,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
           val N = Thm.nprems_of (#goal (Proof.raw_goal stat0))
           val Ns = string_of_int N
 
-          val _ = if N > 30 then (sh_log ("The prompt generates too many subgoals (" ^
+          val _ = if N > 30 then (tracing ("The prompt generates too many subgoals (" ^
                                     string_of_int N ^ "). give up...");
                                   raise Auto_Fail Too_Many_Subgoals)
                             else ()
@@ -1345,7 +1338,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
 
           val (prfs, final_state) =
             funpow' N (fn j => fn (ps,s) =>
-                        let val _ = sh_log ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
+                        let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
                             fun do_iter () =
                             case raw_sledgehammer timeout_opt override hasty s
@@ -1539,7 +1532,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
         if hasty
         then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
         else let val composed = "Auto_Sledgehammer.pre_simproc_on_concl, " ^ prf
-                 val _ = sh_log ("[sledgehammer] verifying composed proof: " ^ quote composed)
+                 val _ = tracing ("[sledgehammer] verifying composed proof: " ^ quote composed)
               in eval_prf_str kws 1 (Time.fromSeconds 180) composed (ctxt,sequent)
              end
     | NONE => (case !failed_subgoal
@@ -1571,7 +1564,7 @@ fun auto'i {improved, fact_override, timeout} (ctxt, sequent) =
             tracing "Proof search by default tactic fails. Invoking sledgehammer..."; *)
             sledgehammer timeout improved hasty kws fact_override (ctxt, sequent) )
       handle Timeout.TIMEOUT _ => (
-        sh_log "Proof search by default tactic times out. Invoking sledgehammer...";
+        tracing "Proof search by default tactic times out. Invoking sledgehammer...";
         sledgehammer timeout improved hasty kws fact_override (ctxt, sequent) )
   in
     apsnd snd found   (*async_prove's `f` yields 'a * thm; drop the context*)
@@ -1612,6 +1605,38 @@ fun guard_errors false _ _ body = body ()
       handle Auto_Fail (Internal_Failure msg) => error msg
            | Auto_Fail _ => error (error_message ctxt sequent)
 
+(*Joins wrap failures in Par_Exn even for a single future, which no Auto_Fail
+  handler matches.  Re-establish the shape without assuming the solver's
+  vocabulary: merge only when ALL failures are Auto_Fail (max rank, as in
+  `normalise`), otherwise re-raise the first exception unchanged.  Interrupts
+  win; the per-element test catches Interrupt_Breakdown inside a Par_Exn.*)
+local
+  fun flatten exn =
+    case Par_Exn.dest exn of
+      SOME (parts as _ :: _) => maps flatten parts
+    | _ => [exn]   (*SOME [] is an interrupt container: keep it as itself*)
+in
+fun joins_norm futs =
+  case Exn.capture_body (fn () => Future.joins futs) of
+    Exn.Res r => r
+  | Exn.Exn exn =>
+      (case flatten exn of
+         [] => Exn.reraise exn
+       | exns =>
+           case find_first Exn.is_interrupt exns of
+             SOME i => Exn.reraise i
+           | NONE =>
+               if forall (fn Auto_Fail _ => true | _ => false) exns
+               then raise Auto_Fail
+                      (case map classify exns of
+                         [] => raise Fail "joins_norm: empty"
+                       | r :: rs =>
+                           fold (fn r' => fn acc =>
+                                   if reason_rank r' > reason_rank acc then r' else acc)
+                                rs r)
+               else Exn.reraise (hd exns))
+end
+
 (*Run `g` once the by-products are in.  Already fulfilled (the synchronous case)
   means running it NOW, before we return, so a synchronous call still records
   before it hands control back; otherwise it becomes a dependent task.  Either
@@ -1619,17 +1644,14 @@ fun guard_errors false _ _ body = body ()
   written once.  This is the one dependent task that is allowed to join.*)
 fun after futs g =
   if forall Future.is_finished futs
-  then Future.value (g (Future.joins futs))
-  (*interrupts = true is load-bearing: with_file_lock acquires the fcntl lock under
-    `run`, and `run` restores the attributes in effect ON ENTRY (thread_attributes.ML,
-    with_attributes passes `atts1 = get_attributes ()`).  Fork this job with
-    interrupts = false and those entry attributes are already no_interrupts, so the
-    blocking setlkw wait could not be cancelled.  Losing a record to cancellation
-    costs one re-search; the append log is CRC-framed and tolerates a torn tail.*)
+  then Future.value (g (joins_norm futs))
+  (*interrupts = true: the body takes the fcntl lock, and with_file_lock's `run`
+    restores the attributes in effect on entry -- forked uninterruptible, the
+    blocking setlkw wait could never be cancelled.*)
   else singleton (Future.forks {name = "\<phi>SH.record_proof", group = NONE,
                                 deps = map Future.task_of futs, pri = 0,
                                 interrupts = true})
-         (fn () => g (Future.joins futs))
+         (fn () => g (joins_norm futs))
 
 (*Proof texts are stored with their own scope.  `[n]` is the real Isar combinator
   Select_Goals, so the record says for itself which goals it speaks for instead
@@ -1663,7 +1685,7 @@ fun auto (opts : options) ctxt0 sequent =
     (*The log line is deliberately NOT gated on write_store: it reports what the
       search found, which is worth knowing whether or not we keep it.*)
     fun record (time, prf) =
-      (sh_log ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
+      (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
        if do_write andalso not hasty
        then let val t = Phi_Proof_Store.standard_time time in
               Phi_Proof_Store.update_hash_cache hash (t, prf);
@@ -1694,16 +1716,16 @@ fun auto (opts : options) ctxt0 sequent =
       val (stale, hit) =
         if not do_read then (false, NONE)
         else case Phi_Proof_Store.get_cached_proof thy id of
-          NONE => (sh_log ("[auto] store MISS for id " ^ quote id); (false, NONE))
+          NONE => (tracing ("[auto] store MISS for id " ^ quote id); (false, NONE))
         | SOME (time, prf) =>
-           (sh_log ("[auto] store HIT for id " ^ quote id ^ ", replaying: " ^ quote prf);
+           (tracing ("[auto] store HIT for id " ^ quote id ^ ", replaying: " ^ quote prf);
             (case eval_prf_str kws 1 (Phi_Proof_Store.tolerant_time time) prf (ctxt, sequent) of
                (_, (_, sequent')) =>
                  if Thm.nprems_of sequent' < nprem
-                 then (sh_log "[auto] store replay OK"; (false, SOME (prf, sequent')))
+                 then (tracing "[auto] store replay OK"; (false, SOME (prf, sequent')))
                  else raise Auto_Fail Subgoal_unsolved)
             handle Auto_Fail _ =>
-              (sh_log "[auto] store replay FAILED, re-searching"; (true, NONE)))
+              (tracing "[auto] store replay FAILED, re-searching"; (true, NONE)))
 
       (*Level 2 -- the in-process table, keyed by the goal hash and never written
         to disk on its own.  A hit here IS recorded, which promotes it into the
@@ -1729,7 +1751,7 @@ fun auto (opts : options) ctxt0 sequent =
                 (*store self-maintenance: deliberately outside read_store /
                   write_store, and unreachable unless read_store let us hit*)
                 Phi_Proof_Store.invalidate_proof_cache true id thy)
-          else sh_log ("Proof store miss, " ^ id);
+          else tracing ("Proof store miss, " ^ id);
           search ())
     end)
   end
@@ -1752,7 +1774,7 @@ fun all_auto (opts : options) ctxt0 sequent =
     val do_write = store_flag ctxt (#write_store opts)
 
     fun record (time, prf) =
-      (sh_log ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
+      (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
        if do_write andalso not hasty
        then let val t = Phi_Proof_Store.standard_time time in
               Phi_Proof_Store.update_hash_cache hash (t, prf);
@@ -1785,17 +1807,17 @@ fun all_auto (opts : options) ctxt0 sequent =
       val (stale, hit) =
         if not do_read then (false, NONE)
         else case Phi_Proof_Store.get_cached_proof thy id of
-          NONE => (sh_log ("[all_auto] store MISS for id " ^ quote id); (false, NONE))
+          NONE => (tracing ("[all_auto] store MISS for id " ^ quote id); (false, NONE))
         | SOME (time, prf) =>
-           (sh_log ("[all_auto] store HIT for id " ^ quote id ^ ", replaying: " ^ quote prf);
+           (tracing ("[all_auto] store HIT for id " ^ quote id ^ ", replaying: " ^ quote prf);
             (*protect n, n = the number of goals this text speaks for*)
             (case eval_prf_str kws nprem (Phi_Proof_Store.tolerant_time time) prf (ctxt, sequent) of
                (_, (_, sequent')) =>
                  if Thm.no_prems sequent'
-                 then (sh_log "[all_auto] store replay OK"; (false, SOME ((time, prf), sequent')))
+                 then (tracing "[all_auto] store replay OK"; (false, SOME ((time, prf), sequent')))
                  else raise Auto_Fail Subgoal_unsolved)
             handle Auto_Fail _ =>
-              (sh_log "[all_auto] store replay FAILED, re-searching"; (true, NONE)))
+              (tracing "[all_auto] store replay FAILED, re-searching"; (true, NONE)))
 
       val (stale, replayed) =
         if is_some hit orelse not do_read then (stale, NONE)
@@ -1815,7 +1837,7 @@ fun all_auto (opts : options) ctxt0 sequent =
          (if stale
           then (warning "A cached proof fails. Re-searching proofs...";
                 Phi_Proof_Store.invalidate_proof_cache true id thy)
-          else sh_log ("Proof store miss, " ^ id);
+          else tracing ("Proof store miss, " ^ id);
           search ())
     end)
   end

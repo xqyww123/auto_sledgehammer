@@ -725,9 +725,8 @@ fun clean_hash_cache () =
    factor applied exactly once. *)
 fun update_cache_by_hash hash prf' (ctxt, sequent') =
   let val prf' = apfst standard_time prf' in (
-       (* Silenced: the same message is already logged to the auto_sledgehammer
-          log file by `sh_log` in sledgehammer_solver.ML; this panel copy was the
-          un-migrated twin.
+       (* Silenced: sledgehammer_solver.ML already traces the same message at
+          its record points; this copy was the un-migrated twin.
        tracing (
           "Find proof (" ^ hash ^ ", time: " ^ Time.toString (fst prf') ^ "): " ^
            (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
