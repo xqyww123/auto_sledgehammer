@@ -30,7 +30,7 @@ text \<open>
 
   The proofs obtained by Sledgehammer are cached by the hash of the proof goal.
   When Isabelle's evaluation reaches the last \<open>end\<close> command of a theory file, the cache will be
-  stored into a file named "<theory-name>.proof-cache". This cache will be loaded when later
+  stored into a file named "<theory-name>.proof-store". This store will be loaded when later
   Isabelle re-evaluates the same theory, so that \<open>auto_sledgehammer\<close> can reuse the cached
   proofs without rerunning Sledgehammer again.
 

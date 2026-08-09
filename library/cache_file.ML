@@ -689,7 +689,11 @@ val _ = Theory.setup (Theory.at_end (fn thy => (
     in if null tasks then (compact_store thy; close_store thy)
        else ((* tracing "There are asynchronous proof tasks. The proof cache will be compacted \
                        \once they are finished." ; *)
-             Future.forks {name="\<phi>System.compact_store", group=NONE, deps = tasks, pri=1, interrupts=false}
+             (*interrupts=true for the same reason as \<phi>SH.record_proof: this body
+               takes the fcntl lock, and with_file_lock's `run` restores the attributes
+               in effect on entry, so forking uninterruptible would make the blocking
+               setlkw wait uncancellable.*)
+             Future.forks {name="\<phi>System.compact_store", group=NONE, deps = tasks, pri=1, interrupts=true}
               [(fn _ => (compact_store thy; close_store thy
                          (* ; tracing "The proof cache has been compacted." *)))] ;
             ())

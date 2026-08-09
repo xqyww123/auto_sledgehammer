@@ -1620,9 +1620,15 @@ fun guard_errors false _ _ body = body ()
 fun after futs g =
   if forall Future.is_finished futs
   then Future.value (g (Future.joins futs))
+  (*interrupts = true is load-bearing: with_file_lock acquires the fcntl lock under
+    `run`, and `run` restores the attributes in effect ON ENTRY (thread_attributes.ML,
+    with_attributes passes `atts1 = get_attributes ()`).  Fork this job with
+    interrupts = false and those entry attributes are already no_interrupts, so the
+    blocking setlkw wait could not be cancelled.  Losing a record to cancellation
+    costs one re-search; the append log is CRC-framed and tolerates a torn tail.*)
   else singleton (Future.forks {name = "\<phi>SH.record_proof", group = NONE,
                                 deps = map Future.task_of futs, pri = 0,
-                                interrupts = false})
+                                interrupts = true})
          (fn () => g (Future.joins futs))
 
 (*Proof texts are stored with their own scope.  `[n]` is the real Isar combinator
