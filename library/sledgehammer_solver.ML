@@ -112,6 +112,18 @@ val get_sledgehammer_params : Proof.context -> (string * string) list
 
 val fast_mepo_max_facts : int Config.T
 val fast_mepo_tac : Time.time -> Proof.context -> int -> tactic
+(* The pieces fast_mepo_tac is built from, exported for FactInTime proof
+   recording (AoA stage 3a, D37): the recorder needs the rendered proof text
+   that fast_mepo_tac keeps internal, and the replayer for recorded texts. *)
+val facts_as_mepo_lazy_facts : bool (*local facts only*) -> Proof.context
+                            -> Sledgehammer_Fact.lazy_fact list
+val run_mepo_and_render : Time.time -> int (*max_facts*)
+                       -> Sledgehammer_Fact.lazy_fact list (*MePo pool; [] skips MePo*)
+                       -> (string * thm) list (*extra add facts*)
+                       -> (string * thm) list (*del facts*)
+                       -> Proof.context -> int -> thm -> thm * string * Time.time
+val replay_mepo_proof : Keyword.keywords -> Time.time -> int -> string
+                     -> context_state -> context_state
 
 val eval_prf_str_stat : Keyword.keywords -> int -> (unit -> string * Proof.state) option
                      -> string -> Proof.state -> string * Proof.state
