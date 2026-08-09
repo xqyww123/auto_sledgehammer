@@ -946,28 +946,23 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                 system the conclusion almost always carries schematics, which the
                 kernel rejects when the promise is generalised.
 
-                Both sides are beta-eta contracted, symmetrically.  Contracting
-                only the extracted G_i would break Thm.implies_elim, whose match
-                is alpha-only.  Doing eta as well as beta turns a property that
-                otherwise depends on which rules happened to fire into a
-                structural one. *)
-             val norm = map (fn ct => Thm.cterm_of ctxt
-                                        (Envir.beta_eta_contract (Thm.term_of ct))) cprems
-             val conj = Conjunction.mk_conjunction_balanced norm
+                The symmetric beta-eta normalization of both sides is retired
+                (stage 4d, §2.5): back_conv at the AoA boundary now restores
+                the verbatim conclusion — the CAUSE of the alpha-only
+                implies_elim mismatches — so the symptomatic normalization is
+                gone and the solver sees the subgoals exactly as authored.
+                fork_state's aconv assertion remains as last-resort insurance. *)
+             val conj = Conjunction.mk_conjunction_balanced cprems
              (* G_1 ==> ... ==> G_n ==> #(G_1 &&& ... &&& G_n); same shape as
                 Minilang's merge_goal_states, which runs this in production *)
              val goal_state =
-                   Conjunction.intr_balanced (map Thm.assume norm)
+                   Conjunction.intr_balanced (map Thm.assume cprems)
                      |> Goal.protect 0
-                     |> fold_rev Thm.implies_intr norm
+                     |> fold_rev Thm.implies_intr cprems
              val (fut, proved) = fork_state failure_msg ctxt f (conj, goal_state)
              val parts = Conjunction.elim_balanced nprems proved
-             val sequent' =
-                   fold2 (fn cprem => fn part => fn seq =>
-                            Thm.implies_elim seq
-                              (Thm.equal_elim
-                                 (Thm.symmetric (Drule.beta_eta_conversion cprem)) part))
-                         cprems parts sequent
+             val sequent' = fold (fn part => fn seq => Thm.implies_elim seq part)
+                                 parts sequent
             in (true, [fut], sequent') end
        | _ =>
            let val (futs, sequent') =
