@@ -141,6 +141,10 @@ type proof_cache = Time.time * string
 type store = {proofs: proof_cache Symtab.table,
               async_tasks: Task_Queue.task list}
 
+(*Where this theory's store file lives.  Exported because user-facing messages
+  name that path, and the naming convention must have exactly one source.*)
+val store_path : theory -> Path.T
+
 val get_store : theory -> store
 val force_reload : theory -> store
 val register_async_task : Task_Queue.task -> theory -> unit
