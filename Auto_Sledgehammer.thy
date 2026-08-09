@@ -4,6 +4,20 @@ begin
 (*declare [[ML_debugger, ML_print_depth = 1000, ML_exception_debugger]]*)
 named_theorems \<phi>sledgehammer_simps \<open>Simplification rules used before applying slegehammer automation\<close>
 
+text \<open>\<open>NO_SIMP\<close> stops the simplifier from descending into the term it wraps. One constant
+  serves both levels: an occurrence under \<open>Trueprop\<close> is object-level, one at the top of a
+  \<^typ>\<open>prop\<close> is meta-level. They are told apart by position, never by name.\<close>
+
+definition NO_SIMP where \<open>NO_SIMP (X::'a::{}) \<equiv> X\<close>
+
+lemma NO_SIMP_cong[cong]: \<open>NO_SIMP (X::'a::{}) \<equiv> NO_SIMP X\<close> .
+  \<comment> \<open>The sort annotation is load-bearing. Without it \<open>X\<close> takes HOL's default sort, this rule
+      stops matching meta-level instances, and nothing reports it -- the tag just quietly
+      stops protecting them.\<close>
+
+lemma NO_SIMP_I : \<open>P \<Longrightarrow> NO_SIMP P\<close> unfolding NO_SIMP_def .
+lemma NO_SIMP_I': \<open>PROP P \<Longrightarrow> PROP NO_SIMP P\<close> unfolding NO_SIMP_def .
+
 ML_file \<open>library/helpers0.ML\<close>
 ML_file \<open>library/Hasher.ML\<close>
 ML_file \<open>library/cache_file.ML\<close>
