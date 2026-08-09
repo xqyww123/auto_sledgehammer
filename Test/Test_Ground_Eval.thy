@@ -2,7 +2,7 @@ theory Test_Ground_Eval
   imports Auto_Sledgehammer.Auto_Sledgehammer
 begin
 
-declare [[enable_proof_cache = false]]
+declare [[enable_proof_store = false]]
 
 section \<open>The standalone \<open>ground_eval\<close> method\<close>
 

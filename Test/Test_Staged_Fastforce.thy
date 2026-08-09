@@ -2,7 +2,7 @@ theory Test_Staged_Fastforce
   imports Auto_Sledgehammer.Auto_Sledgehammer
 begin
 
-declare [[enable_proof_cache = false]]
+declare [[enable_proof_store = false]]
 
 section \<open>Test: \<open>fast_mepo_tac\<close> basic functionality after refactoring\<close>
 

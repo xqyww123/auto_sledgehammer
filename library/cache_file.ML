@@ -1,7 +1,7 @@
-(* Building Cache *)
+(* Building the Proof Store *)
 
 (* ===========================================================================
-   Proof cache on-disk format: a crash-robust, multi-process-safe append log.
+   Proof store on-disk format: a crash-robust, multi-process-safe append log.
 
    The file is a sequence of self-delimited frames:
 
@@ -24,7 +24,7 @@
    This structure is deliberately exposed (no signature ascription) so the
    format can be unit-tested directly.
    =========================================================================== *)
-structure Proof_Cache_Format = struct
+structure Proof_Store_Format = struct
 
 val magic_word = 0wx6ABCDEF6 : Word32.word
 
@@ -134,20 +134,20 @@ fun replay records =
 end
 
 
-signature PHI_CACHE_DB = sig
+signature PHI_PROOF_STORE = sig
 
 type proof_id = string
 type proof_cache = Time.time * string
-type cache = {proofs: proof_cache Symtab.table,
+type store = {proofs: proof_cache Symtab.table,
               async_tasks: Task_Queue.task list}
 
-val get_cache : theory -> cache
-val force_reload : theory -> cache
+val get_store : theory -> store
+val force_reload : theory -> store
 val register_async_task : Task_Queue.task -> theory -> unit
 
-val store_cache : theory -> unit
-val store_and_close_cache : theory -> unit
-val invalidate_cache : theory -> unit
+val compact_and_store : theory -> unit
+val close_store : theory -> unit
+val invalidate_store : theory -> unit
 val invalidate_proof_cache : bool (*whether warn*) -> proof_id -> theory -> unit
 (* val check_cache : string (*Document_ID*) -> Proof.context -> unit *)
 val report_cache_is_outdated : bool (*whether warn*) -> theory -> unit
@@ -160,10 +160,6 @@ val update_cached_proof : theory -> proof_id * (Time.time * string) -> unit
   lemma can be changed due to the editing, but the hash digest will not only if the proposition of
   the lemma itself is unchanged, so the proof can be still cached and saves the user from annoying
   proof re-search.
-  However, the hash cache DB is heavy in both calculating the hash (having to enumerate every term
-  and type with many string concatenations, costing about hundreds milliseconds) and storing the
-  record as the hash has no way to be short (the scope is in global!) but of 20 bytes using SHA1.
-  Therefore, this feature is only enabled during the interactive editing time.
 *)
 
 val access_hash_cache : Hasher.digest -> proof_cache option
@@ -174,8 +170,17 @@ type proof = string
 
 (*Budget for replaying a cached proof: the time recorded when it was found, plus
   slack for a machine that is busier now than it was then.  Overrunning it
-  invalidates the entry and re-searches the proof from scratch.*)
+  invalidates the entry and re-searches the proof from scratch.
+
+  The result is a NOMINAL time handed to Timeout.apply, which multiplies this
+  machine's timeout_scale in itself -- so never multiply the factor in here.*)
 val tolerant_time : Time.time -> Time.time
+
+(*The write-side counterpart: divide a measured elapsed time by this machine's
+  timeout_scale, so what lands in the store is standard-machine time and a slow
+  machine does not hand every other machine an inflated replay budget.  Every
+  write point must pass its measurement through this before storing it.*)
+val standard_time : Time.time -> Time.time
 
 val try_cached_proof_by_hash :
          (Time.time -> proof -> context_state -> context_state option) (*evaluator*)
@@ -193,44 +198,49 @@ val try_cached_proof_by_hash_at :
       -> context_state
       -> (Time.time * proof) * context_state
 
-val enable_proof_cache : bool Config.T
+val enable_proof_store : bool Config.T
 
 end
 
 
-structure Phi_Cache_DB : PHI_CACHE_DB = struct
+structure Phi_Proof_Store : PHI_PROOF_STORE = struct
 
-val enable_proof_cache = Attrib.setup_config_bool \<^binding>\<open>enable_proof_cache\<close> (K true)
+val enable_proof_store = Attrib.setup_config_bool \<^binding>\<open>enable_proof_store\<close> (K true)
 
 type proof_id = string
 type proof_cache = Time.time * string
-type cache = {proofs: (Time.time * string) Symtab.table,
+type store = {proofs: (Time.time * string) Symtab.table,
               async_tasks: Task_Queue.task list}
 
-val empty_cache = {proofs = Symtab.empty, async_tasks = []} : cache
+val empty_store = {proofs = Symtab.empty, async_tasks = []} : store
 
-open Proof_Cache_Format  (*MAGIC, crc32, frame, scan, replay, encode_put, encode_tombstone, ...*)
+open Proof_Store_Format  (*MAGIC, crc32, frame, scan, replay, encode_put, encode_tombstone, ...*)
 
-fun cache_update_proof (id,s) ({proofs, async_tasks}:cache)
+fun store_update_proof (id,s) ({proofs, async_tasks}:store)
       = {proofs = Symtab.update (id,s) proofs,
-         async_tasks = async_tasks} : cache
+         async_tasks = async_tasks} : store
 
-fun cache_invalidate_proof id ({proofs,async_tasks}:cache)
+fun store_invalidate_proof id ({proofs,async_tasks}:store)
       = {proofs = Symtab.delete_safe id proofs (*Symtab.fold (fn (k,_) =>
                       if Phi_ID.dep id k
                       then Symtab.delete k
                       else I) proofs proofs*),
          async_tasks = []
-        } : cache
+        } : store
 
-fun cache_add_async task ({proofs,async_tasks}:cache)
-      = {proofs = proofs, async_tasks = task :: async_tasks} : cache
+fun store_add_async task ({proofs,async_tasks}:store)
+      = {proofs = proofs, async_tasks = task :: async_tasks} : store
 
-fun cache_path thy =
+fun store_base thy =
       Path.append (Resources.master_directory thy) (Path.basic (Context.theory_name {long=false} thy))
-   |> Path.ext "proof-cache"
 
-fun lock_path thy = Path.ext "lock" (cache_path thy)   (* <thy>.proof-cache.lock *)
+fun store_path thy = Path.ext "proof-store" (store_base thy)
+
+(* The pre-rename file name.  Only ever READ, and only by migrate_legacy on the
+   first touch of a theory's store; nothing appends to it again. *)
+fun legacy_cache_path thy = Path.ext "proof-cache" (store_base thy)
+
+fun lock_path thy = Path.ext "lock" (store_path thy)   (* <thy>.proof-store.lock *)
 
 (* Whether the cache location admits the writes this module performs: creating
    the lock file and the compaction temp file, appending to the data file,
@@ -250,11 +260,11 @@ fun accessible path modes =
 
 fun probe_writable thy =
   let val dir = Resources.master_directory thy
-      val cache = cache_path thy
+      val data = store_path thy
       val lock = lock_path thy
    in File.is_dir dir andalso
       accessible dir [OS.FileSys.A_WRITE, OS.FileSys.A_EXEC] andalso
-      (not (File.exists cache) orelse accessible cache [OS.FileSys.A_WRITE]) andalso
+      (not (File.exists data) orelse accessible data [OS.FileSys.A_WRITE]) andalso
       (not (File.exists lock) orelse accessible lock [OS.FileSys.A_WRITE])
   end
 
@@ -268,11 +278,11 @@ fun probe_writable thy =
    TWO readers, deliberately, because there are two callers with OPPOSITE needs.
 
    `read_file_state_exn` lets an I/O failure escape, and is what compaction must
-   use: `compact_cache` feeds this result straight back to `write_state_new`, so
+   use: `compact_store` feeds this result straight back to `write_state_new`, so
    a reader that degrades to `Symtab.empty` there does not degrade -- it TRUNCATES
    the user's cache to nothing and renames the empty payload over it.  Letting the
    exception out instead aborts the rewrite with the file byte-intact, and
-   `compact_cache`'s own handler demotes the verdict.  Triggers are not only
+   `compact_store`'s own handler demotes the verdict.  Triggers are not only
    permissions: EIO, an NFS ESTALE, EMFILE under a parallel build, or Size on a
    large cache all raise here from an ordinary mode-0644 file.
 
@@ -359,7 +369,7 @@ end
    directory share a file yet got two different mutexes.
 
    NEVER evicted, deliberately.  This var IS the mutex: dropping it while another
-   thread sits inside `Synchronized.change v` lets the next cache_append_lock
+   thread sits inside `Synchronized.change v` lets the next store_append_lock
    mint a fresh var, so two threads then append unserialised -- reachable via the
    async at_end branch.  Deleting while HOLDING v does not help either, since the
    blocked thread already has the reference; a safe eviction would need
@@ -377,22 +387,22 @@ end
 val append_locks : bool Synchronized.var Strhashtab.table = Strhashtab.empty 16
 
 val append_locks_guard : unit Synchronized.var =
-  Synchronized.var "phi_cache.append_locks" ()
+  Synchronized.var "phi_store.append_locks" ()
 
-fun cache_append_lock key =
+fun store_append_lock key =
   Synchronized.change_result append_locks_guard (fn () =>
     (case Strhashtab.lookup append_locks key of
        SOME v => (v, ())
      | NONE =>
-         let val v = Synchronized.var ("phi_cache.append." ^ key) false
+         let val v = Synchronized.var ("phi_store.append." ^ key) false
           in Strhashtab.update append_locks (key, v); (v, ()) end))
 
 (* The warning is emitted at most once per LOCATION, not once per theory or per
    proof: it is the directory the user has to fix, and a theory can reach a write
    site many times.  warned_dirs is a leaf lock (probe_writable takes none), so it
-   adds no cycle to the v -> fcntl -> openning_caches order below. *)
+   adds no cycle to the v -> fcntl -> openning_stores order below. *)
 val warned_dirs : unit Symtab.table Synchronized.var =
-  Synchronized.var "phi_cache.warned_dirs" Symtab.empty
+  Synchronized.var "phi_store.warned_dirs" Symtab.empty
 
 fun warn_not_writable thy =
   let val dir = Path.implode (Resources.master_directory thy)
@@ -400,7 +410,7 @@ fun warn_not_writable thy =
            (Symtab.defined tab dir, Symtab.update (dir, ()) tab))
       then ()
       else warning ("Proof cache for theory " ^ Context.theory_name {long=true} thy ^
-                    " is not writable (" ^ Path.print (cache_path thy) ^
+                    " is not writable (" ^ Path.print (store_path thy) ^
                     "); cached proofs will be read but not recorded.")
   end
 
@@ -428,7 +438,7 @@ fun warn_not_writable thy =
    one.  Isa-REPL now absolutises its base dir on entry (Server.ML `startup` and
    the \x05file handler), so a genuinely relative master_dir should not arise;
    expand-only normalisation here is the defence that holds even if one does. *)
-fun cache_file_key thy = File.standard_path (cache_path thy)
+fun store_file_key thy = File.standard_path (store_path thy)
 
 (* NOT memoised, deliberately.  Measured on this machine: the probe is 10.4 us
    and a memo lookup 0.24 us, against a call site that only runs when a proof is
@@ -438,7 +448,7 @@ fun cache_file_key thy = File.standard_path (cache_path thy)
    location, a `chmod u+w` could not take effect until the entry was evicted, and
    the table grew without bound.  Probing every time makes all of that vanish and
    is what a user expects -- fix the permissions, caching resumes at once. *)
-fun cache_is_writable thy =
+fun store_is_writable thy =
   let val ok = probe_writable thy
    in if ok then () else warn_not_writable thy; ok end
 
@@ -447,11 +457,46 @@ fun cache_is_writable thy =
    not a proof obligation. \<^try> re-raises interrupts, so this stays safe under
    the Timeout that wraps sledgehammer. *)
 fun try_write thy body =
-  if not (cache_is_writable thy) then ()
+  if not (store_is_writable thy) then ()
   else \<^try>\<open>body () catch _ => ()\<close>
     (* Nothing to demote: the verdict is re-probed on the next attempt, so a
        transient failure (ENOSPC clearing, a remount, an NFS hiccup) recovers by
        itself instead of disabling the cache for the rest of the process. *)
+
+(* One-shot migration of the pre-rename <thy>.proof-cache into <thy>.proof-store.
+   Goes through this module's own write funnel: writability probe -> in-process
+   mutex -> fcntl lock -> \<^try>, so a read-only or otherwise unwritable location
+   simply does not migrate (the read path keeps falling back to the legacy file
+   there).  The old file is left in place, never deleted.
+
+   RE-CHECKING under the lock is the point: between the fast-path test and the
+   lock another process may have migrated AND appended new records, and renaming
+   our own stale snapshot over that would drop them.
+
+   read_file_state_exn, not the degrading reader: a reader that answers
+   Symtab.empty on an I/O failure would hand write_state_new an empty table and
+   silently write the legacy content away.
+
+   CALL IT from the five public entry points only, at the very top of their
+   bodies -- NEVER from load_store_raw / get_store_i (lock order is
+   v -> fcntl -> openning_stores; calling it there closes the cycle) and never
+   inside append_record's or compact_store's `Synchronized.change v` body
+   (that var is not reentrant). *)
+fun migrate_legacy thy =
+  let val new_path = store_path thy
+      val old_path = legacy_cache_path thy
+      val v = store_append_lock (store_file_key thy)
+   in if File.is_file new_path orelse not (File.is_file old_path)
+      then ()                                          (* fast path, no lock *)
+      else Synchronized.change v (fn confirmed =>
+        if not (store_is_writable thy) then confirmed
+        else \<^try>\<open>
+          with_file_lock (lock_path thy) (fn () =>
+            (if File.is_file new_path then ()
+             else write_state_new new_path (read_file_state_exn old_path);
+             confirmed))
+          catch _ => confirmed\<close>)
+  end
 
 (* Before appending, if the on-disk file exists but is NOT in the new format
    (an old/incompatible/corrupt file), discard it so we never append binary
@@ -473,10 +518,10 @@ fun ensure_new_format path =
    `confirmed`: a confirmed format stays confirmed, an unconfirmed one is not
    falsely upgraded. *)
 fun append_record thy bytes =
-  let val path = cache_path thy
-      val v = cache_append_lock (cache_file_key thy)
+  let val path = store_path thy
+      val v = store_append_lock (store_file_key thy)
    in Synchronized.change v (fn confirmed =>
-        if not (cache_is_writable thy) then confirmed
+        if not (store_is_writable thy) then confirmed
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
             ((if confirmed then () else ensure_new_format path);
@@ -491,11 +536,11 @@ fun append_record thy bytes =
    Guarded like append_record -- this is what protects the Theory.at_end hook
    below, whose deferred Future.forks branch would otherwise surface an IO.Io
    as a spurious error long after the theory has finished. *)
-fun compact_cache thy =
-  let val path = cache_path thy
-      val v = cache_append_lock (cache_file_key thy)
+fun compact_store thy =
+  let val path = store_path thy
+      val v = store_append_lock (store_file_key thy)
    in Synchronized.change v (fn confirmed =>
-        if not (cache_is_writable thy) then confirmed
+        if not (store_is_writable thy) then confirmed
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
             (if File.is_file path then write_state_new path (read_file_state_exn path) else ();
@@ -503,72 +548,86 @@ fun compact_cache thy =
           catch _ => confirmed\<close>)
   end
 
-val openning_caches : (cache * bool) Symtab.table Synchronized.var
-  = Synchronized.var "\<phi>-System.openning_caches" Symtab.empty
+val openning_stores : (store * bool) Symtab.table Synchronized.var
+  = Synchronized.var "\<phi>-System.openning_stores" Symtab.empty
 
-fun load_cache_raw thy =
-  {proofs = read_file_state (cache_path thy), async_tasks = []} : cache
+(* Read fallback: where migration could not run (an unwritable location) the new
+   file simply is not there, and the legacy one still holds every record -- so
+   read it rather than come up empty.  Deliberately NOT inside migrate_legacy's
+   guard: this path takes no lock and must stay callable from get_store_i. *)
+fun load_store_raw thy =
+  let val path = store_path thy
+      val path = if File.is_file path then path else legacy_cache_path thy
+   in {proofs = read_file_state path, async_tasks = []} : store end
 
 fun force_reload thy =
-  Synchronized.change_result openning_caches (fn tab =>
-    let val c = load_cache_raw thy
-     in (c, Symtab.update (Context.theory_name {long=true} thy, (c, false)) tab) end )
+ (migrate_legacy thy;                                        (*D44: outside the critical section*)
+  Synchronized.change_result openning_stores (fn tab =>
+    let val c = load_store_raw thy
+     in (c, Symtab.update (Context.theory_name {long=true} thy, (c, false)) tab) end ))
 
-fun get_cache_i thy tab =
+fun get_store_i thy tab =
   case Symtab.lookup tab (Context.theory_name {long=true} thy)
       of SOME (x, _) => (x, tab)
-       | _ => let val c = load_cache_raw thy
+       | _ => let val c = load_store_raw thy
                in (c, Symtab.update_new (Context.theory_name {long=true} thy, (c, false)) tab) end
 
-fun get_cache thy =
-  Synchronized.change_result openning_caches (get_cache_i thy)
+fun get_store thy =
+ (migrate_legacy thy;                                        (*D44*)
+  Synchronized.change_result openning_stores (get_store_i thy))
 
 fun register_async_task task thy =
   let val name = Context.theory_name {long=true} thy
-   in Synchronized.change openning_caches (fn tab =>
+      val _ = migrate_legacy thy                             (*D44*)
+   in Synchronized.change openning_stores (fn tab =>
       case Symtab.lookup tab name
-        of SOME (c, flag) => Symtab.update (name, (cache_add_async task c, flag)) tab
-         | _ => let val c = cache_add_async task (load_cache_raw thy)
+        of SOME (c, flag) => Symtab.update (name, (store_add_async task c, flag)) tab
+         | _ => let val c = store_add_async task (load_store_raw thy)
                  in Symtab.update_new (name, (c, false)) tab end )
   end
 
 (* Persistence is now continuous (each update appends immediately), so storing
    is just compaction; closing just drops the in-memory entry. *)
-fun store_cache thy = compact_cache thy
+fun compact_and_store thy = compact_store thy
 
-fun store_and_close_cache thy =
+fun close_store thy =
   (* Only the in-memory proof table is per-theory state to drop here.  There is no
      writability verdict to evict any more (it is probed, not cached), and the
-     append lock must NOT be evicted -- see cache_append_lock. *)
-  Synchronized.change openning_caches
+     append lock must NOT be evicted -- see store_append_lock. *)
+  Synchronized.change openning_stores
     (Symtab.delete_safe (Context.theory_name {long=true} thy))
 
 (* Drop the data file and reset the in-memory entry as ONE per-theory critical
    section (under the same `v` that serialises appends), so a concurrent append
    cannot slip between the disk-rm and the memory-reset. Lock order here is
-   v -> fcntl -> openning_caches; nothing acquires v while holding
-   openning_caches, so there is no cycle. The in-memory half is unconditional:
+   v -> fcntl -> openning_stores; nothing acquires v while holding
+   openning_stores, so there is no cycle. The in-memory half is unconditional:
    when the disk half is skipped, a bad cached proof is still dropped for this
    session, we merely cannot record the tombstone durably. *)
-fun invalidate_cache thy =
-  (* two keys: the mutex/flag is per cache FILE, the openning_caches entry below
+fun invalidate_store thy =
+  (* two keys: the mutex/flag is per cache FILE, the openning_stores entry below
      is per theory. *)
   let val name = Context.theory_name {long=true} thy in
-  Synchronized.change (cache_append_lock (cache_file_key thy)) (fn _ =>
+  Synchronized.change (store_append_lock (store_file_key thy)) (fn _ =>
     (try_write thy (fn () =>
        with_file_lock (lock_path thy) (fn () =>
-         if File.is_file (cache_path thy) then File.rm (cache_path thy) else ()));
-     Synchronized.change openning_caches (Symtab.update (name, (empty_cache, true)));
+         if File.is_file (store_path thy) then File.rm (store_path thy) else ()));
+     Synchronized.change openning_stores (Symtab.update (name, (empty_store, true)));
      false))
   end
 
-fun get_cached_proof thy = Symtab.lookup (#proofs (get_cache thy))
+fun get_cached_proof thy = Symtab.lookup (#proofs (get_store thy))
 
+(* The time in `s` must ALREADY be standard-machine time -- every caller passes
+   its measurement through standard_time first.  Normalising here instead would
+   double-divide the callers that (per the time-semantics rule) do it themselves
+   before handing the record over. *)
 fun update_cached_proof thy (id,s) =
- (Synchronized.change openning_caches (fn tab =>
-    let val (_, tab') = get_cache_i thy tab
+ (migrate_legacy thy;                                        (*D44: a write can be the first touch*)
+  Synchronized.change openning_stores (fn tab =>
+    let val (_, tab') = get_store_i thy tab
      in Symtab.map_entry (Context.theory_name {long=true} thy)
-                         (fn (c, _) => (cache_update_proof (id,s) c, true)) tab'
+                         (fn (c, _) => (store_update_proof (id,s) c, true)) tab'
     end);
   append_record thy (encode_put (id, Time.toMilliseconds (#1 s), #2 s)))
 
@@ -579,10 +638,11 @@ fun report_cache_is_outdated warn thy =
 
 fun invalidate_proof_cache warn id thy =
  (report_cache_is_outdated warn thy;
-  Synchronized.change openning_caches (fn tab =>
-    let val (_, tab') = get_cache_i thy tab
+  migrate_legacy thy;                                        (*D44*)
+  Synchronized.change openning_stores (fn tab =>
+    let val (_, tab') = get_store_i thy tab
      in Symtab.map_entry (Context.theory_name {long=true} thy)
-                         (fn (c, _) => (cache_invalidate_proof id c, true)) tab'
+                         (fn (c, _) => (store_invalidate_proof id c, true)) tab'
     end);
   append_record thy (encode_tombstone id))
 
@@ -622,19 +682,23 @@ fun check_cache doc_id ctxt =
    still-running async proof tasks REGISTERED via register_async_task: it lets
    those tasks' appends land before we rewrite. A late append from a registered
    task after store_and_close still goes to disk durably; it would re-insert a
-   stale in-memory openning_caches entry (harmless, dropped next load) -- the
+   stale in-memory openning_stores entry (harmless, dropped next load) -- the
    deferral keeps that from happening for the registered tasks. *)
 val _ = Theory.setup (Theory.at_end (fn thy => (
-  let val tasks = #async_tasks (get_cache thy)
-    in if null tasks then (compact_cache thy; store_and_close_cache thy)
+  let val tasks = #async_tasks (get_store thy)
+    in if null tasks then (compact_store thy; close_store thy)
        else ((* tracing "There are asynchronous proof tasks. The proof cache will be compacted \
                        \once they are finished." ; *)
-             Future.forks {name="\<phi>System.compact_cache", group=NONE, deps = tasks, pri=1, interrupts=false}
-              [(fn _ => (compact_cache thy; store_and_close_cache thy
+             Future.forks {name="\<phi>System.compact_store", group=NONE, deps = tasks, pri=1, interrupts=false}
+              [(fn _ => (compact_store thy; close_store thy
                          (* ; tracing "The proof cache has been compacted." *)))] ;
             ())
     end
   ; NONE)))
+
+(* Guard the divisor: timeout_scale is a user-settable real, and 0 (or a
+   negative) would blow up or negate every stored time. *)
+fun standard_time t = Time.scale (1.0 / Real.max (Timeout.scale (), 0.001)) t
 
 (*** Proof cache by hash ***)
 
@@ -651,7 +715,12 @@ fun update_hash_cache hash prf =
 fun clean_hash_cache () =
   Synchronized.change hash_cache (K Symtab.empty)
 
-fun update_cache_by_hash hash prf' (ctxt, sequent') = (
+(* prf' carries the RAW measured elapsed; standard_time normalises it once here,
+   for both the in-process table and the disk record, so the two agree and both
+   read paths (which pass it through tolerant_time into Timeout.apply) get the
+   factor applied exactly once. *)
+fun update_cache_by_hash hash prf' (ctxt, sequent') =
+  let val prf' = apfst standard_time prf' in (
        (* Silenced: the same message is already logged to the auto_sledgehammer
           log file by `sh_log` in sledgehammer_solver.ML; this panel copy was the
           un-migrated twin.
@@ -661,7 +730,7 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') = (
        ) ; *)
        update_hash_cache hash prf';
        update_cached_proof (Proof_Context.theory_of ctxt) (hash, prf') ;
-       (snd prf', sequent'))
+       (snd prf', sequent')) end
 
 type proof = string
 val time_delt = Time.fromMilliseconds 1000
@@ -674,7 +743,7 @@ fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) 
              in update_cache_by_hash hash prf' (ctxt, sequent)
               ; (prf', ret)
             end
-   in if Config.get ctxt enable_proof_cache
+   in if Config.get ctxt enable_proof_store
     then case get_cached_proof (Proof_Context.theory_of ctxt) hash
           of NONE => fallback' NONE
            | SOME (time,prf) =>
@@ -687,7 +756,11 @@ fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) 
     else fallback NONE
   end
 
-val try_cached_proof_by_hash = try_cached_proof_by_hash_with_key Hasher.goal
+(* Keyed on the LEADING subgoal, like every other single-goal entry point.  It
+   used to key on Hasher.goal (the whole proposition, conclusion included); that
+   formula is not invariant under the fork/promise transformation and must not
+   survive anywhere, least of all behind an exported name. *)
+val try_cached_proof_by_hash = try_cached_proof_by_hash_with_key (Hasher.goal_at 1)
 
 fun try_cached_proof_by_hash_at i = try_cached_proof_by_hash_with_key (Hasher.goal_at i)
 

@@ -2,7 +2,7 @@ theory Auto_Sledgehammer
   imports HOL.Sledgehammer Performant_Isabelle_ML.Performant_Isabelle_ML
 begin
 (*declare [[ML_debugger, ML_print_depth = 1000, ML_exception_debugger]]*)
-(* named_theorems \<phi>sledgehammer_simps \<open>Simplification rules used before applying slegehammer automation\<close> *)
+named_theorems \<phi>sledgehammer_simps \<open>Simplification rules used before applying slegehammer automation\<close>
 
 ML_file \<open>library/helpers0.ML\<close>
 ML_file \<open>library/Hasher.ML\<close>

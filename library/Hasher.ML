@@ -57,6 +57,7 @@ val typ  : typ -> digest
 val term : term -> digest
 val goal : context_state -> digest
 val goal_at : int -> context_state -> digest
+val all_goals : context_state -> digest
 
 end
 
@@ -190,15 +191,17 @@ fun typ ty = word64_to_hex (hash_typ ty fnv_offset_basis)
 
 fun term t = word64_to_hex (hash_term t fnv_offset_basis)
 
-fun hash_in_context ctxt term =
+fun hash_in_context' ctxt terms =
   let
     val thy_name = Context.theory_name {long=false} (Proof_Context.theory_of ctxt)
     val h0 = hash_string thy_name fnv_offset_basis
     val h1 = fold (hash_term o Thm.term_of) (Assumption.all_assms_of ctxt) h0
-    val h2 = hash_term term h1
+    val h2 = fold hash_term terms h1
   in
     word64_to_hex h2
   end
+
+fun hash_in_context ctxt term = hash_in_context' ctxt [term]
 
 (* goal_at 0 hashes the whole proposition (all subgoals + conclusion);
    goal_at i for i >= 1 hashes the i-th subgoal in isolation. *)
@@ -206,5 +209,13 @@ fun goal_at 0 (ctxt, stat) = hash_in_context ctxt (Thm.prop_of stat)
   | goal_at i (ctxt, stat) = hash_in_context ctxt (Logic.get_goal (Thm.prop_of stat) i)
 
 fun goal cs = goal_at 0 cs
+
+(* Hashes EVERY subgoal of the state and nothing else -- the protected
+   conclusion is deliberately excluded, so the key is invariant under the
+   fork/promise transformation that replaces the conclusion (see the plan's
+   "key formula" section).  Zero subgoals is legal and folds to the empty
+   digest; unlike goal_at i (i >= 1) this never goes out of range. *)
+fun all_goals (ctxt, stat) =
+  hash_in_context' ctxt (Logic.strip_imp_prems (Thm.prop_of stat))
 
 end

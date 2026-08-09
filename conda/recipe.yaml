@@ -38,9 +38,9 @@ build:
       mkdir -p "$dest"
       cp -a "$SRC_DIR/ROOT"                  "$dest/"
       cp -a "$SRC_DIR/Auto_Sledgehammer.thy" "$dest/"
-      # library/ wholesale, not a file list: Phi_ID.ML is reached only indirectly (used by
-      # library/cache_file.ML, never ML_file'd from the theory), so enumerating the
-      # ML_file lines would silently drop it.
+      # library/ wholesale, not a file list: Phi_ID.ML has no reference at all -- the
+      # theory never ML_file's it and cache_file.ML mentions Phi_ID only inside
+      # comments -- so enumerating the ML_file lines would silently drop it.
       cp -a "$SRC_DIR/library"               "$dest/"
       # ROOT's `document_files "root.tex"` makes this mandatory, not decorative.
       cp -a "$SRC_DIR/document"              "$dest/"
@@ -49,7 +49,7 @@ build:
       # The caches are environment-specific, and the cache file is written at USE time
       # anyway -- see the note under `requirements` about where that write lands.
       find "$dest" -name '*~' -delete
-      find "$dest" \( -name '*.proof-cache' -o -name '*.proof-cache.lock' \) -delete
+      find "$dest" \( -name '*.proof-store' -o -name '*.proof-store.lock' \) -delete
 
       test -f "$dest/ROOT"
       test -f "$dest/document/root.tex"      # ROOT declares it; a missing one fails builds
