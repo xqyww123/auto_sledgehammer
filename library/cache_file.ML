@@ -189,7 +189,7 @@ val try_cached_proof_by_hash :
       -> (Time.time * proof) * context_state
 
 (*Variant keyed by Hasher.goal_at i — caches a per-subgoal proof.
-  Use i = 0 to mean "the whole sequent" (equivalent to try_cached_proof_by_hash);
+  Use i = 0 to mean "the whole sequent";
   use i >= 1 to key on the i-th subgoal in isolation.*)
 val try_cached_proof_by_hash_at :
          int (*subgoal index, 0 = whole sequent*)

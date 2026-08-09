@@ -20,10 +20,14 @@ val override_parser : Sledgehammer.fact_override parser
    raise_Error_instead_of_Auto_Fail
                  -- true turns Auto_Fail into a fatal ERROR (for the Isar
                     methods); false lets Auto_Fail through to the caller.
-   failure_msg   -- composes the text reported (Future.error_message) when a
-                    FORKED search fails; NONE = Runtime.exn_message.  Rendering
-                    only: the exception itself is re-raised unchanged, so the
-                    promise and any joiner still see the original exception. *)
+   failure_msg   -- composes the text of every human-facing failure: the forked
+                    search's report (Future.error_message), guard_errors'
+                    generic sync arm, and the promise branch, which re-raises
+                    ERROR (composed text ^ position) so the batch join at
+                    theory finish prints it.  The by-product branch keeps the
+                    original exception (joins_norm matches Auto_Fail there).
+                    NONE = raw renderings everywhere.  Rendering only: never
+                    affects the search or any control flow. *)
 type options = {improved      : bool,
                 async         : bool,
                 fact_override : Sledgehammer.fact_override,
@@ -1749,7 +1753,7 @@ fun auto (opts : options) ctxt0 sequent =
   in
     guard_errors (#raise_Error_instead_of_Auto_Fail opts) (#failure_msg opts) ctxt sequent (fn () =>
     let
-      (*Level 1 -- the on-disk store, keyed by proof id.  A hit that still
+      (*The on-disk proof store, keyed by proof id.  A hit that still
         replays is handed back as it stands; nothing is written.*)
       val (stale, hit) =
         if not do_read then (false, NONE)
@@ -1765,7 +1769,7 @@ fun auto (opts : options) ctxt0 sequent =
             handle Auto_Fail _ =>
               (tracing "[auto] store replay FAILED, re-searching"; (true, NONE)))
 
-      (*Level 2 -- the in-process table, keyed by the goal hash and never written
+      (*The in-process hash table, keyed by the goal hash and never written
         to disk on its own.  A hit here IS recorded, which promotes it into the
         store under THIS call's proof id.  Finding an entry marks the situation
         stale either way: a stored id entry that we are about to supersede.*)
