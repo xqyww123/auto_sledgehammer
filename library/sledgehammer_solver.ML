@@ -946,24 +946,27 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                 system the conclusion almost always carries schematics, which the
                 kernel rejects when the promise is generalised.
 
-                Both sides are beta-eta contracted, symmetrically.  Contracting
-                only the extracted G_i would break Thm.implies_elim, whose match
-                is alpha-only.  Doing eta as well as beta turns a property that
-                otherwise depends on which rules happened to fire into a
-                structural one.
+                Both sides are BETA-normalised, symmetrically.  Normalising
+                only the extracted G_i would break Thm.implies_elim, whose
+                match is alpha-only.
 
                 This is NOT merely compensating for what the AoA round trip
                 does to the conclusion (that cause is fixed at its own end by
-                back_conv, stage 4e).  Goal.protect below is a composition,
-                and Thm.bicompose's full-normalization branch beta-normalizes
-                the term it substitutes: promising the RAW cprems while the
-                solver receives a beta-normalized state makes fork_state's
-                aconv assertion fire on a SUCCESSFUL proof whenever a subgoal
-                carries a beta-redex.  Normalizing both sides up front is what
-                keeps the promise and the state in the same shape, so this
-                stays (stage 4d retired and restored, round-6 review). *)
+                the boundary restore, stage 4e).  Goal.protect below is a
+                composition, and Thm.bicompose's full-normalisation branch
+                beta-normalises the term it substitutes: promising the RAW
+                cprems while the solver receives a beta-normalised state makes
+                fork_state's aconv assertion fire on a SUCCESSFUL proof
+                whenever a subgoal carries a beta-redex.  Normalising both
+                sides up front keeps the promise and the state in one shape
+                (stage 4d retired and restored, round-6 review).
+
+                BETA only, no eta: measured, Goal.protect leaves eta-redexes
+                untouched, so eta buys nothing here and costs R30 — with eta
+                the agent would see eta-contracted subgoals inside the fork
+                body, which enter its prompts and pattern matching. *)
              val norm = map (fn ct => Thm.cterm_of ctxt
-                                        (Envir.beta_eta_contract (Thm.term_of ct))) cprems
+                                        (Envir.beta_norm (Thm.term_of ct))) cprems
              val conj = Conjunction.mk_conjunction_balanced norm
              (* G_1 ==> ... ==> G_n ==> #(G_1 &&& ... &&& G_n); same shape as
                 Minilang's merge_goal_states, which runs this in production *)
@@ -977,7 +980,7 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                    fold2 (fn cprem => fn part => fn seq =>
                             Thm.implies_elim seq
                               (Thm.equal_elim
-                                 (Thm.symmetric (Drule.beta_eta_conversion cprem)) part))
+                                 (Thm.symmetric (Thm.beta_conversion true cprem)) part))
                          cprems parts sequent
             in (true, [fut], sequent') end
        | _ =>
