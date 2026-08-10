@@ -814,6 +814,15 @@ local
    HOL-and-below layer and is used by callers that know nothing of each other. *)
 fun is_schematic t = Term.maxidx_term t ~1 <> ~1
 
+(* Everything crossing the promise boundary is beta-normalised with THIS pair:
+   Envir.beta_norm to build a shape, Thm.beta_conversion true to bridge a
+   theorem back to the un-normalised one.  They are the same normalisation
+   (Pure/thm.ML), which is what makes the bridges below exact.  The reason is
+   Goal.protect / Goal.conclude: both are compositions whose full-normalisation
+   branch beta-normalises what they substitute or strip back, so a promise
+   built from un-normalised terms would not match what is delivered. *)
+fun beta_norm_cterm ctxt ct = Thm.cterm_of ctxt (Envir.beta_norm (Thm.term_of ct))
+
 (* Fork the proof of `goal`, starting the solver from `goal_state`.  Returns the
    by-product future and the theorem of `goal` that the promise stands for.
    Only ONE fork happens: the ('a * thm) future is split with Future.map, which
@@ -822,7 +831,14 @@ fun fork_state failure_msg ctxt f (goal : cterm, goal_state : thm) =
   let
     val pos = Position.make (Thread_Position.get ())
     val hyps = Assumption.all_assms_of ctxt
-    val promise = Drule.list_implies (hyps, goal)
+    (*The promise is shaped like what Goal.conclude DELIVERS, not like what the
+      context holds: conclude strips the hyps back through its
+      full-normalisation branch, so one carrying a beta-redex would arrive
+      normalised and the aconv assertion below would fire on a proof that
+      actually succeeded.  The RAW hyps stay in use for implies_intr and assume
+      -- they must match the assumptions the theorem really carries, or the
+      hypothesis is left dangling -- and the discharge below bridges. *)
+    val promise = Drule.list_implies (map (beta_norm_cterm ctxt) hyps, goal)
     fun body () =
       let
         val (a, st) = f (ctxt, goal_state)
@@ -875,7 +891,11 @@ fun fork_state failure_msg ctxt f (goal : cterm, goal_state : thm) =
                     else raise ERROR (compose exn ^ Position.here pos)))
     val proved =
       Goal.future_result ctxt thm_future (Thm.term_of promise)
-        |> fold (fn a => fn th => Thm.implies_elim th (Thm.assume a)) hyps
+        (*`a ⊢ beta_norm a` discharges the normalised premise while recording
+          the RAW assumption, which is what Assumption.export later expects.*)
+        |> fold (fn a => fn th =>
+              Thm.implies_elim th
+                (Thm.equal_elim (Thm.beta_conversion true a) (Thm.assume a))) hyps
   in (Future.map fst future, proved) end
 
 (* What the solver was supposed to have consumed.  Leading can only assert "one
@@ -965,8 +985,7 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                 untouched, so eta buys nothing here and costs R30 — with eta
                 the agent would see eta-contracted subgoals inside the fork
                 body, which enter its prompts and pattern matching. *)
-             val norm = map (fn ct => Thm.cterm_of ctxt
-                                        (Envir.beta_norm (Thm.term_of ct))) cprems
+             val norm = map (beta_norm_cterm ctxt) cprems
              val conj = Conjunction.mk_conjunction_balanced norm
              (* G_1 ==> ... ==> G_n ==> #(G_1 &&& ... &&& G_n); same shape as
                 Minilang's merge_goal_states, which runs this in production *)
@@ -984,10 +1003,20 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                          cprems parts sequent
             in (true, [fut], sequent') end
        | _ =>
+           (*Same shape as All_At_Once above, for the same reason: Goal.init's
+             protection is stripped by a Goal.conclude that beta-normalises, so
+             promise and state are built from the normalised cprem and the
+             bridge puts the raw one back for implies_elim.*)
            let val (futs, sequent') =
                  fold (fn cprem => fn (acc, seq) =>
-                        let val (fut, th) = fork_state failure_msg ctxt f (cprem, Goal.init cprem)
-                         in (fut :: acc, Thm.implies_elim seq th) end)
+                        let val ncprem = beta_norm_cterm ctxt cprem
+                            val (fut, th) =
+                              fork_state failure_msg ctxt f (ncprem, Goal.init ncprem)
+                         in (fut :: acc,
+                             Thm.implies_elim seq
+                               (Thm.equal_elim
+                                  (Thm.symmetric (Thm.beta_conversion true cprem)) th))
+                        end)
                       targets ([], sequent)
             in (true, rev futs, sequent') end))
   end
