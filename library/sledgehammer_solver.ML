@@ -946,23 +946,39 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                 system the conclusion almost always carries schematics, which the
                 kernel rejects when the promise is generalised.
 
-                The symmetric beta-eta normalization of both sides is retired
-                (stage 4d, §2.5): back_conv at the AoA boundary now restores
-                the verbatim conclusion — the CAUSE of the alpha-only
-                implies_elim mismatches — so the symptomatic normalization is
-                gone and the solver sees the subgoals exactly as authored.
-                fork_state's aconv assertion remains as last-resort insurance. *)
-             val conj = Conjunction.mk_conjunction_balanced cprems
+                Both sides are beta-eta contracted, symmetrically.  Contracting
+                only the extracted G_i would break Thm.implies_elim, whose match
+                is alpha-only.  Doing eta as well as beta turns a property that
+                otherwise depends on which rules happened to fire into a
+                structural one.
+
+                This is NOT merely compensating for what the AoA round trip
+                does to the conclusion (that cause is fixed at its own end by
+                back_conv, stage 4e).  Goal.protect below is a composition,
+                and Thm.bicompose's full-normalization branch beta-normalizes
+                the term it substitutes: promising the RAW cprems while the
+                solver receives a beta-normalized state makes fork_state's
+                aconv assertion fire on a SUCCESSFUL proof whenever a subgoal
+                carries a beta-redex.  Normalizing both sides up front is what
+                keeps the promise and the state in the same shape, so this
+                stays (stage 4d retired and restored, round-6 review). *)
+             val norm = map (fn ct => Thm.cterm_of ctxt
+                                        (Envir.beta_eta_contract (Thm.term_of ct))) cprems
+             val conj = Conjunction.mk_conjunction_balanced norm
              (* G_1 ==> ... ==> G_n ==> #(G_1 &&& ... &&& G_n); same shape as
                 Minilang's merge_goal_states, which runs this in production *)
              val goal_state =
-                   Conjunction.intr_balanced (map Thm.assume cprems)
+                   Conjunction.intr_balanced (map Thm.assume norm)
                      |> Goal.protect 0
-                     |> fold_rev Thm.implies_intr cprems
+                     |> fold_rev Thm.implies_intr norm
              val (fut, proved) = fork_state failure_msg ctxt f (conj, goal_state)
              val parts = Conjunction.elim_balanced nprems proved
-             val sequent' = fold (fn part => fn seq => Thm.implies_elim seq part)
-                                 parts sequent
+             val sequent' =
+                   fold2 (fn cprem => fn part => fn seq =>
+                            Thm.implies_elim seq
+                              (Thm.equal_elim
+                                 (Thm.symmetric (Drule.beta_eta_conversion cprem)) part))
+                         cprems parts sequent
             in (true, [fut], sequent') end
        | _ =>
            let val (futs, sequent') =
