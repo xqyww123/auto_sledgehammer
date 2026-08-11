@@ -2,41 +2,64 @@ signature PHI_SLEDGEHAMMER_SOLVER = sig
 
 val override_parser : Sledgehammer.fact_override parser
 
+(* Whether the search is forked, and in which shape a failure arrives.
+
+   Sync   -- run in the caller's thread; failure is ALWAYS a raw Auto_Fail.
+             Turning that into an ERROR is the caller's business: only the caller
+             knows whether it wants to observe the failure (the AoA fallback
+             does, to fall back) or report it (the Isar methods do).
+   Async  -- a REQUEST to fork.  `failure_msg` composes the text of every
+             human-facing failure -- a fork has no other way to speak.  NONE
+             takes the default renderer below, which prints the goal that was
+             not proved; a layer that knows more than we do about what failed
+             (Phi_Reasoners' obligation solver knows the AoA give-up banners)
+             passes SOME.  `user_facing = true` asks for Execution.fork, which is
+             what keeps the command displayed as running in a PIDE front-end,
+             and makes BOTH the by-product future and the theorem promise fail
+             as an error message; `user_facing = false` forks off PIDE with plain
+             Future.forks and lets the by-product future fail with a raw
+             Auto_Fail.
+
+   The failure SHAPE is fixed by the mode; the MECHANISM is best-effort.  A
+   request that cannot be honoured -- no exec id in the thread position
+   (Isa-REPL), a stale one (the command was purged), a schematic variable in the
+   goal or in a context assumption, proof term recording -- degrades to a plain
+   fork or to synchronous execution, while still failing in the promised shape.
+   What does change on degradation is WHEN the exception arrives: through the
+   future at join time when the fork happened, at the call site itself when it
+   did not.
+
+   "Fails as an error message" is deliberately not "raises ERROR": Execution.fork
+   wraps an escaping exception in Runtime.CONTEXT, and a joined future may wrap
+   it in Par_Exn, so the constructor is not reliably matchable.  The TEXT is
+   reliable -- Runtime.exn_message unwraps both.  A consumer that needs to match
+   a constructor must normalise first (joins_norm is such a normaliser). *)
+datatype async_mode =
+    Sync
+  | Async of {failure_msg : (exn -> string) option, user_facing : bool}
+
 (* The single argument of both entry points.  There is deliberately NO
    `default_options`: every call site spells the whole record out, because SML
    records have neither defaults nor an update syntax and a silently-defaulted
    field here changes proof behaviour without a compile error.
 
-   async         -- fork the search.  MUST be false wherever the caller relies on
-                    observing the failure (Auto_Fail propagating): forking and
-                    observable failure are incompatible.
+   async_mode    -- see the datatype above.  MUST be Sync wherever the caller
+                    relies on observing the failure (Auto_Fail propagating):
+                    forking and observable failure are incompatible.
    proof_id      -- store key; NONE derives it from the goal (see below).
    read_store    -- governs BOTH reads (the on-disk store and the in-process
                     hash table); NONE falls back to the enable_proof_store config.
    write_store   -- governs BOTH writes, symmetrically.  Store self-maintenance
                     (invalidate_proof_cache) is deliberately NOT governed by
                     either: it can only trigger after a hit, and hits are already
-                    gated by read_store.
-   raise_Error_instead_of_Auto_Fail
-                 -- true turns Auto_Fail into a fatal ERROR (for the Isar
-                    methods); false lets Auto_Fail through to the caller.
-   failure_msg   -- composes the text of every human-facing failure: the forked
-                    search's report (Future.error_message), guard_errors'
-                    generic sync arm, and the promise branch, which re-raises
-                    ERROR (composed text ^ position) so the batch join at
-                    theory finish prints it.  The by-product branch keeps the
-                    original exception (joins_norm matches Auto_Fail there).
-                    NONE = raw renderings everywhere.  Rendering only: never
-                    affects the search or any control flow. *)
+                    gated by read_store. *)
 type options = {improved      : bool,
-                async         : bool,
+                async_mode    : async_mode,
                 fact_override : Sledgehammer.fact_override,
                 proof_id      : Phi_Proof_Store.proof_id option,
                 timeout       : Time.time option,
                 read_store    : bool option,
-                write_store   : bool option,
-                raise_Error_instead_of_Auto_Fail : bool,
-                failure_msg   : (exn -> string) option}
+                write_store   : bool option}
 
 (* Single-goal entry: attacks the LEADING subgoal, keyed on it alone.
    Multi-goal entry: attacks EVERY subgoal, keyed on all of them at once, and
@@ -50,24 +73,26 @@ type options = {improved      : bool,
 val auto     : options -> Proof.context -> thm -> string future * thm
 val all_auto : options -> Proof.context -> thm -> (Time.time * string) future * thm
 
+(* "Fail to prove the goal" followed by the pretty-printed leading subgoal.  A
+   Sync caller that has to turn Auto_Fail into an ERROR needs this: Auto_Fail
+   registers no pretty printer, so Runtime.exn_message renders it as the useless
+   "exception Auto_Fail raised".  A text renderer only -- the control flow of the
+   conversion stays with each call site.  It is also what Async's
+   failure_msg = NONE falls back to. *)
+val error_message : Proof.context -> thm -> string
+
 (* Which subgoals one call of the solver `f` is expected to consume:
      Leading     -- the first premise only
      Each_Goal   -- one premise per call, repeated until none is left
      All_At_Once -- every premise in a single call
-   `async` and the scope are orthogonal; the returned list has the same length
+   The mode and the scope are orthogonal; the returned list has the same length
    and shape either way, only the futures differ in when they are fulfilled.
-   The returned bool says whether this call ACTUALLY forked -- the `async`
+   The returned bool says whether this call ACTUALLY forked -- the `async_mode`
    argument does not, because the schematic guard can send a forked request back
    to synchronous execution. *)
 datatype goal_scope = Leading | Each_Goal | All_At_Once
 
-val async_prove : bool -> goal_scope
-               -> (Proof.context * thm -> 'a * thm)
-               -> Proof.context * thm
-               -> bool * 'a future list * thm
-(* Same, plus the failure_msg hook applied inside the fork's error report
-   (`async_prove = async_prove' NONE`). *)
-val async_prove' : (exn -> string) option -> bool -> goal_scope
+val async_prove : async_mode -> goal_scope
                -> (Proof.context * thm -> 'a * thm)
                -> Proof.context * thm
                -> bool * 'a future list * thm
@@ -143,6 +168,11 @@ structure Phi_Sledgehammer_Solver : PHI_SLEDGEHAMMER_SOLVER = struct
 (*** Preliminaries ***)
 
 (** Options **)
+
+(*Documented in the signature.*)
+datatype async_mode =
+    Sync
+  | Async of {failure_msg : (exn -> string) option, user_facing : bool}
 
 val classical_prover_timeout =
         Attrib.setup_config_int \<^binding>\<open>classical_prover_timeout\<close> (K 3)
@@ -491,6 +521,15 @@ datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal
                      | Internal_Failure of string
 exception Auto_Fail of fail_reason
 
+(* What Async {failure_msg = NONE} renders.  Runtime.exn_message on its own is
+   not usable here: Auto_Fail carries no pretty printer, so it would print
+   "exception Auto_Fail raised" and would swallow Internal_Failure's payload --
+   and that payload is the entire reason that constructor exists.  `sequent` is
+   the state whose leading subgoal is the goal that was not proved. *)
+fun default_failure_msg _ _ (Auto_Fail (Internal_Failure msg)) = msg
+  | default_failure_msg ctxt sequent (Auto_Fail _) = error_message ctxt sequent
+  | default_failure_msg _ _ exn = Runtime.exn_message exn
+
 (* Total order on failure reasons; merging several takes the MAXIMUM, and ties
    keep the first.  Internal_Failure outranks everything because a bug must not
    be hidden behind a proof-search verdict. *)
@@ -827,9 +866,12 @@ fun beta_norm_cterm ctxt ct = Thm.cterm_of ctxt (Envir.beta_norm (Thm.term_of ct
    by-product future and the theorem of `goal` that the promise stands for.
    Only ONE fork happens: the ('a * thm) future is split with Future.map, which
    builds dependent tasks rather than running the proof a second time. *)
-fun fork_state failure_msg ctxt f (goal : cterm, goal_state : thm) =
+fun fork_state {failure_msg, user_facing} ctxt f (goal : cterm, goal_state : thm) =
   let
+    (*Computed ONCE: it is both the input of the exec-id test below and the
+      argument handed to Execution.fork, and the two must not disagree.*)
     val pos = Position.make (Thread_Position.get ())
+    val compose = the_default (default_failure_msg ctxt goal_state) failure_msg
     val hyps = Assumption.all_assms_of ctxt
     (*The promise is shaped like what Goal.conclude DELIVERS, not like what the
       context holds: conclude strips the hyps back through its
@@ -853,42 +895,85 @@ fun fork_state failure_msg ctxt f (goal : cterm, goal_state : thm) =
           else raise THM ("async_prove: the solver returned a conclusion that is \
                           \not the one it was given", 0, [th])
       in (a, th) end
-    (*Plain Future.forks, NOT Execution.fork -- that is PIDE document machinery,
-      not for tools.  Cancellation still works: group = NONE forks into a
-      worker_subgroup, and group cancellation follows the parent chain.  A failing
-      body prints nothing by itself; the NONE makes the report unconditional.*)
-    val future = (singleton o Future.forks)
-      {name = "\<phi>System-async-proof", group = NONE, deps = [], pri = ~1, interrupts = true}
-      (fn () =>
-        case Exn.capture_body body of
-          Exn.Res r => r
-        | Exn.Exn exn =>
-            (if Exn.is_interrupt exn then ()
-             else Future.error_message pos
-                    ((serial (),
-                      case failure_msg of
-                        SOME compose => compose exn
-                      | NONE => Runtime.exn_message exn), NONE);
-             Exn.reraise exn))
+    (*Which fork to use.  Execution.fork is what keeps a PIDE command displayed
+      as running -- it ends with `status (Future.task_of future) [Markup.forked]`,
+      the same thing Isabelle's own forked proofs rely on (Pure/goal.ML) -- and
+      it reports a failure by itself.  It needs an exec id in the position:
+      without one the id defaults to 0, a pre-registered slot that is never
+      purged, where the group leaks and every error is SILENCED (execution.ML:
+      `if exec_id = 0 then ()`).  So only fork that way when the position really
+      carries a live id, and fall back to a plain fork otherwise.
+
+      Position.id_of, not parse_id: put_id accepts any string and parse_id would
+      raise Fail on a non-numeric one.  is_running_exec is the second, separate
+      test -- it rejects a STALE id, i.e. a command already purged by a document
+      edit.  It cannot stand in for the first: slot 0 is pre-registered, so it is
+      true for a position with no id at all.
+
+      is_running_exec and the fork below race: the entry can be purged in
+      between, and Execution.fork then raises Fail.  Catching it is safe -- the
+      table update that raises happens BEFORE anything is forked, so nothing runs
+      twice.  We fall back to a plain fork rather than to synchronous execution:
+      a stale id means the command is gone from the document, and running a full
+      search (an AoA call can take a minute) in its thread would work for nobody.*)
+    val live_exec_id =
+      if not user_facing then NONE
+      else if is_none (Position.id_of pos) then NONE
+      else (case Option.join (try Position.parse_id pos) of
+              SOME i => if Execution.is_running_exec i then SOME i else NONE
+            | NONE => NONE)
+    (*The shape conversion sits at the OUTERMOST point of the body, where the
+      exception is still in its original form: failure_msg pattern-matches on the
+      solver's own constructors (Auto_Fail, Agent_Give_Up, ...) and any later
+      wrapping -- Runtime.CONTEXT from Execution.fork, Par_Exn from a join --
+      would defeat it.  Everything is caught, only interrupts pass through: the
+      body can also escape with a bare ERROR, a THM, or Agent_Give_Up.
+      `report_here` is passed in rather than derived from user_facing, because
+      the deciding fact is whether THIS fork actually went through Execution
+      (which reports by itself) -- and the Fail fallback below flips that after
+      the test above has already run.*)
+    fun forked_body report_here () =
+      case Exn.capture_body body of
+        Exn.Res r => r
+      | Exn.Exn exn =>
+          if Exn.is_interrupt exn then Exn.reraise exn
+          else
+            let
+              val msg = compose exn
+              val _ = if report_here
+                      then Future.error_message pos ((serial (), msg), NONE)
+                      else ()
+            in
+              if user_facing then raise ERROR (msg ^ Position.here pos)
+              else Exn.reraise exn
+            end
+    fun plain_fork () = (singleton o Future.forks)
+          {name = "\<phi>System-async-proof", group = NONE, deps = [], pri = ~1,
+           interrupts = true} (forked_body true)
+    val future =
+      (case live_exec_id of
+         NONE => plain_fork ()
+       | SOME _ =>
+           Execution.fork {name = "\<phi>System-async-proof", pos = pos, pri = ~1}
+                          (forked_body false)
+           handle Fail _ => plain_fork ())
     val _ = Phi_Proof_Store.register_async_task (Future.task_of future)
               (Proof_Context.theory_of ctxt)
-    (*The promise branch: with a failure_msg hook, a failed search is re-raised
-      as ERROR (composed text) POSITIONED at the forking command, so the batch
-      join (theory finish) prints something a user can act on.  The by-product
-      branch below stays verbatim -- joins_norm matches Auto_Fail there.*)
+    (*The promise branch.  user_facing already got its ERROR composed inside the
+      body, so this only has to pass it on -- but through a dependent fork rather
+      than Future.map, because join_result does not wrap it in Par_Exn and the
+      text stays clean for the batch join at theory finish.  Not user_facing
+      keeps Auto_Fail verbatim, exactly like the by-product branch below.*)
     val thm_future =
-      (case failure_msg of
-         NONE => Future.map snd future
-       | SOME compose =>
-           (singleton o Future.forks)
-             {name = "\<phi>System-async-proof-promise", group = NONE,
-              deps = [Future.task_of future], pri = ~1, interrupts = true}
-             (fn () =>
-                case Future.join_result future of
-                  Exn.Res (_, th) => th
-                | Exn.Exn exn =>
-                    if Exn.is_interrupt exn then Exn.reraise exn
-                    else raise ERROR (compose exn ^ Position.here pos)))
+      if not user_facing then Future.map snd future
+      else
+        (singleton o Future.forks)
+          {name = "\<phi>System-async-proof-promise", group = NONE,
+           deps = [Future.task_of future], pri = ~1, interrupts = true}
+          (fn () =>
+             case Future.join_result future of
+               Exn.Res (_, th) => th
+             | Exn.Exn exn => Exn.reraise exn)
     val proved =
       Goal.future_result ctxt thm_future (Thm.term_of promise)
         (*`a ⊢ beta_norm a` discharges the normalised premise while recording
@@ -914,7 +999,7 @@ fun check_exit scope nprems (forked, futs, sequent') =
 
 in
 
-fun async_prove' failure_msg async scope f (ctxt, sequent) =
+fun async_prove mode scope f (ctxt, sequent) =
   (* Zero subgoals short-circuit, for all three scopes at once: Leading's exit
      assertion would demand -1 premises; All_At_Once's promise
      Conjunction.intr_balanced [] quietly degenerates to asm_rl while the inverse
@@ -925,11 +1010,14 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
     val nprems = Thm.nprems_of sequent
     val cprems = map (Thm.cprem_of sequent) (1 upto nprems)
     val targets = case scope of Leading => [hd cprems] | _ => cprems
+    val async = (case mode of Sync => false | Async _ => true)
     val assms_ok = not (exists (is_schematic o Thm.term_of) (Assumption.all_assms_of ctxt))
     val bad = find_index (is_schematic o Thm.term_of) targets
     (*Thm.future refuses promises while proof terms are recorded.  Test at the
       decision point: inside fork_state the fork would already be running.*)
     val proofs_ok = not (Proofterm.any_proofs_enabled ())
+    (*The exec-id test is deliberately NOT part of this: it decides WHICH fork to
+      use, not whether to fork at all, and it belongs to fork_state.*)
     val forking = async andalso assms_ok andalso bad < 0 andalso proofs_ok
     val _ =
       if async andalso not forking
@@ -946,19 +1034,46 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
     check_exit scope nprems (
     if not forking
     then
-      (case scope of
-         (* the loop that used to live in all_auto: one premise per call *)
-         Each_Goal =>
-           let fun loop sequent acc =
-                 if Thm.no_prems sequent then (rev acc, sequent)
-                 else let val (a, sequent') = f (ctxt, sequent)
-                       in loop sequent' (a :: acc) end
-               val (as_, sequent') = loop sequent []
-            in (false, map Future.value as_, sequent') end
-       | _ =>
-           let val (a, sequent') = f (ctxt, sequent)
-            in (false, [Future.value a], sequent') end)
+      (*Degrading to synchronous execution keeps the SHAPE the mode asked for:
+        an Async {user_facing = true} request still fails as an error message,
+        an Async {user_facing = false} one still fails with a raw Auto_Fail, and
+        Sync always does.  What the caller does see differently is WHEN: the
+        exception arrives at this call instead of at a join.*)
+      let
+        fun shape body =
+          (case mode of
+             Async {failure_msg, user_facing = true} =>
+               let val pos = Position.make (Thread_Position.get ())
+                   val compose = the_default (default_failure_msg ctxt sequent) failure_msg
+                in
+                 case Exn.capture_body body of
+                   Exn.Res r => r
+                 | Exn.Exn exn =>
+                     if Exn.is_interrupt exn then Exn.reraise exn
+                     else raise ERROR (compose exn ^ Position.here pos)
+               end
+           | _ => body ())
+      in
+        shape (fn () =>
+          case scope of
+             (* the loop that used to live in all_auto: one premise per call *)
+             Each_Goal =>
+               let fun loop sequent acc =
+                     if Thm.no_prems sequent then (rev acc, sequent)
+                     else let val (a, sequent') = f (ctxt, sequent)
+                           in loop sequent' (a :: acc) end
+                   val (as_, sequent') = loop sequent []
+                in (false, map Future.value as_, sequent') end
+           | _ =>
+               let val (a, sequent') = f (ctxt, sequent)
+                in (false, [Future.value a], sequent') end)
+      end
     else
+      let
+        (*Unreachable: `forking` implies `async`, which is exactly `mode = Async`.*)
+        val payload = (case mode of Async r => r
+                        | Sync => raise Fail "async_prove: forking without Async")
+      in
       (case scope of
          All_At_Once =>
            let
@@ -993,7 +1108,7 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                    Conjunction.intr_balanced (map Thm.assume norm)
                      |> Goal.protect 0
                      |> fold_rev Thm.implies_intr norm
-             val (fut, proved) = fork_state failure_msg ctxt f (conj, goal_state)
+             val (fut, proved) = fork_state payload ctxt f (conj, goal_state)
              val parts = Conjunction.elim_balanced nprems proved
              val sequent' =
                    fold2 (fn cprem => fn part => fn seq =>
@@ -1011,17 +1126,16 @@ fun async_prove' failure_msg async scope f (ctxt, sequent) =
                  fold (fn cprem => fn (acc, seq) =>
                         let val ncprem = beta_norm_cterm ctxt cprem
                             val (fut, th) =
-                              fork_state failure_msg ctxt f (ncprem, Goal.init ncprem)
+                              fork_state payload ctxt f (ncprem, Goal.init ncprem)
                          in (fut :: acc,
                              Thm.implies_elim seq
                                (Thm.equal_elim
                                   (Thm.symmetric (Thm.beta_conversion true cprem)) th))
                         end)
                       targets ([], sequent)
-            in (true, rev futs, sequent') end))
+            in (true, rev futs, sequent') end)
+      end)
   end
-
-fun async_prove async = async_prove' NONE async
 
 end
 
@@ -1665,14 +1779,12 @@ fun auto'i {improved, fact_override, timeout} (ctxt, sequent) =
 (* val proof = raw_sledgehammer stat *)
 
 type options = {improved      : bool,
-                async         : bool,
+                async_mode    : async_mode,
                 fact_override : Sledgehammer.fact_override,
                 proof_id      : Phi_Proof_Store.proof_id option,
                 timeout       : Time.time option,
                 read_store    : bool option,
-                write_store   : bool option,
-                raise_Error_instead_of_Auto_Fail : bool,
-                failure_msg   : (exn -> string) option}
+                write_store   : bool option}
 
 local
 
@@ -1687,20 +1799,6 @@ fun with_timeout NONE ctxt = ctxt
       Config.map sledgehammer_params
         (fn s => "timeout = " ^ string_of_int (Time.toSeconds t)
                  ^ (if s = "" then "" else ", " ^ s)) ctxt
-
-(*true converts Auto_Fail into a fatal ERROR, for the Isar methods.
-  Internal_Failure gets its own arm: its payload is the entire reason the
-  constructor exists, and the generic "Fail to prove the goal" would eat it.
-  The hand-rolled Par_Exn.dest paragraph that used to live here is gone -- the
-  branch exits now normalise everything into Auto_Fail.*)
-fun guard_errors false _ _ _ body = body ()
-  | guard_errors true failure_msg ctxt sequent body =
-      body ()
-      handle Auto_Fail (Internal_Failure msg) => error msg
-           | exn as Auto_Fail _ =>
-               error (case failure_msg of
-                        SOME compose => compose exn
-                      | NONE => error_message ctxt sequent)
 
 (*Joins wrap failures in Par_Exn even for a single future, which no Auto_Fail
   handler matches.  Re-establish the shape without assuming the solver's
@@ -1792,7 +1890,7 @@ fun auto (opts : options) ctxt0 sequent =
 
     fun search () =
       let val (_, futs, sequent') =
-            async_prove' (#failure_msg opts) (#async opts) Leading
+            async_prove (#async_mode opts) Leading
               (wrapper (auto'i {improved = #improved opts,
                                 fact_override = #fact_override opts,
                                 timeout = #timeout opts}))
@@ -1806,7 +1904,6 @@ fun auto (opts : options) ctxt0 sequent =
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
        in (out, sequent') end
   in
-    guard_errors (#raise_Error_instead_of_Auto_Fail opts) (#failure_msg opts) ctxt sequent (fn () =>
     let
       (*The on-disk proof store, keyed by proof id.  A hit that still
         replays is handed back as it stands; nothing is written.*)
@@ -1850,7 +1947,7 @@ fun auto (opts : options) ctxt0 sequent =
                 Phi_Proof_Store.invalidate_proof_cache true id thy)
           else tracing ("Proof store miss, " ^ id);
           search ())
-    end)
+    end
   end
 
 fun all_auto (opts : options) ctxt0 sequent =
@@ -1881,7 +1978,7 @@ fun all_auto (opts : options) ctxt0 sequent =
 
     fun search () =
       let val (_, futs, sequent') =
-            async_prove' (#failure_msg opts) (#async opts) Each_Goal
+            async_prove (#async_mode opts) Each_Goal
               (wrapper (auto'i {improved = #improved opts,
                                 fact_override = #fact_override opts,
                                 timeout = #timeout opts}))
@@ -1899,7 +1996,6 @@ fun all_auto (opts : options) ctxt0 sequent =
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
        in (out, sequent') end
   in
-    guard_errors (#raise_Error_instead_of_Auto_Fail opts) (#failure_msg opts) ctxt sequent (fn () =>
     let
       val (stale, hit) =
         if not do_read then (false, NONE)
@@ -1936,7 +2032,7 @@ fun all_auto (opts : options) ctxt0 sequent =
                 Phi_Proof_Store.invalidate_proof_cache true id thy)
           else tracing ("Proof store miss, " ^ id);
           search ())
-    end)
+    end
   end
 
 end
@@ -1962,9 +2058,11 @@ fun override_parser toks = (
                |> (fn (A,D) => {add = A, del = D, only = false})) ) toks
 
 (* The four methods differ only in which entry point they drive and whether the
-   improved multi-strategy search is used.  All four take async = false (a method
-   has to fail observably, which forking rules out) and
-   raise_Error_instead_of_Auto_Fail = true.  The id is computed BEFORE
+   improved multi-strategy search is used.  All four take async_mode = Sync (a
+   method has to fail observably, which forking rules out) and turn the resulting
+   Auto_Fail into a method error right here -- Internal_Failure keeping its own
+   payload, since that payload is the whole reason the constructor exists and the
+   generic "Fail to prove the goal" would eat it.  The id is computed BEFORE
    insert_tac, exactly as it always was, so `using foo by auto_sledgehammer` does
    not key on foo -- a pre-existing asymmetry, left alone deliberately. *)
 fun sledgehammer_method key run improved = Scan.lift (
@@ -1985,16 +2083,15 @@ fun sledgehammer_method key run improved = Scan.lift (
                  | NONE => error "Why the insert_tac can fail?"
      in SOME (
          (Seq.Result (ctxt, snd (run {improved = improved,
-                                      async = false,
+                                      async_mode = Sync,
                                       fact_override = override,
                                       proof_id = SOME id,
                                       timeout = NONE,
                                       read_store = NONE,
-                                      write_store = NONE,
-                                      raise_Error_instead_of_Auto_Fail = true,
-                                      failure_msg = NONE}
+                                      write_store = NONE}
                                      ctxt sequent'))
-          handle Auto_Fail _ => Seq.Error err),
+          handle Auto_Fail (Internal_Failure msg) => Seq.Error (fn () => msg)
+               | Auto_Fail _ => Seq.Error err),
          Seq.empty)
     end))))
 
