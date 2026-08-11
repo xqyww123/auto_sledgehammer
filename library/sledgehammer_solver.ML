@@ -901,24 +901,25 @@ fun fork_state {failure_msg, user_facing} ctxt f (goal : cterm, goal_state : thm
       it reports a failure by itself.  It needs an exec id in the position:
       without one the id defaults to 0, a pre-registered slot that is never
       purged, where the group leaks and every error is SILENCED (execution.ML:
-      `if exec_id = 0 then ()`).  So only fork that way when the position really
-      carries a live id, and fall back to a plain fork otherwise.
+      `if exec_id = 0 then ()`).
 
-      Position.id_of, not parse_id: put_id accepts any string and parse_id would
-      raise Fail on a non-numeric one.  is_running_exec is the second, separate
-      test -- it rejects a STALE id, i.e. a command already purged by a document
-      edit.  It cannot stand in for the first: slot 0 is pre-registered, so it is
-      true for a position with no id at all.
+      The MISSING-id case does not arrive here at all -- async_prove sends a
+      user_facing request with no exec id to synchronous execution instead, so
+      that "it returned" keeps meaning "it is done".  What is left for this test
+      is the STALE id: a command already purged by a document edit.  There we do
+      fork, plainly -- the command is gone from the document, so there is no
+      running status to show anyway, and running a full search (an AoA call can
+      take a minute) in its thread would work for nobody.
 
-      is_running_exec and the fork below race: the entry can be purged in
-      between, and Execution.fork then raises Fail.  Catching it is safe -- the
-      table update that raises happens BEFORE anything is forked, so nothing runs
-      twice.  We fall back to a plain fork rather than to synchronous execution:
-      a stale id means the command is gone from the document, and running a full
-      search (an AoA call can take a minute) in its thread would work for nobody.*)
+      `try` guards parse_id, which raises Fail on a non-numeric id (put_id accepts
+      any string).  is_running_exec cannot be the whole test on its own: slot 0 is
+      pre-registered, so it answers true for a position with no id at all.
+
+      is_running_exec and the fork below race: the entry can be purged in between,
+      and Execution.fork then raises Fail.  Catching it is safe -- the table
+      update that raises happens BEFORE anything is forked, so nothing runs twice.*)
     val live_exec_id =
-      if not user_facing then NONE
-      else if is_none (Position.id_of pos) then NONE
+      if not user_facing then NONE   (*a plain fork is what this mode asked for*)
       else (case Option.join (try Position.parse_id pos) of
               SOME i => if Execution.is_running_exec i then SOME i else NONE
             | NONE => NONE)
@@ -1016,9 +1017,22 @@ fun async_prove mode scope f (ctxt, sequent) =
     (*Thm.future refuses promises while proof terms are recorded.  Test at the
       decision point: inside fork_state the fork would already be running.*)
     val proofs_ok = not (Proofterm.any_proofs_enabled ())
-    (*The exec-id test is deliberately NOT part of this: it decides WHICH fork to
-      use, not whether to fork at all, and it belongs to fork_state.*)
+    (*A user_facing request wants Execution.fork, and that needs an exec id in the
+      position.  Without one -- Isa-REPL builds its positions with id = "" -- the
+      fork would land in the pre-registered slot 0, where the group leaks and
+      every error is silenced.  Forking anyway with a plain Future.forks would
+      bring back exactly the disease this mode exists to cure: the call returns
+      while the proof is still running, so "it passed" means nothing.  So run
+      synchronously instead: slower, but the failure is visible on the spot.
+      A STALE id is a different case -- there the command is gone from the
+      document, and fork_state still forks, plainly.*)
+    val exec_id_ok =
+      (case mode of
+         Async {user_facing = true, ...} =>
+           is_some (Position.id_of (Position.make (Thread_Position.get ())))
+       | _ => true)
     val forking = async andalso assms_ok andalso bad < 0 andalso proofs_ok
+                  andalso exec_id_ok
     val _ =
       if async andalso not forking
       then tracing ("[async_prove] running synchronously instead: " ^
@@ -1027,8 +1041,11 @@ fun async_prove mode scope f (ctxt, sequent) =
                     else if bad >= 0
                     then "subgoal " ^ string_of_int (bad + 1) ^
                          " contains a schematic variable"
-                    else "proof term recording is enabled, and the kernel \
-                         \refuses promised theorems (Thm.future)"))
+                    else if not proofs_ok
+                    then "proof term recording is enabled, and the kernel \
+                         \refuses promised theorems (Thm.future)"
+                    else "this position carries no exec id, so the fork could not \
+                         \be the one that keeps the command displayed as running"))
       else ()
   in
     check_exit scope nprems (
