@@ -2,7 +2,21 @@ theory Auto_Sledgehammer
   imports HOL.Sledgehammer Performant_Isabelle_ML.Performant_Isabelle_ML
 begin
 (*declare [[ML_debugger, ML_print_depth = 1000, ML_exception_debugger]]*)
-(* named_theorems φsledgehammer_simps ‹Simplification rules used before applying slegehammer automation› *)
+named_theorems φsledgehammer_simps ‹Simplification rules used before applying slegehammer automation›
+
+text ‹‹NO_SIMP› stops the simplifier from descending into the term it wraps. One constant
+  serves both levels: an occurrence under ‹Trueprop› is object-level, one at the top of a
+  \<^typ>‹prop› is meta-level. They are told apart by position, never by name.›
+
+definition NO_SIMP where ‹NO_SIMP (X::'a::{}) ≡ X›
+
+lemma NO_SIMP_cong[cong]: ‹NO_SIMP (X::'a::{}) ≡ NO_SIMP X› .
+  ― ‹The sort annotation is load-bearing. Without it ‹X› takes HOL's default sort, this rule
+      stops matching meta-level instances, and nothing reports it -- the tag just quietly
+      stops protecting them.›
+
+lemma NO_SIMP_I : ‹P ⟹ NO_SIMP P› unfolding NO_SIMP_def .
+lemma NO_SIMP_I': ‹PROP P ⟹ PROP NO_SIMP P› unfolding NO_SIMP_def .
 
 ML_file ‹library/helpers0.ML›
 ML_file ‹library/Hasher.ML›
