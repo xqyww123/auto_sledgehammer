@@ -552,7 +552,39 @@ fun compact_store thy =
           catch _ => confirmed\<close>)
   end
 
-val openning_stores : (store * bool) Symtab.table Synchronized.var
+(* Beside `proofs`, every open theory carries a second table: what THIS session
+   has already written under each key.  It is what separates a real key
+   collision -- two different obligations reaching one proof id -- from an
+   ordinary cross-build update of a key that was merely read off the file.
+   Asking `proofs` instead would report every such update as a collision.
+
+   It holds a digest and a few leading characters, never the proof text: an
+   aoa_replay blob runs to hundreds of thousands of characters, and this table
+   lives as long as the theory does.
+
+   It is monotone within the session, and deliberately NOT derived from
+   `proofs`.  `proofs` loses a key to store_invalidate_proof, and the main
+   collision path runs straight through that loss (L2 hit -> replay fails ->
+   tombstone -> rewrite), so a mark kept in `proofs` would erase its own
+   evidence and the collision count would be a constant zero.  Hence
+   store_invalidate_proof, force_reload and invalidate_store all leave it
+   alone; close_store drops it, and that is precisely the session boundary. *)
+type written = (string * string * int) Symtab.table
+  (*key -> SHA1 of the proof text, its leading characters, standard-machine ms*)
+
+val proof_head_len = 120
+fun proof_mark (t, text) =
+  let val syms = Symbol.explode text
+   in (SHA1.rep (SHA1.digest text),
+       if length syms <= proof_head_len then text
+       else String.concat (take proof_head_len syms) ^ " ...",
+       Time.toMilliseconds t)
+  end
+
+fun written_of tab name =
+  case Symtab.lookup tab name of SOME (_, _, w) => w | NONE => Symtab.empty
+
+val openning_stores : (store * bool * written) Symtab.table Synchronized.var
   = Synchronized.var "\<phi>-System.openning_stores" Symtab.empty
 
 (* Read fallback: where migration could not run (an unwritable location) the new
@@ -567,14 +599,22 @@ fun load_store_raw thy =
 fun force_reload thy =
  (migrate_legacy thy;                                        (*D44: outside the critical section*)
   Synchronized.change_result openning_stores (fn tab =>
-    let val c = load_store_raw thy
-     in (c, Symtab.update (Context.theory_name {long=true} thy, (c, false)) tab) end ))
+    let val name = Context.theory_name {long=true} thy
+        val c = load_store_raw thy
+        (*re-reading the file says nothing about what this session wrote*)
+        val w = written_of tab name
+     in (c, Symtab.update (name, (c, false, w)) tab) end ))
+
+(*The whole entry, for the writer that needs the written table too; get_store_i
+  is the same thing for the readers that only want the store.*)
+fun get_entry_i thy tab =
+  case Symtab.lookup tab (Context.theory_name {long=true} thy)
+      of SOME e => (e, tab)
+       | _ => let val e = (load_store_raw thy, false, Symtab.empty)
+               in (e, Symtab.update_new (Context.theory_name {long=true} thy, e) tab) end
 
 fun get_store_i thy tab =
-  case Symtab.lookup tab (Context.theory_name {long=true} thy)
-      of SOME (x, _) => (x, tab)
-       | _ => let val c = load_store_raw thy
-               in (c, Symtab.update_new (Context.theory_name {long=true} thy, (c, false)) tab) end
+  let val ((c, _, _), tab') = get_entry_i thy tab in (c, tab') end
 
 fun get_store thy =
  (migrate_legacy thy;                                        (*D44*)
@@ -585,9 +625,9 @@ fun register_async_task task thy =
       val _ = migrate_legacy thy                             (*D44*)
    in Synchronized.change openning_stores (fn tab =>
       case Symtab.lookup tab name
-        of SOME (c, flag) => Symtab.update (name, (store_add_async task c, flag)) tab
+        of SOME (c, flag, w) => Symtab.update (name, (store_add_async task c, flag, w)) tab
          | _ => let val c = store_add_async task (load_store_raw thy)
-                 in Symtab.update_new (name, (c, false)) tab end )
+                 in Symtab.update_new (name, (c, false, Symtab.empty)) tab end )
   end
 
 (* Persistence is now continuous (each update appends immediately), so storing
@@ -597,7 +637,9 @@ fun compact_and_store thy = compact_store thy
 fun close_store thy =
   (* Only the in-memory proof table is per-theory state to drop here.  There is no
      writability verdict to evict any more (it is probed, not cached), and the
-     append lock must NOT be evicted -- see store_append_lock. *)
+     append lock must NOT be evicted -- see store_append_lock.
+     Dropping the entry drops the written table with it, and that is deliberate:
+     it is what makes "this session" mean "this theory, start to end". *)
   Synchronized.change openning_stores
     (Symtab.delete_safe (Context.theory_name {long=true} thy))
 
@@ -616,24 +658,70 @@ fun invalidate_store thy =
     (try_write thy (fn () =>
        with_file_lock (lock_path thy) (fn () =>
          if File.is_file (store_path thy) then File.rm (store_path thy) else ()));
-     Synchronized.change openning_stores (Symtab.update (name, (empty_store, true)));
+     Synchronized.change openning_stores (fn tab =>
+       (*dropping the data does not un-write what this session wrote*)
+       Symtab.update (name, (empty_store, true, written_of tab name)) tab);
      false))
   end
 
 fun get_cached_proof thy = Symtab.lookup (#proofs (get_store thy))
 
-(* The time in `s` must ALREADY be standard-machine time -- every caller passes
-   its measurement through standard_time first.  Normalising here instead would
-   double-divide the callers that (per the time-semantics rule) do it themselves
-   before handing the record over. *)
+fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
+  "Proof store: this session has written two DIFFERENT proofs under one key.\n\
+  \  key: " ^ id ^ "\n\
+  \  first (" ^ string_of_int old_ms ^ " ms): " ^ old_head ^ "\n\
+  \  now replaced by (" ^ string_of_int new_ms ^ " ms): " ^ new_head ^ "\n\
+  \Two proof obligations share one proof id.  The first proof is gone, and \
+  \whichever of the two obligations next meets the survivor will fail to replay \
+  \it -- with the AoA gate shut, that is a failed build.  \
+  \See PROOF_ID_COLLISION_FIX_PLAN.md."
+
+(*This guard cannot stop a key collision, only make the build that produces one
+  say so on the spot, instead of leaving it to surface days later in another
+  theory as an unexplained replay failure.  It sits at the single point every
+  writer goes through, so it also sees the writers that a Post_App probe hook
+  structurally cannot (holds_fact, led_future_proof).
+
+  Its two questions go to two different tables on purpose -- the reasons are
+  with the declaration of `written` above.  The skip half additionally drops the
+  benign duplicate appends of the rw_access retry path.
+
+  The time in `s` must ALREADY be standard-machine time -- every caller passes
+  its measurement through standard_time first.  Normalising here instead would
+  double-divide the callers that (per the time-semantics rule) do it themselves
+  before handing the record over.*)
 fun update_cached_proof thy (id,s) =
  (migrate_legacy thy;                                        (*D44: a write can be the first touch*)
-  Synchronized.change openning_stores (fn tab =>
-    let val (_, tab') = get_store_i thy tab
-     in Symtab.map_entry (Context.theory_name {long=true} thy)
-                         (fn (c, _) => (store_update_proof (id,s) c, true)) tab'
-    end);
-  append_record thy (encode_put (id, Time.toMilliseconds (#1 s), #2 s)))
+  let val name = Context.theory_name {long=true} thy
+      val mark = proof_mark s
+      (*The message is built inside the critical section but emitted outside it:
+        output synchronises on its own, and this section already serialises the
+        concurrent writers (\<phi>SH.record_proof, hammer_or_AoA_store_write).*)
+      val (do_append, msg) =
+        Synchronized.change_result openning_stores (fn tab =>
+          let val ((c, _, w), tab') = get_entry_i thy tab
+              val live_and_identical =
+                    case Symtab.lookup (#proofs c) id
+                      of SOME (_, text) => text = #2 s
+                       | NONE => false
+           in if live_and_identical
+              then ((false, NONE), tab')
+              else let val msg = case Symtab.lookup w id
+                                   of SOME old =>
+                                        if #1 old = #1 mark then NONE
+                                        else SOME (collision_message id old mark)
+                                    | NONE => NONE
+                    in ((true, msg),
+                        Symtab.update
+                          (name, (store_update_proof (id,s) c, true,
+                                  Symtab.update (id, mark) w)) tab')
+                   end
+          end)
+      val _ = case msg of SOME m => warning m | NONE => ()
+   in if do_append
+      then append_record thy (encode_put (id, Time.toMilliseconds (#1 s), #2 s))
+      else ()
+  end)
 
 fun report_cache_is_outdated warn thy =
   if warn
@@ -646,7 +734,9 @@ fun invalidate_proof_cache warn id thy =
   Synchronized.change openning_stores (fn tab =>
     let val (_, tab') = get_store_i thy tab
      in Symtab.map_entry (Context.theory_name {long=true} thy)
-                         (fn (c, _) => (store_invalidate_proof id c, true)) tab'
+                         (*w survives: this is the very path a collision takes,
+                           and a mark dropped here is evidence destroyed*)
+                         (fn (c, _, w) => (store_invalidate_proof id c, true, w)) tab'
     end);
   append_record thy (encode_tombstone id))
 
