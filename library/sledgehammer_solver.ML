@@ -561,7 +561,11 @@ fun classify exn =
 
    Par_Exn is a CONTAINER, not a kind of failure -- open it and classify the
    contents.  Never use `Par_Exn.dest exn = SOME _` as a test for "this was a
-   parallel failure": an interrupt destructures to SOME [] as well. *)
+   parallel failure": an interrupt destructures to SOME [] as well.
+
+   A twin of this discipline lives in PLPR's guard race
+   (Phi_Logic_Programming_Reasoner/library/reasoners.ML, prove_or_refute):
+   keep the two in sync; extract a shared kernel only on a third consumer. *)
 fun normalise exn =
   if Exn.is_interrupt exn then Exn.reraise exn
   else case exn of
