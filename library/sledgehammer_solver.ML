@@ -563,9 +563,12 @@ fun classify exn =
    contents.  Never use `Par_Exn.dest exn = SOME _` as a test for "this was a
    parallel failure": an interrupt destructures to SOME [] as well.
 
-   A twin of this discipline lives in PLPR's guard race
-   (Phi_Logic_Programming_Reasoner/library/reasoners.ML, prove_or_refute):
-   keep the two in sync; extract a shared kernel only on a third consumer. *)
+   The shared kernel of this discipline lives in the race engine:
+   Race.contains_interrupt (Performant_Isabelle_ML, library/race.ML), used
+   by PLPR's guard race; this file still carries its own inline copy --
+   keep it in sync with that kernel.  Do NOT substitute the kernel into
+   `joins_norm` below: its `flatten` unpacks Par_Exn RECURSIVELY, while
+   the engine's test is one-level by design. *)
 fun normalise exn =
   if Exn.is_interrupt exn then Exn.reraise exn
   else case exn of
