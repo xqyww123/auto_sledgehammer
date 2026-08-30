@@ -1,4 +1,4 @@
-session Auto_Sledgehammer = HOL +
+session Auto_Sledgehammer = Performant_Isabelle_HOL +
   sessions
     Performant_Isabelle_ML
   theories Auto_Sledgehammer

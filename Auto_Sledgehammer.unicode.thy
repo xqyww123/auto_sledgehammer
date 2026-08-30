@@ -1,5 +1,5 @@
 theory Auto_Sledgehammer
-  imports HOL.Sledgehammer Performant_Isabelle_ML.Performant_Isabelle_ML
+  imports HOL.Sledgehammer Performant_Isabelle_HOL.SSymb
 begin
 (*declare [[ML_debugger, ML_print_depth = 1000, ML_exception_debugger]]*)
 named_theorems φsledgehammer_simps ‹Simplification rules used before applying slegehammer automation›

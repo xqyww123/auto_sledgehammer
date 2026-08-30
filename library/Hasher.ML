@@ -133,6 +133,7 @@ val tag_Var   = 0wx6 : Word64.word
 val tag_Bound = 0wx7 : Word64.word
 val tag_Abs   = 0wx8 : Word64.word
 val tag_App   = 0wx9 : Word64.word
+val tag_Symbol = 0wxA : Word64.word
 
 (* Hash a type with direct fold accumulation *)
 fun hash_typ (ty: typ) (h: Word64.word) : Word64.word =
@@ -149,8 +150,13 @@ fun hash_typ (ty: typ) (h: Word64.word) : Word64.word =
         fold hash_string sort h''
       end
 
-(* Hash a term with direct fold accumulation *)
+(* Hash a term with direct fold accumulation.  A runtime symbol (SSymb.thy) is
+   hashed by its identifier, never by its numeral: the numeral is allocated per
+   process, so it would make the digest differ between sessions. *)
 fun hash_term (t: term) (h: Word64.word) : Word64.word =
+  case Phi_Tool_Symbol.dest_symbol t of
+    SOME id => hash_tagged tag_Symbol id h
+  | NONE =>
   case t of
     Const (name, ty) =>
       hash_typ ty (hash_tagged tag_Const name h)
