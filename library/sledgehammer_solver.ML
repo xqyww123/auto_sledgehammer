@@ -542,18 +542,14 @@ fun reason_rank (Internal_Failure _) = 7
   | reason_rank Subgoal_unsolved     = 1
   | reason_rank (Unknown _)          = 0
 
-(* Classify ONE exception.  The interrupt test is repeated per component and is
-   NOT redundant with the one in `normalise`: Par_Exn's invariant only excludes
-   interrupt_PROPER, and Exn.Interrupt_Breakdown is not proper, so it may sit
-   inside a Par_Exn -- while Exn.is_interrupt of the Par_Exn container itself is
-   false.  Without this line a user cancellation gets reported as an engine bug. *)
+(* Classify ONE non-interrupt exception: the callers have already re-raised
+   any interrupt, container components included. *)
 fun classify exn =
       (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.classify" exn;
-      if Exn.is_interrupt exn then Exn.reraise exn
-      else case exn of
-             Auto_Fail r       => r
-           | Timeout.TIMEOUT _ => Timeout
-           | _                 => Internal_Failure (Runtime.exn_message exn))
+      case exn of
+        Auto_Fail r       => r
+      | Timeout.TIMEOUT _ => Timeout
+      | _                 => Internal_Failure (Runtime.exn_message exn))
 
 (* Turn ANY escaping exception into the engine's own vocabulary.  Install it at
    the exits of the proof-search branches and NOWHERE inside them: the engine
@@ -562,18 +558,17 @@ fun classify exn =
 
    Par_Exn is a CONTAINER, not a kind of failure -- open it and classify the
    contents.  Never use `Par_Exn.dest exn = SOME _` as a test for "this was a
-   parallel failure": an interrupt destructures to SOME [] as well.
-
-   The shared kernel of this discipline lives in the race engine:
-   Race.contains_interrupt (Performant_Isabelle_ML, library/race.ML), used
-   by PLPR's guard race; this file still carries its own inline copy --
-   keep it in sync with that kernel.  Do NOT substitute the kernel into
-   `joins_norm` below: its `flatten` unpacks Par_Exn RECURSIVELY, while
-   the engine's test is one-level by design. *)
+   parallel failure": an interrupt destructures to SOME [] as well.  The
+   interrupt test, one level into the container, is Interrupt_Family
+   (Performant_Isabelle_ML, library/accounted_timeout.ML), shared with the
+   race engine and PLPR's guard race.  Do NOT substitute it into `joins_norm`
+   below: its `flatten` unpacks Par_Exn RECURSIVELY, by design. *)
 fun normalise exn =
   (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.normalise" exn;
-  if Exn.is_interrupt exn then Exn.reraise exn
-  else case exn of
+  case Interrupt_Family.find_interrupt exn of
+    SOME interrupt => Exn.reraise interrupt
+  | NONE =>
+  case exn of
     Auto_Fail _       => Exn.reraise exn                 (*already our vocabulary*)
   | Timeout.TIMEOUT _ => raise Auto_Fail Timeout
   | _ =>
