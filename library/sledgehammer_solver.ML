@@ -548,11 +548,12 @@ fun reason_rank (Internal_Failure _) = 7
    inside a Par_Exn -- while Exn.is_interrupt of the Par_Exn container itself is
    false.  Without this line a user cancellation gets reported as an engine bug. *)
 fun classify exn =
+      (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.classify" exn;
       if Exn.is_interrupt exn then Exn.reraise exn
       else case exn of
              Auto_Fail r       => r
            | Timeout.TIMEOUT _ => Timeout
-           | _                 => Internal_Failure (Runtime.exn_message exn)
+           | _                 => Internal_Failure (Runtime.exn_message exn))
 
 (* Turn ANY escaping exception into the engine's own vocabulary.  Install it at
    the exits of the proof-search branches and NOWHERE inside them: the engine
@@ -570,6 +571,7 @@ fun classify exn =
    `joins_norm` below: its `flatten` unpacks Par_Exn RECURSIVELY, while
    the engine's test is one-level by design. *)
 fun normalise exn =
+  (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.normalise" exn;
   if Exn.is_interrupt exn then Exn.reraise exn
   else case exn of
     Auto_Fail _       => Exn.reraise exn                 (*already our vocabulary*)
@@ -585,7 +587,7 @@ fun normalise exn =
             (* the payload describes the ORIGINAL exception, container and all *)
             (case worst of Internal_Failure _ => Internal_Failure (Runtime.exn_message exn)
                          | r => r)
-      end
+      end)
 
 fun head_only tac th =
   if Thm.nprems_of th = 0
@@ -607,7 +609,7 @@ fun auto_obligation_solver1 (ctxt, th) = th
    store hit can never start a proof search.  Stock `""` records need no special
    rule: the parser rejects them, which lands in the catch-all below, which the
    caching layer reads as "cached proof no longer works, search again". *)
-fun eval_prf_str kws n timeout prf (ctxt,sequent) = \<^try>\<open>
+fun eval_prf_str0 kws n timeout prf (ctxt,sequent) = \<^try>\<open>
       let val _ = tracing ("[eval_prf_str] replaying: " ^ quote prf)
           val protected = Goal.protect n sequent
           val seq =
@@ -628,6 +630,21 @@ fun eval_prf_str kws n timeout prf (ctxt,sequent) = \<^try>\<open>
               | err => (tracing ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
                                  Runtime.exn_message err);
                          raise Auto_Fail (Unknown (Runtime.exn_message err))) \<close>
+
+(*record point (EVENT_LOG_PLAN 7): a breakdown leaving a replay is attributed
+  with the budget and the elapsed time at that moment; record_breakdown is a
+  no-op otherwise.  Behaviour unchanged.*)
+fun eval_prf_str kws n timeout prf cs =
+  let val t0 = Time.now ()
+   in case Exn.capture_body (fn () => eval_prf_str0 kws n timeout prf cs) of
+        Exn.Res r => r
+      | Exn.Exn exn =>
+          (Exception_Log.record_breakdown
+             ("eval_prf_str timeout=" ^ Time.toString timeout ^
+              " elapsed=" ^ Time.toString (Time.now () - t0) ^
+              " prf=" ^ String.substring (prf, 0, Int.min (size prf, 40))) exn;
+           Exn.reraise exn)
+  end
 
 
 fun eval_prf_str_stat kws timeout F_None prf stat =
@@ -827,12 +844,18 @@ fun raw_sledgehammer timeout_opt override hasty stat =
           deadline
 
    in Future.forks {name="\<phi>SH", group = SOME group, deps = [], pri=10, interrupts=true} [(fn () =>
-        ( Sledgehammer.run_sledgehammer
-            (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
-                Sledgehammer_Prover.Normal
-                (SOME dirty_hack) 1 override
-                (silence_state stat)
-        ; ()))]
+        (*capture site (EVENT_LOG_PLAN 7): the sledgehammer arm runs on a
+          worker and its failures are otherwise swallowed by join_results
+          below; the region is bounded by the hammer timeout*)
+        Exception_Log.capture
+          {site = "hammer sledgehammer", record = Exception_Log.default_record}
+          (fn () =>
+            ( Sledgehammer.run_sledgehammer
+                (Sledgehammer_Commands.default_params (Proof.theory_of stat) sledgehammer_params)
+                    Sledgehammer_Prover.Normal
+                    (SOME dirty_hack) 1 override
+                    (silence_state stat)
+            ; ())))]
     |> Future.join_results
      ; Future.join_results (Synchronized.value futures)
      ; (case watchdog of SOME req => ignore (Event_Timer.cancel req) | NONE => ())
@@ -1839,11 +1862,13 @@ fun joins_norm futs =
   case Exn.capture_body (fn () => Future.joins futs) of
     Exn.Res r => r
   | Exn.Exn exn =>
-      (case flatten exn of
+      (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.joins_norm" exn;
+       case flatten exn of
          [] => Exn.reraise exn
        | exns =>
            case find_first Exn.is_interrupt exns of
-             SOME i => Exn.reraise i
+             SOME i => (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.joins_norm/flattened" i;
+                        Exn.reraise i)
            | NONE =>
                if forall (fn Auto_Fail _ => true | _ => false) exns
                then raise Auto_Fail
