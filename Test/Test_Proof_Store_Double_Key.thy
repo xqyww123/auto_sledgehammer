@@ -28,6 +28,7 @@ fun assert b msg = if b then () else error ("FAIL: " ^ msg)
 
 val t1 = Time.fromMilliseconds 100
 val t2 = Time.fromMilliseconds 200
+val t3 = Time.fromMilliseconds 300
 fun digest s = Hasher.string s
 
 (*the pre-hash frame layout, as an old binary wrote it*)
@@ -124,14 +125,14 @@ val _ = assert (length (frames ()) = n11 + 2) "test11 two frames"
       in its time is not (ruling O covers the whole record)*)
 val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD'} (t2, "pD")
 val _ = assert (length (frames ()) = n11 + 2) "test12 no frame"
-val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD'} (t1, "pD")
+val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD'} (t3, "pD")
 val _ = assert (length (frames ()) = n11 + 3) "test12b time-only rewrite is a frame"
-val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t1, "pD")) "test12b by_hash follows"
+val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t3, "pD")) "test12b by_hash follows"
 
 (*13: 10 and 11 hold after a reload*)
 val _ = S.force_reload thy
 val _ = assert (S.get_cached_proof_by_hash thy hC = SOME (t1, "pB1")) "test13 a"
-val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t1, "pD")
+val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t3, "pD")
                 andalso S.get_cached_proof_by_hash thy hD = SOME (t1, "pD")) "test13 b"
 \<close>
 
@@ -173,12 +174,12 @@ ML \<open>
 structure Solver = Phi_Sledgehammer_Solver
 
 fun goal_of ctxt s = Goal.init (Thm.cterm_of ctxt (Syntax.read_prop ctxt s))
-fun opts r pid w =
+fun opts {read, write} pid =
   {improved = true, async_mode = Solver.Sync,
    fact_override = Sledgehammer_Fact.no_fact_override, proof_id = pid,
-   timeout = NONE, read_store = SOME r, write_store = SOME w} : Solver.options
-fun run_auto r pid w ctxt st =
-  let val (fut, st') = Solver.auto (opts r pid w) ctxt st in (Future.join fut, st') end
+   timeout = NONE, read_store = SOME read, write_store = SOME write} : Solver.options
+fun run_auto flags pid ctxt st =
+  let val (fut, st') = Solver.auto (opts flags pid) ctxt st in (Future.join fut, st') end
 
 (*counted by the method below: a replay the skip rule suppresses shows as a
   count that did not move*)
@@ -196,7 +197,7 @@ val _ = S.invalidate_store thy
 val g16 = goal_of ctxt "(x::nat) + 0 = x"
 val h16 = Hasher.goal_at 1 (ctxt, g16)
 val _ = S.update_cached_proof thy {id = "other16", hash = SOME h16} (t1, "(fail)[1]")
-val (txt16, st16) = run_auto true (SOME "K16") true ctxt g16
+val (txt16, st16) = run_auto {read = true, write = true} (SOME "K16") ctxt g16
 val _ = assert (Thm.no_prems st16) "test16 solved"
 val _ = assert (tombs_of "K16" = 0 andalso tombs_of "other16" = 0) "test16 no tombstone"
 val _ = assert (length (puts_of "other16") = 1) "test16 record kept"
@@ -211,7 +212,7 @@ val _ = S.invalidate_store thy
 val g16b = goal_of ctxt "(w::nat) + 0 = w"
 val _ = S.update_cached_proof thy {id = "K16b", hash = NONE} (t1, "(simp)[1]")
 val n16b = length (frames ())
-val (txt16b, st16b) = run_auto true (SOME "K16b") true ctxt g16b
+val (txt16b, st16b) = run_auto {read = true, write = true} (SOME "K16b") ctxt g16b
 val _ = assert (txt16b = "(simp)[1]" andalso Thm.no_prems st16b) "test16b verbatim"
 val _ = assert (length (frames ()) = n16b) "test16b no frame"
 \<close>
@@ -224,7 +225,7 @@ val g16c = goal_of ctxt "(v::nat) + 0 = v"
 val h16c = Hasher.goal_at 1 (ctxt, g16c)
 val _ = S.update_cached_proof thy {id = "K16c", hash = SOME h16c} (t1, "(simp)[1]")
 val n16c = length (frames ())
-val (txt16c, st16c) = run_auto false (SOME "K16c") false ctxt g16c
+val (txt16c, st16c) = run_auto {read = false, write = false} (SOME "K16c") ctxt g16c
 val _ = assert (txt16c <> "(simp)[1]" andalso Thm.no_prems st16c) "test16c searched"
 val _ = assert (length (frames ()) = n16c) "test16c no frame"
 \<close>
@@ -236,7 +237,7 @@ val _ = S.invalidate_store thy
 val g17 = goal_of ctxt "(y::nat) * 1 = y"
 val h17 = Hasher.goal_at 1 (ctxt, g17)
 val _ = S.update_cached_proof thy {id = "K17", hash = SOME h17} (t1, "(fail)[1]")
-val (_, st17) = run_auto true (SOME "K17") false ctxt g17
+val (_, st17) = run_auto {read = true, write = false} (SOME "K17") ctxt g17
 val _ = assert (Thm.no_prems st17) "test17 solved"
 val _ = assert (tombs_of "K17" = 1 andalso length (puts_of "K17") = 1) "test17 tombstone, no PUT"
 val _ = assert (S.get_cached_proof thy "K17" = NONE) "test17 id gone"
@@ -261,9 +262,10 @@ val per_replay = !replays
 val _ = assert (per_replay > 0) "test17b count_fail is reached"
 val _ = S.update_cached_proof thy {id = "K17b", hash = SOME h17b} (t1, "(count_fail)[1]")
 val _ = replays := 0
-val (_, st17b) = run_auto true (SOME "K17b") true ctxt g17b
+val (_, st17b) = run_auto {read = true, write = true} (SOME "K17b") ctxt g17b
 val _ = assert (Thm.no_prems st17b) "test17b solved"
 val _ = assert (!replays = per_replay) ("test17b replayed once, not twice: " ^ string_of_int (!replays))
+val _ = assert (tombs_of "K17b" = 1) "test17b tombstone"
 \<close>
 
 ML \<open>
@@ -275,9 +277,9 @@ val g18b = goal_of ctxt "rev (rev (xs::nat list)) = xs"
 val p18 = "(rule rev_rev_ident)[1]"
 val h18b = Hasher.goal_at 1 (ctxt, g18b)
 val _ = S.update_cached_proof thy {id = "K18a", hash = SOME h18b} (t1, p18)
-val (_, st18a) = run_auto true (SOME "K18a") true ctxt g18a
+val (_, st18a) = run_auto {read = true, write = true} (SOME "K18a") ctxt g18a
 val _ = assert (Thm.no_prems st18a andalso tombs_of "K18a" = 1) "test18 first call"
-val (txt18, st18b) = run_auto true (SOME "K18b") true ctxt g18b
+val (txt18, st18b) = run_auto {read = true, write = true} (SOME "K18b") ctxt g18b
 val _ = assert (txt18 = p18 andalso Thm.no_prems st18b) "test18 verbatim"
 val _ = assert (map #hash (puts_of "K18b") = [SOME h18b] andalso tombs_of "K18b" = 0) "test18 promoted"
 \<close>
@@ -294,7 +296,7 @@ val p19 = "(rule rev_rev_ident)[1]"
 val _ = S.update_cached_proof thy {id = "K19", hash = NONE} (t1, "(fail)[1]")
 val _ = S.update_cached_proof thy {id = "other19", hash = SOME h19} (t1, p19)
 (*the promotion rewrites K19 with another text: the collision guard warns, as it should*)
-val (txt19, st19) = run_auto true (SOME "K19") true ctxt g19
+val (txt19, st19) = run_auto {read = true, write = true} (SOME "K19") ctxt g19
 val _ = assert (txt19 = p19 andalso Thm.no_prems st19) "test19 verbatim"
 val _ = assert (tombs_of "K19" = 1 andalso map #hash (puts_of "K19") = [NONE, SOME h19]) "test19 frames"
 val _ = S.force_reload thy
@@ -315,7 +317,7 @@ val h19b = Hasher.all_goals (ctxt, g19b)
 val p19b = "((rule add_0_right)[1], (rule rev_rev_ident)[1])"
 val _ = S.update_cached_proof thy {id = "other19b", hash = SOME h19b} (t1, p19b)
 val n19b = length (frames ())
-val (fut19b, st19b) = Solver.all_auto (opts true (SOME "K19b") false) ctxt g19b
+val (fut19b, st19b) = Solver.all_auto (opts {read = true, write = false} (SOME "K19b")) ctxt g19b
 val (_, txt19b) = Future.join fut19b
 val _ = assert (txt19b = p19b) "test19b verbatim"
 val _ = assert (Thm.no_prems st19b) "test19b closed"
@@ -324,7 +326,7 @@ val _ = assert (length (frames ()) = n19b) "test19b no frame"
 (*19c: all_auto's hit by id, handed back as it stands*)
 val _ = S.update_cached_proof thy {id = "K19c", hash = NONE} (t1, p19b)
 val n19c = length (frames ())
-val (fut19c, st19c) = Solver.all_auto (opts true (SOME "K19c") true) ctxt g19b
+val (fut19c, st19c) = Solver.all_auto (opts {read = true, write = true} (SOME "K19c")) ctxt g19b
 val _ = assert (snd (Future.join fut19c) = p19b) "test19c verbatim"
 val _ = assert (Thm.no_prems st19c) "test19c closed"
 val _ = assert (length (frames ()) = n19c) "test19c no frame"

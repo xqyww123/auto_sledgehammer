@@ -49,7 +49,9 @@ datatype async_mode =
    proof_id      -- store key; NONE derives it from the goal (see below).
    read_store    -- governs the lookup under BOTH keys, the proof id and the
                     goal hash; NONE falls back to the enable_proof_store config.
-   write_store   -- governs the write, which carries both keys.  Store
+   write_store   -- governs BOTH writes, each carrying both keys: the record
+                    made when a search succeeds, and the promotion of a
+                    goal-hash hit under this call's proof id.  Store
                     self-maintenance is deliberately NOT governed by either:
                     invalidate_proof_cache retires an id whose record failed to
                     replay, invalidate_proof_cache_by_hash forgets a hash entry
@@ -1981,15 +1983,13 @@ fun auto (opts : options) ctxt0 sequent =
     val do_read = store_flag ctxt (#read_store opts)
     val do_write = store_flag ctxt (#write_store opts)
 
-    (*The time is standard-machine time already: a search site normalises its
-      measurement before calling, a promotion copies a stored record.
-      The log line is deliberately NOT gated on write_store: it reports what the
-      search found, which is worth knowing whether or not we keep it.*)
+    (*`time` is already standard-machine time; the contract and the reason are
+      at update_cached_proof.  A search site normalises its measurement; a
+      promotion copies a stored record.*)
     fun record (time, prf) =
-      (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
-       if do_write andalso not hasty
-       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
-       else ())
+      if do_write andalso not hasty
+      then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
+      else ()
 
     fun search () =
       let val (_, futs, sequent') =
@@ -1998,9 +1998,12 @@ fun auto (opts : options) ctxt0 sequent =
                                 fact_override = #fact_override opts,
                                 timeout = #timeout opts}))
               (ctxt, sequent)
+          (*The log line is deliberately NOT gated on write_store: it reports what
+            the search found, which is worth knowing whether or not we keep it.*)
           val out = after futs (fn [(time, prf)] =>
                                    let val text = scoped prf
-                                    in record (Phi_Proof_Store.standard_time time, text); text end
+                                    in tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ text);
+                                       record (Phi_Proof_Store.standard_time time, text); text end
                                  | _ => raise Fail "auto: async_prove Leading \
                                                    \yielded the wrong shape")
           val _ = if Future.is_finished out then ()
@@ -2028,11 +2031,13 @@ fun all_auto (opts : options) ctxt0 sequent =
     val do_read = store_flag ctxt (#read_store opts)
     val do_write = store_flag ctxt (#write_store opts)
 
+    (*`time` is already standard-machine time; the contract and the reason are
+      at update_cached_proof.  A search site normalises its measurement; a
+      promotion copies a stored record.*)
     fun record (time, prf) =
-      (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
-       if do_write andalso not hasty
-       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
-       else ())
+      if do_write andalso not hasty
+      then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
+      else ()
 
     fun search () =
       let val (_, futs, sequent') =
@@ -2049,7 +2054,8 @@ fun all_auto (opts : options) ctxt0 sequent =
                        let val time = fold (curry (op +) o fst) tps Time.zeroTime
                            val text = "(" ^ String.concatWith ", "
                                               (map (scoped o snd) tps) ^ ")"
-                        in record (Phi_Proof_Store.standard_time time, text); (time, text) end)
+                        in tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ text);
+                           record (Phi_Proof_Store.standard_time time, text); (time, text) end)
           val _ = if Future.is_finished out then ()
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
        in (out, sequent') end

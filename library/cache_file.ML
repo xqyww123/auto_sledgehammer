@@ -151,10 +151,12 @@ type proof_cache = Time.time * string
 (*A record has two keys: its proof id, under which it is stored, and
   optionally the digest of the goal it proved.  `proofs` is the file's live
   set, keyed by id.  `by_hash` is the second index: goal digest -> (time, text)
-  of the last record written with that digest.  It lives in memory only,
-  is rebuilt from the file's frames on load (tombstoned records included), and
-  is insert-only except for invalidate_proof_cache_by_hash.  See
-  ai-artifacts/PROOF_STORE_DOUBLE_KEY_PLAN.md.*)
+  of the most recent write carrying that digest that was not short-circuited
+  by update_cached_proof.  Which record that is when several ids share a
+  digest is deliberately unspecified; every by-hash hit is replay-verified
+  before use.  It lives in memory only, is rebuilt from the file's frames on
+  load (tombstoned records included), and is insert-only except for
+  invalidate_proof_cache_by_hash.  See ai-artifacts/PROOF_STORE_DOUBLE_KEY_PLAN.md.*)
 type proof_record = {hash: Hasher.digest option, time: Time.time, proof: string}
 type store = {proofs: proof_record Symtab.table,
               by_hash: proof_cache Hasher.Tab.table,
@@ -747,8 +749,9 @@ fun update_cached_proof thy {id, hash} s =
       val (do_append, msg) =
         Synchronized.change_result openning_stores (fn tab =>
           let val ((c, _, w), tab') = get_entry_i thy tab
-              (*the whole record, time included: a skipped write is then a
-                true no-op, and by_hash cannot lag behind the write sequence*)
+              (*the whole record, time included: a skipped write then leaves
+                proofs[id] byte-identical, so the frame it would append is
+                redundant*)
               val live_and_identical = Symtab.lookup (#proofs c) id = SOME r
            in if live_and_identical
               then ((false, NONE), tab')

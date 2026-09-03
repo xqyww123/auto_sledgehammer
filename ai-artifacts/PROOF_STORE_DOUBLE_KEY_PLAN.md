@@ -18,8 +18,9 @@ rev 4 → rev 5 的变化：
 评审中被作者驳回或延后的意见见 §6。
 
 rev 5 → rev 6（实施完成后的代码评审，2026-09-03；实施提交 auto_sledgehammer `a9c1b0b`、Isa-Mini `59099f0`）：
-① 裁决 O 的短路判据从"文本相同、hash 相同"放宽为**整条记录相同**（时间也相同）：被跳过的写入因此是真正的
-   空操作，`by_hash` 不会落后于写入序列（§2、§3.3）；
+① 裁决 O 的短路判据从"文本相同、hash 相同"放宽为**整条记录相同**（时间也相同）：被跳过的写入因此对该 id
+   是真正的空操作，它要追加的帧是冗余的（§2、§3.3；rev 6 初稿还写了"`by_hash` 不会落后于写入序列"，
+   那句话不成立，见 §3.3）；
 ② `replay_store` 的参数记录缩为 `{do_read, id, hash}`，`thy` 与 `kws` 由它收到的 `ctxt` 推出（§3.4）；
 ③ 晋升写入的时间语义统一为"晋升是复制"：`record` 只接收已归一的标准机器时间，搜索现场调用它之前自己做
    `standard_time`，按 hash 命中时以取回的记录原样写入，与 `store_hit_replay` 的 `write_l2` 一致（§3.4）；
@@ -266,8 +267,11 @@ fun invalidate_proof_cache_by_hash h thy =
 
 - `live_and_identical`（`:703-706`）按裁决 O 改为 `Symtab.lookup (#proofs c) id = SOME r`，r 是本次要写的
   整条记录（rev 6：连时间一起比）。撞键守卫不受影响：`proof_mark`（`:576`）只摘要文本，同文本换 hash 或换
-  时间得到同样的摘要，不会误报；逐字节相同的重复写入仍被短路，而被短路的写入是真正的空操作，
-  `by_hash` 里的项与写入序列一致，签名里"该 hash 最后一次写入的 (time, text)"这句话因此成立。
+  时间得到同样的摘要，不会误报；逐字节相同的重复写入仍被短路，而被短路的写入对该 id 是真正的空操作，
+  它要追加的帧是冗余的。**这不意味着 `by_hash` 与写入序列一致**：短路按 id 判断，`by_hash` 跨 id 只存
+  一个值。反例：写 {A, h}(t, P)，再写 {B, h}(t2, Q)，再写 {A, h}(t, P)——第三次因 A 名下记录逐字节相同而
+  短路，`by_hash[h]` 停在 (t2, Q)。所以 `by_hash[h]` 是"最近一次**没被短路**的、带 h 的写入"，多个 id 共用
+  一个 hash 时留下哪条不作规定（裁决 H），每次按 hash 命中都先重放验证，签名注释照此措辞。
 - `written` 表与撞键守卫其余部分不变；追加的帧由 `encode_put` 按新记录编码。
 
 ### 3.4 调用点清单
@@ -361,8 +365,10 @@ val store_hit_replay : {key: Phi_Proof_Store.proof_id, hash: Hasher.digest optio
 头部契约注释（`:31-40`）改写为三级顺序，**并写明三级各自的失败动作**（L2 按 id → 墓碑并下落；
 L2 按 hash → 按 hash 作废、不追加帧；L1 → `l1_invalidate` 并报未命中）以及那条贯穿三级的已失败记录
 规则。代码里第 2 步的失败分支旁留一句短注释引用裁决 I。hash 的计算**不进** `store_hit_replay`：
-它是共享的 level-0 入口，不应持有任何键配方（裁决 A）。**§4 没有测试能到第 3 步**（测试在无 Python
-环境下跑，L1 静默未命中），第 3 步的行为靠人工检查。
+它是共享的 level-0 入口，不应持有任何键配方（裁决 A）。**§4 的测试到第 3 步时 L1 必定未命中**：Isa-Mini
+测试 theory 里所有 proof id 带前缀 `TPSHH.`，生产代码造不出这个前缀（`run_AoA` 写十六进制摘要，
+`hammer_or_AoA` 转发 phi 的义务 id），所以不论 prover 有没有 Python，L1 都查不到，也不会误删作者的真实
+L1 缓存。第 3 步的行为靠人工检查。
 
 其余调用点：
 
@@ -394,7 +400,8 @@ L2 按 hash → 按 hash 作废、不追加帧；L1 → `l1_invalidate` 并报�
 
 新增 `Test/Test_Proof_Store_Double_Key.thy`，`imports Auto_Sledgehammer.Auto_Sledgehammer`
 （带 session 前缀，与 `Test/Test_Ground_Eval.thy:2` 一致，使其在别的 session 下也能解析），
-纯 ML 断言。`*.proof-store` 与 `.lock` 已被 `.gitignore` 忽略，测试文件不需要善后。凡是
+ML 断言，外加 17b / 22b 需要的一个 `method_setup`。`*.proof-store` 与 `.lock` 已被 `.gitignore` 忽略，
+测试文件不需要善后。凡是
 "`scan` 文件断言帧存在"的断言都是有意的：`try_write`（`:463-465`）与 `append_record`
 （`:527-534`）在不可写目录下静默跳过，不检查磁盘的测试会空过。解码后的记录没有 tag 字段，
 所以对文件只断言 `hash` 字段，不断言 tag（编码器只产生 tag 3，测试 1 已钉住）。
@@ -480,8 +487,12 @@ rev 6 补充的测试（实施评审指出的空白）：
   （搜索了）、文件无新帧。这是 §3.4 "一处 `do_read` 判断"的反向。
 - **17b / 22b**：**跳过规则的正向**：测试 theory 里用 `method_setup` 声明一个计数后失败的方法 `count_fail`，
   预置 `{id = K, hash = SOME h}`、文本 `(count_fail)[1]`，以 K 调用：第 1 步重放一次（计数 1）、失败、墓碑；
-  第 2 步取回同一条记录、跳过；断言计数为 1（没有跳过规则时为 2）。`count_fail` 只对 `method_setup` 之后
-  取的 context 可见，这两条测试因此各自取新的 `\<^context>`。
+  第 2 步取回同一条记录、跳过。一次重放会调用该方法**不止一次**（`[1]` 组合子会回溯），所以测试先单独
+  重放一次量出基准，再断言整次调用的计数等于基准（没有跳过规则时是基准的两倍）；rev 6 初稿写的
+  "计数为 1、否则为 2"按字面做不出来。`count_fail` 只对 `method_setup` 之后取的 context 可见，这两条测试
+  因此各自取新的 `\<^context>`。
+- **Isa-Mini 测试 theory 的 proof id 一律带前缀 `TPSHH.`**（如 `TPSHH.K1`），理由见 §3.4；本节示意用的
+  键名省略了前缀。
 - **20b**：`store_hit_replay` 的按 id 命中成功，同 16b。
 
 对 `store_hit_replay` 与 `hammer_or_AoA`（裁决 P、I、Q），放在 Isa-Mini 侧
@@ -538,7 +549,7 @@ Python 时静默返回未命中（`proof_store_AoA.ML` 的 `\<^try>`），测试
    （§3.2、§3.3）。
 3. `sledgehammer_solver.ML`：共用函数 `replay_store`，`auto` / `all_auto` 改为调用它，`record` 调用点，
    `:50-55` 与 `:1968-1971` 注释；`cache_file.ML` 的 `update_cache_by_hash`（§3.4）。
-4. 测试 theory（§4 第 1–19b 条），经 Isabelle-MCP 跑通。
+4. 测试 theory（§4 第 1–19c 条），经 Isabelle-MCP 跑通。
 5. Isa-Mini：`store_hit_replay` 三级顺序、签名与契约注释、`run_AoA` / `hammer_or_AoA` 调用点、
    测试 20–24（§3.4、§4）。两处写回 fork 无测试，原因见 §4 末。
    **实测记录（2026-09-03，Isabelle-MCP 的 `HOL` session）**：`Semantic_Embedding.thy:29` 起 RPC host 失败
