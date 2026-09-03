@@ -734,9 +734,10 @@ fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
   with the declaration of `written` above.  The skip half additionally drops the
   benign duplicate appends of the rw_access retry path.
 
-  The time in `s` must ALREADY be standard-machine time -- every caller passes
-  its measurement through standard_time first.  Normalising here instead would
-  double-divide the callers that (per the time-semantics rule) do it themselves
+  The time in `s` must ALREADY be standard-machine time: a caller that MEASURED
+  it passes it through standard_time first, a caller that COPIES a stored
+  record passes it on unchanged.  Normalising here instead would double-divide
+  the measuring callers, which (per the time-semantics rule) do it themselves
   before handing the record over.*)
 fun update_cached_proof thy {id, hash} s =
  (migrate_legacy thy;                                        (*D44: a write can be the first touch*)
