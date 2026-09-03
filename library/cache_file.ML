@@ -8,13 +8,21 @@
      [ magic : u32 BE = 0x6ABCDEF6 ][ len : u32 BE ][ crc32 : u32 BE ][ payload : len bytes ]
 
    crc32 is the standard IEEE 802.3 CRC-32 over (be32 len ++ payload).
-   payload is a MessagePack-encoded record:
+   payload is a MessagePack-encoded record, tagged by its first element:
 
-     PUT  (key, time_ms, value)   <->  (1, (key, time_ms, value))
-     TOMB key                     <->  (2, key)
+     PUT {id, hash, time_ms, proof}  <->  (3, (id, hash | nil, time_ms, proof))
+     TOMB id                         <->  (2, id)
+     (1, (id, time_ms, proof))         --  the pre-hash PUT.  Decoded forever,
+                                           never written: proofstore-merge.sh
+                                           splices frames from old branches in.
 
-   Reading scans for the magic, validates the crc and that len fits, then
-   applies records in file order (last write wins; TOMB deletes the key).
+   hash is the goal digest (Hasher.digest, a 64-bit word) or nil for a record
+   that was stored without one.  Decoding is what migrates: a tag-1 frame and a
+   tag-3 frame with a nil hash decode to the same record.
+
+   Reading scans for the magic, validates the crc and that len fits, and yields
+   the records in file order; folding them into tables is the store's business
+   (Phi_Proof_Store.replay).
    A torn/half-written trailing frame, or a magic byte-sequence that happens
    to occur inside a payload, fails the crc check and the scanner resynchronises
    at the next magic occurrence -- so a crash never corrupts earlier records and
@@ -63,23 +71,30 @@ fun crc32 (s : string) : Word32.word =
     0wxFFFFFFFF)
 end
 
-datatype record = PUT of string * int * string | TOMB of string
+datatype record =
+    PUT of {id: string, hash: Hasher.digest option, time_ms: int, proof: string}
+  | TOMB of string
 
 local
   structure P = MessagePackBytesIO.Pack
   structure U = MessagePackBytesIO.Unpack
-  val put_packer = P.packPair (P.packInt, P.packTuple3 (P.packString, P.packInt, P.packString))
+  val put_packer =
+    P.packPair (P.packInt, P.packTuple4 (P.packString, P.packOption P.packWord64, P.packInt, P.packString))
   val tomb_packer = P.packPair (P.packInt, P.packString)
+  fun put (id, hash, time_ms, proof) = PUT {id = id, hash = hash, time_ms = time_ms, proof = proof}
   val rec_unpacker =
     U.unpackPair_dep' U.unpackInt (fn tag =>
-      if tag = 1 then U.>> (U.unpackTuple3 (U.unpackString, U.unpackInt, U.unpackString), PUT)
+      if tag = 3 then U.>> (U.unpackTuple4 (U.unpackString, U.unpackOption U.unpackWord64,
+                                            U.unpackInt, U.unpackString), put)
       else if tag = 2 then U.>> (U.unpackString, TOMB)
+      else if tag = 1 then U.>> (U.unpackTuple3 (U.unpackString, U.unpackInt, U.unpackString),
+                                 fn (id, time_ms, proof) => put (id, NONE, time_ms, proof))
       else raise U.Unpack)
 in
 fun encode_record r =
   let val outs = BytesIO.mkOutstream ()
-   in (case r of PUT (k, t, v) => put_packer (1, (k, t, v)) outs
-               | TOMB k => tomb_packer (2, k) outs);
+   in (case r of PUT {id, hash, time_ms, proof} => put_packer (3, (id, hash, time_ms, proof)) outs
+               | TOMB id => tomb_packer (2, id) outs);
       BytesIO.toString outs
   end
 fun decode_record payload = #1 (U.doUnpack rec_unpacker (BytesIO.fromString payload))
@@ -89,8 +104,8 @@ fun frame payload =
   let val len_bytes = be32 (Word32.fromInt (size payload))
    in MAGIC ^ len_bytes ^ be32 (crc32 (len_bytes ^ payload)) ^ payload end
 
-fun encode_put (k, t, v) = frame (encode_record (PUT (k, t, v)))
-fun encode_tombstone k = frame (encode_record (TOMB k))
+fun encode_put r = frame (encode_record (PUT r))
+fun encode_tombstone id = frame (encode_record (TOMB id))
 
 fun is_new_format raw = size raw >= 4 andalso String.substring (raw, 0, 4) = MAGIC
 
@@ -125,12 +140,6 @@ fun scan s =
               end
    in loop 0 [] end
 
-(* replay records (file order) into the proof table; last write wins, TOMB deletes *)
-fun replay records =
-  fold (fn PUT (k, t, v) => Symtab.update (k, (Time.fromMilliseconds t, v))
-         | TOMB k => Symtab.delete_safe k)
-       records Symtab.empty
-
 end
 
 
@@ -138,7 +147,17 @@ signature PHI_PROOF_STORE = sig
 
 type proof_id = string
 type proof_cache = Time.time * string
-type store = {proofs: proof_cache Symtab.table,
+
+(*A record has two keys: its proof id, under which it is stored, and
+  optionally the digest of the goal it proved.  `proofs` is the file's live
+  set, keyed by id.  `by_hash` is the second index: goal digest -> (time, text)
+  of the last record written with that digest.  It lives in memory only,
+  is rebuilt from the file's frames on load (tombstoned records included), and
+  is insert-only except for invalidate_proof_cache_by_hash.  See
+  ai-artifacts/PROOF_STORE_DOUBLE_KEY_PLAN.md.*)
+type proof_record = {hash: Hasher.digest option, time: Time.time, proof: string}
+type store = {proofs: proof_record Symtab.table,
+              by_hash: proof_cache Hasher.Tab.table,
               async_tasks: Task_Queue.task list}
 
 (*Where this theory's store file lives.  Exported because user-facing messages
@@ -152,23 +171,19 @@ val register_async_task : Task_Queue.task -> theory -> unit
 val compact_and_store : theory -> unit
 val close_store : theory -> unit
 val invalidate_store : theory -> unit
-val invalidate_proof_cache : bool (*whether warn*) -> proof_id -> theory -> unit
 (* val check_cache : string (*Document_ID*) -> Proof.context -> unit *)
 val report_cache_is_outdated : bool (*whether warn*) -> theory -> unit
 
-val get_cached_proof : theory -> proof_id -> (Time.time * string) option
-val update_cached_proof : theory -> proof_id * (Time.time * string) -> unit
-
-(*Here we provide another mechanism which records the proof to the hash digest of the proposition.
-  It is useful when the user is editing a code before a lemma of a cached proof, the proof-id of the
-  lemma can be changed due to the editing, but the hash digest will not only if the proposition of
-  the lemma itself is unchanged, so the proof can be still cached and saves the user from annoying
-  proof re-search.
-*)
-
-val access_hash_cache : Hasher.digest -> proof_cache option
-val update_hash_cache : Hasher.digest -> proof_cache -> unit
-val clean_hash_cache  : unit -> unit
+(*Each key fails on its own: a record that does not replay under its id is
+  tombstoned (invalidate_proof_cache: the id is gone, the digest entry stays --
+  the text is still a proof of that goal), a by_hash entry that does not replay
+  is forgotten in memory only (invalidate_proof_cache_by_hash: no frame, the
+  file is untouched).*)
+val get_cached_proof : theory -> proof_id -> proof_cache option
+val get_cached_proof_by_hash : theory -> Hasher.digest -> proof_cache option
+val update_cached_proof : theory -> {id: proof_id, hash: Hasher.digest option} -> proof_cache -> unit
+val invalidate_proof_cache : bool (*whether warn*) -> proof_id -> theory -> unit
+val invalidate_proof_cache_by_hash : Hasher.digest -> theory -> unit
 
 type proof = string
 
@@ -213,27 +228,50 @@ val enable_proof_store = Attrib.setup_config_bool \<^binding>\<open>enable_proof
 
 type proof_id = string
 type proof_cache = Time.time * string
-type store = {proofs: (Time.time * string) Symtab.table,
+type proof_record = {hash: Hasher.digest option, time: Time.time, proof: string}
+type store = {proofs: proof_record Symtab.table,
+              by_hash: proof_cache Hasher.Tab.table,
               async_tasks: Task_Queue.task list}
 
-val empty_store = {proofs = Symtab.empty, async_tasks = []} : store
+val empty_store = {proofs = Symtab.empty, by_hash = Hasher.Tab.empty, async_tasks = []} : store
 
-open Proof_Store_Format  (*MAGIC, crc32, frame, scan, replay, encode_put, encode_tombstone, ...*)
+open Proof_Store_Format  (*MAGIC, crc32, frame, scan, encode_put, encode_tombstone, ...*)
 
-fun store_update_proof (id,s) ({proofs, async_tasks}:store)
-      = {proofs = Symtab.update (id,s) proofs,
+(*The only writers of `proofs` and `by_hash`.  A write overwrites the digest
+  entry but never deletes the superseded one (that text still proves its own
+  goal); a tombstone leaves `by_hash` alone.  Deleting there on a tombstone
+  cascades: when an obligation is inserted ahead of n others, every one of
+  them fails under its shifted id and would delete the very entry its
+  successor is about to look up.  Hence the single deletion is
+  store_forget_hash, reached only when a by_hash hit itself failed to replay.*)
+fun store_update_proof (id, r : proof_record) ({proofs, by_hash, async_tasks}:store)
+      = {proofs = Symtab.update (id, r) proofs,
+         by_hash = (case #hash r of
+                      SOME h => Hasher.Tab.update (h, (#time r, #proof r)) by_hash
+                    | NONE => by_hash),
          async_tasks = async_tasks} : store
 
-fun store_invalidate_proof id ({proofs,async_tasks}:store)
-      = {proofs = Symtab.delete_safe id proofs (*Symtab.fold (fn (k,_) =>
-                      if Phi_ID.dep id k
-                      then Symtab.delete k
-                      else I) proofs proofs*),
-         async_tasks = []
-        } : store
+fun store_invalidate_proof id ({proofs, by_hash, ...}:store)
+      = {proofs = Symtab.delete_safe id proofs, by_hash = by_hash, async_tasks = []} : store
 
-fun store_add_async task ({proofs,async_tasks}:store)
-      = {proofs = proofs, async_tasks = task :: async_tasks} : store
+fun store_forget_hash h ({proofs, by_hash, async_tasks}:store)
+      = {proofs = proofs, by_hash = Hasher.Tab.delete_safe h by_hash, async_tasks = async_tasks} : store
+
+fun store_add_async task ({proofs, by_hash, async_tasks}:store)
+      = {proofs = proofs, by_hash = by_hash, async_tasks = task :: async_tasks} : store
+
+(*Fold a file's records, in file order, into a store: last write wins, TOMB
+  deletes the id.  Total by construction -- a raise here would let compact_store
+  rewrite the file from a half-built table.*)
+fun replay records =
+  fold (fn PUT {id, hash, time_ms, proof} =>
+             store_update_proof (id, {hash = hash, time = Time.fromMilliseconds time_ms, proof = proof})
+         | TOMB id => store_invalidate_proof id)
+       records empty_store
+
+(*The one conversion from a live record back to a frame.*)
+fun put_frame id ({hash, time, proof} : proof_record) =
+  encode_put {id = id, hash = hash, time_ms = Time.toMilliseconds time, proof = proof}
 
 fun store_base thy =
       Path.append (Resources.master_directory thy) (Path.basic (Context.theory_name {long=false} thy))
@@ -272,18 +310,19 @@ fun probe_writable thy =
       (not (File.exists lock) orelse accessible lock [OS.FileSys.A_WRITE])
   end
 
-(* Read the proof table from a new-format file. Any non-new-format or corrupt
-   file is treated as empty -- there is NO backward compatibility; old caches
-   are discarded. Best-effort: a decode failure degrades to empty, and so does
-   an unreadable file -- a cache primed by another user under a tight umask
-   would otherwise raise EACCES from Bytes.read straight into the user's proof
-   (the read happens before any write, so the writability probe cannot help).
+(* Read the store from a new-format file. Any non-new-format or corrupt file
+   is treated as empty -- there is NO backward compatibility with the pre-frame
+   format; old caches are discarded. Best-effort: a scan failure degrades to
+   empty, and so does an unreadable file -- a cache primed by another user
+   under a tight umask would otherwise raise EACCES from Bytes.read straight
+   into the user's proof (the read happens before any write, so the
+   writability probe cannot help).
 
    TWO readers, deliberately, because there are two callers with OPPOSITE needs.
 
    `read_file_state_exn` lets an I/O failure escape, and is what compaction must
    use: `compact_store` feeds this result straight back to `write_state_new`, so
-   a reader that degrades to `Symtab.empty` there does not degrade -- it TRUNCATES
+   a reader that degrades to `empty_store` there does not degrade -- it TRUNCATES
    the user's cache to nothing and renames the empty payload over it.  Letting the
    exception out instead aborts the rewrite with the file byte-intact, and
    `compact_store`'s own handler demotes the verdict.  Triggers are not only
@@ -292,34 +331,35 @@ fun probe_writable thy =
 
    `read_file_state` degrades, and is what the pure read path uses.
 
-   In BOTH, a decode failure still discards: a corrupt or truncated file is
-   treated as empty, which is the pre-existing contract and is unchanged. *)
+   In BOTH, a scan failure still discards: a corrupt or truncated file is
+   treated as empty, which is the pre-existing contract and is unchanged.  The
+   catch-all wraps `scan` only.  `replay` is total, so a raise from it is a bug
+   and must abort compaction rather than be turned into an empty table. *)
 fun read_file_state_exn path =
-  if not (File.is_file path) then Symtab.empty
+  if not (File.is_file path) then empty_store
   else
     let val raw = Bytes.content (Bytes.read path)   (* I/O failure escapes, by design *)
      in if is_new_format raw
-        then \<^try>\<open>replay (scan raw) catch _ => Symtab.empty\<close>
-        else Symtab.empty
+        then replay (\<^try>\<open>scan raw catch _ => []\<close>)
+        else empty_store
     end
 
 fun read_file_state path =
-  \<^try>\<open>read_file_state_exn path catch _ => Symtab.empty\<close>
+  \<^try>\<open>read_file_state_exn path catch _ => empty_store\<close>
 
 (* process id, used to make the compaction temp file unique across processes *)
 val proc_pid = SysWord.toString (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))
 
-(* Atomically write the proof table as a fresh new-format file (tmp + rename).
+(* Atomically write the live records as a fresh new-format file (tmp + rename).
    The temp file name carries the pid so two processes compacting the same
    theory never write the same temp path (they are already serialised by the
    fcntl lock, but a unique name removes that dependence). File.write neither
    unlinks nor truncates back on failure, so a failed rename (or a mid-write
    ENOSPC) would orphan the temp file; unlink it and rethrow, leaving the
    verdict to the caller's guard. *)
-fun write_state_new path proofs =
+fun write_state_new path (proofs : proof_record Symtab.table) =
   let val payload =
-        String.concat (Symtab.fold (fn (k,(t,v)) => fn acc =>
-                          encode_put (k, Time.toMilliseconds t, v) :: acc) proofs [])
+        String.concat (Symtab.fold (fn (id, r) => fn acc => put_frame id r :: acc) proofs [])
       val tmp = Path.ext ("tmp." ^ proc_pid) path
    in \<^try>\<open>
         (File.write tmp payload;
@@ -497,7 +537,7 @@ fun migrate_legacy thy =
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
             (if File.is_file new_path then ()
-             else write_state_new new_path (read_file_state_exn old_path);
+             else write_state_new new_path (#proofs (read_file_state_exn old_path));
              confirmed))
           catch _ => confirmed\<close>)
   end
@@ -547,12 +587,12 @@ fun compact_store thy =
         if not (store_is_writable thy) then confirmed
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
-            (if File.is_file path then write_state_new path (read_file_state_exn path) else ();
+            (if File.is_file path then write_state_new path (#proofs (read_file_state_exn path)) else ();
              true))
           catch _ => confirmed\<close>)
   end
 
-(* Beside `proofs`, every open theory carries a second table: what THIS session
+(* Beside its store, every open theory carries one more table: what THIS session
    has already written under each key.  It is what separates a real key
    collision -- two different obligations reaching one proof id -- from an
    ordinary cross-build update of a key that was merely read off the file.
@@ -594,7 +634,7 @@ val openning_stores : (store * bool * written) Symtab.table Synchronized.var
 fun load_store_raw thy =
   let val path = store_path thy
       val path = if File.is_file path then path else legacy_cache_path thy
-   in {proofs = read_file_state path, async_tasks = []} : store end
+   in read_file_state path end
 
 fun force_reload thy =
  (migrate_legacy thy;                                        (*D44: outside the critical section*)
@@ -664,7 +704,10 @@ fun invalidate_store thy =
      false))
   end
 
-fun get_cached_proof thy = Symtab.lookup (#proofs (get_store thy))
+fun get_cached_proof thy id =
+  Option.map (fn r => (#time r, #proof r)) (Symtab.lookup (#proofs (get_store thy)) id)
+
+fun get_cached_proof_by_hash thy = Hasher.Tab.lookup (#by_hash (get_store thy))
 
 fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
   "Proof store: this session has written two DIFFERENT proofs under one key.\n\
@@ -690,10 +733,11 @@ fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
   its measurement through standard_time first.  Normalising here instead would
   double-divide the callers that (per the time-semantics rule) do it themselves
   before handing the record over.*)
-fun update_cached_proof thy (id,s) =
+fun update_cached_proof thy {id, hash} s =
  (migrate_legacy thy;                                        (*D44: a write can be the first touch*)
   let val name = Context.theory_name {long=true} thy
       val mark = proof_mark s
+      val r = {hash = hash, time = #1 s, proof = #2 s} : proof_record
       (*The message is built inside the critical section but emitted outside it:
         output synchronises on its own, and this section already serialises the
         concurrent writers (\<phi>SH.record_proof, hammer_or_AoA_store_write).*)
@@ -702,7 +746,7 @@ fun update_cached_proof thy (id,s) =
           let val ((c, _, w), tab') = get_entry_i thy tab
               val live_and_identical =
                     case Symtab.lookup (#proofs c) id
-                      of SOME (_, text) => text = #2 s
+                      of SOME r' => #proof r' = #proof r andalso #hash r' = hash
                        | NONE => false
            in if live_and_identical
               then ((false, NONE), tab')
@@ -713,14 +757,12 @@ fun update_cached_proof thy (id,s) =
                                     | NONE => NONE
                     in ((true, msg),
                         Symtab.update
-                          (name, (store_update_proof (id,s) c, true,
+                          (name, (store_update_proof (id, r) c, true,
                                   Symtab.update (id, mark) w)) tab')
                    end
           end)
       val _ = case msg of SOME m => warning m | NONE => ()
-   in if do_append
-      then append_record thy (encode_put (id, Time.toMilliseconds (#1 s), #2 s))
-      else ()
+   in if do_append then append_record thy (put_frame id r) else ()
   end)
 
 fun report_cache_is_outdated warn thy =
@@ -739,6 +781,14 @@ fun invalidate_proof_cache warn id thy =
                          (fn (c, _, w) => (store_invalidate_proof id c, true, w)) tab'
     end);
   append_record thy (encode_tombstone id))
+
+(*Narrows an entry that exists: only reachable after get_cached_proof_by_hash
+  answered SOME.  An entry already dropped by close_store needs nothing --
+  by_hash is memory only and the next load rebuilds it from the frames.*)
+fun invalidate_proof_cache_by_hash h thy =
+  Synchronized.change openning_stores
+    (Symtab.map_entry (Context.theory_name {long=true} thy)
+       (fn (c, f, w) => (store_forget_hash h c, f, w)))
 
 (** Document_ID of each construct to detect if caches are invalid **)
 (*
@@ -800,23 +850,10 @@ fun standard_time t = Time.scale (1.0 / Real.max (Timeout.scale (), 0.001)) t
 
 (*** Proof cache by hash ***)
 
-val hash_cache : proof_cache Hasher.Tab.table Synchronized.var
-      = Synchronized.var "\<phi>System.proof_cache.hash" Hasher.Tab.empty
-
-fun access_hash_cache hash =
-  let val hc = Synchronized.value hash_cache
-   in Hasher.Tab.lookup hc hash end
-
-fun update_hash_cache hash prf =
-  Synchronized.change hash_cache (Hasher.Tab.update (hash, prf))
-
-fun clean_hash_cache () =
-  Synchronized.change hash_cache (K Hasher.Tab.empty)
-
 (* prf' carries the RAW measured elapsed; standard_time normalises it once here,
-   for both the in-process table and the disk record, so the two agree and both
-   read paths (which pass it through tolerant_time into Timeout.apply) get the
-   factor applied exactly once. *)
+   so the record holds standard-machine time and the read path (which passes it
+   through tolerant_time into Timeout.apply) gets the factor applied exactly
+   once. *)
 fun update_cache_by_hash hash prf' (ctxt, sequent') =
   let val prf' = apfst standard_time prf' in (
        (* Silenced: sledgehammer_solver.ML already traces the same message at
@@ -825,8 +862,7 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') =
           "Find proof (" ^ hash ^ ", time: " ^ Time.toString (fst prf') ^ "): " ^
            (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
        ) ; *)
-       update_hash_cache hash prf';
-       update_cached_proof (Proof_Context.theory_of ctxt) (Hasher.hex hash, prf') ;
+       update_cached_proof (Proof_Context.theory_of ctxt) {id = Hasher.hex hash, hash = SOME hash} prf' ;
        (snd prf', sequent')) end
 
 type proof = string

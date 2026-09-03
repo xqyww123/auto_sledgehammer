@@ -47,12 +47,14 @@ datatype async_mode =
                     relies on observing the failure (Auto_Fail propagating):
                     forking and observable failure are incompatible.
    proof_id      -- store key; NONE derives it from the goal (see below).
-   read_store    -- governs BOTH reads (the on-disk store and the in-process
-                    hash table); NONE falls back to the enable_proof_store config.
-   write_store   -- governs BOTH writes, symmetrically.  Store self-maintenance
-                    (invalidate_proof_cache) is deliberately NOT governed by
-                    either: it can only trigger after a hit, and hits are already
-                    gated by read_store. *)
+   read_store    -- governs the lookup under BOTH keys, the proof id and the
+                    goal hash; NONE falls back to the enable_proof_store config.
+   write_store   -- governs the write, which carries both keys.  Store
+                    self-maintenance is deliberately NOT governed by either:
+                    invalidate_proof_cache retires an id whose record failed to
+                    replay, invalidate_proof_cache_by_hash forgets a hash entry
+                    that failed to replay, each only reachable after a hit under
+                    its own key, and hits are already gated by read_store. *)
 type options = {improved      : bool,
                 async_mode    : async_mode,
                 fact_override : Sledgehammer.fact_override,
@@ -1899,6 +1901,54 @@ fun after futs g =
   auto -- hence the parentheses.*)
 fun scoped prf = "(" ^ prf ^ ")[1]"
 
+(*The lookup shared by auto and all_auto; k = how many leading subgoals the
+  cached text must close (1, or all of them).  SOME on a hit that replays,
+  exactly as eval_prf_str hands it back; NONE means: search -- and the message
+  announcing that is printed here, where it is known why.
+
+  Two keys, tried in order, each failing on its own.  An id hit that does not
+  replay is tombstoned at once (invalidate_proof_cache, which prints "outdated")
+  and the lookup falls through to the goal hash.  A hash hit that does replay
+  is recorded under THIS call's id (promotion); one that does not is forgotten
+  in memory only (invalidate_proof_cache_by_hash: no frame).  The record that
+  just failed under the id is not replayed again under the hash: same text
+  and same time mean the same budget and the same outcome.*)
+fun replay_store k record {do_read, thy, id, hash, kws} (ctxt, sequent) =
+  let
+    val nprem = Thm.nprems_of sequent
+    (*NONE on Auto_Fail, eval_prf_str's whole failure vocabulary*)
+    fun replay (time, prf) =
+      \<^try>\<open>
+        let val r as (_, (_, sequent')) =
+              eval_prf_str kws k (Phi_Proof_Store.tolerant_time time) prf (ctxt, sequent)
+         in if Thm.nprems_of sequent' <= nprem - k then SOME r
+            else raise Auto_Fail Subgoal_unsolved
+        end
+      catch Auto_Fail _ => NONE\<close>
+    fun miss stale =
+      (if stale then warning "A cached proof fails. Re-searching proofs..."
+       else tracing ("Proof store miss, " ^ id);
+       NONE)
+    (*step 2: the goal hash; `failed` is the record step 1 gave up on*)
+    fun by_hash (stale, failed) =
+      case Phi_Proof_Store.get_cached_proof_by_hash thy hash of
+        NONE => miss stale
+      | SOME s =>
+          (tracing ("[store] hash HIT, replaying: " ^ quote (#2 s));
+           case (if failed = SOME s then NONE else replay s) of
+             SOME (r as (tp, _)) => (record tp; SOME r)
+           | NONE => (Phi_Proof_Store.invalidate_proof_cache_by_hash hash thy; miss true))
+    (*step 1: the proof id*)
+    fun by_id () =
+      case Phi_Proof_Store.get_cached_proof thy id of
+        NONE => (tracing ("[store] MISS for id " ^ quote id); by_hash (false, NONE))
+      | SOME s =>
+          (tracing ("[store] HIT for id " ^ quote id ^ ", replaying: " ^ quote (#2 s));
+           case replay s of
+             SOME r => SOME r
+           | NONE => (Phi_Proof_Store.invalidate_proof_cache true id thy; by_hash (true, SOME s)))
+  in if do_read then by_id () else miss false end
+
 in
 
 fun auto (opts : options) ctxt0 sequent =
@@ -1912,7 +1962,6 @@ fun auto (opts : options) ctxt0 sequent =
     val thy = Proof_Context.theory_of ctxt
     val kws = Keyword.no_major_keywords (Thy_Header.get_keywords thy)
     val hasty = Config.get ctxt hasty_mode
-    val nprem = Thm.nprems_of sequent
     (* single-goal entry => key on the LEADING subgoal alone.  Hashing the whole
        proposition would move the key when the conclusion is replaced by a
        promise, so one obligation would key differently sync vs async. *)
@@ -1926,10 +1975,8 @@ fun auto (opts : options) ctxt0 sequent =
     fun record (time, prf) =
       (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
        if do_write andalso not hasty
-       then let val t = Phi_Proof_Store.standard_time time in
-              Phi_Proof_Store.update_hash_cache hash (t, prf);
-              Phi_Proof_Store.update_cached_proof thy (id, (t, prf))
-            end
+       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash}
+              (Phi_Proof_Store.standard_time time, prf)
        else ())
 
     fun search () =
@@ -1948,50 +1995,10 @@ fun auto (opts : options) ctxt0 sequent =
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
        in (out, sequent') end
   in
-    let
-      (*The on-disk proof store, keyed by proof id.  A hit that still
-        replays is handed back as it stands; nothing is written.*)
-      val (stale, hit) =
-        if not do_read then (false, NONE)
-        else case Phi_Proof_Store.get_cached_proof thy id of
-          NONE => (tracing ("[auto] store MISS for id " ^ quote id); (false, NONE))
-        | SOME (time, prf) =>
-           (tracing ("[auto] store HIT for id " ^ quote id ^ ", replaying: " ^ quote prf);
-            (case eval_prf_str kws 1 (Phi_Proof_Store.tolerant_time time) prf (ctxt, sequent) of
-               (_, (_, sequent')) =>
-                 if Thm.nprems_of sequent' < nprem
-                 then (tracing "[auto] store replay OK"; (false, SOME (prf, sequent')))
-                 else raise Auto_Fail Subgoal_unsolved)
-            handle Auto_Fail _ =>
-              (tracing "[auto] store replay FAILED, re-searching"; (true, NONE)))
-
-      (*The in-process hash table, keyed by the goal hash and never written
-        to disk on its own.  A hit here IS recorded, which promotes it into the
-        store under THIS call's proof id.  Finding an entry marks the situation
-        stale either way: a stored id entry that we are about to supersede.*)
-      val (stale, replayed) =
-        if is_some hit orelse not do_read then (stale, NONE)
-        else case Phi_Proof_Store.access_hash_cache hash of
-          NONE => (stale, NONE)
-        | SOME (t, prf) =>
-            (true,
-             SOME (eval_prf_str kws 1 (Phi_Proof_Store.tolerant_time t) prf (ctxt, sequent))
-             handle Auto_Fail _ => NONE)
-    in
-      case hit of
-        SOME (prf, sequent') => (Future.value prf, sequent')
-      | NONE =>
-      case replayed of
-        SOME ((time, prf), (_, sequent')) => (record (time, prf); (Future.value prf, sequent'))
-      | NONE =>
-         (if stale
-          then (warning "A cached proof fails. Re-searching proofs...";
-                (*store self-maintenance: deliberately outside read_store /
-                  write_store, and unreachable unless read_store let us hit*)
-                Phi_Proof_Store.invalidate_proof_cache true id thy)
-          else tracing ("Proof store miss, " ^ id);
-          search ())
-    end
+    case replay_store 1 record {do_read = do_read, thy = thy, id = id, hash = hash, kws = kws}
+                      (ctxt, sequent) of
+      SOME ((_, prf), (_, sequent')) => (Future.value prf, sequent')
+    | NONE => search ()
   end
 
 fun all_auto (opts : options) ctxt0 sequent =
@@ -2014,10 +2021,8 @@ fun all_auto (opts : options) ctxt0 sequent =
     fun record (time, prf) =
       (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
        if do_write andalso not hasty
-       then let val t = Phi_Proof_Store.standard_time time in
-              Phi_Proof_Store.update_hash_cache hash (t, prf);
-              Phi_Proof_Store.update_cached_proof thy (id, (t, prf))
-            end
+       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash}
+              (Phi_Proof_Store.standard_time time, prf)
        else ())
 
     fun search () =
@@ -2040,43 +2045,11 @@ fun all_auto (opts : options) ctxt0 sequent =
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
        in (out, sequent') end
   in
-    let
-      val (stale, hit) =
-        if not do_read then (false, NONE)
-        else case Phi_Proof_Store.get_cached_proof thy id of
-          NONE => (tracing ("[all_auto] store MISS for id " ^ quote id); (false, NONE))
-        | SOME (time, prf) =>
-           (tracing ("[all_auto] store HIT for id " ^ quote id ^ ", replaying: " ^ quote prf);
-            (*protect n, n = the number of goals this text speaks for*)
-            (case eval_prf_str kws nprem (Phi_Proof_Store.tolerant_time time) prf (ctxt, sequent) of
-               (_, (_, sequent')) =>
-                 if Thm.no_prems sequent'
-                 then (tracing "[all_auto] store replay OK"; (false, SOME ((time, prf), sequent')))
-                 else raise Auto_Fail Subgoal_unsolved)
-            handle Auto_Fail _ =>
-              (tracing "[all_auto] store replay FAILED, re-searching"; (true, NONE)))
-
-      val (stale, replayed) =
-        if is_some hit orelse not do_read then (stale, NONE)
-        else case Phi_Proof_Store.access_hash_cache hash of
-          NONE => (stale, NONE)
-        | SOME (t, prf) =>
-            (true,
-             SOME (eval_prf_str kws nprem (Phi_Proof_Store.tolerant_time t) prf (ctxt, sequent))
-             handle Auto_Fail _ => NONE)
-    in
-      case hit of
-        SOME (tp, sequent') => (Future.value tp, sequent')
-      | NONE =>
-      case replayed of
-        SOME (tp, (_, sequent')) => (record tp; (Future.value tp, sequent'))
-      | NONE =>
-         (if stale
-          then (warning "A cached proof fails. Re-searching proofs...";
-                Phi_Proof_Store.invalidate_proof_cache true id thy)
-          else tracing ("Proof store miss, " ^ id);
-          search ())
-    end
+    (*k = nprem: the text speaks for every subgoal*)
+    case replay_store nprem record {do_read = do_read, thy = thy, id = id, hash = hash, kws = kws}
+                      (ctxt, sequent) of
+      SOME (tp, (_, sequent')) => (Future.value tp, sequent')
+    | NONE => search ()
   end
 
 end
