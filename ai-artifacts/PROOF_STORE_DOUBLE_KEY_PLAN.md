@@ -432,7 +432,7 @@ ML 断言，外加 17b / 22b 需要的一个 `method_setup`。`*.proof-store` �
 11. 同一 id、同一段证明文本、**不同的时间** t₁ 与 t₂，先以 hash h 写（t₁）、再以 hash h' 写（t₂）：
     按 h' 得到 t₂，按 h 仍得到 t₁（规则 1 只增不删），文件多出一帧（裁决 O）。
 12. 裁决 O 的短路：同一 id、同文本、同 hash 再写一次，文件**不**多帧。
-13. `force_reload` 后第 10、11 条结论不变（`by_hash` 派生自记录序列）。
+13. `force_reload` 后第 10、11、12b 条结论不变（`by_hash` 派生自记录序列）。
 14. **tag 1 帧端到端**：手工拼一个文件，帧序为 `PUT x`（**tag 1**，用测试 2 的拼法加
     `Proof_Store_Format.frame`）、`PUT a(h)`、`TOMB a`；`force_reload`：x 按 id 命中，h 仍命中
     （只增不删）；`compact_and_store` 后 `scan`：x 的记录仍在、解码后 `hash = NONE`，a 的两帧都不在；
@@ -442,7 +442,8 @@ ML 断言，外加 17b / 22b 需要的一个 `method_setup`。`*.proof-store` �
 
 对 `auto`（裁决 I、N、Q、R 的行为）。所有调用 `options` 写全：`improved = true`（只有这个分支的
 竞赛里有 `simp` 竞赛者，能在没装 ATP 的机器上解掉 `simp` 可解的 goal；`improved = false` 只跑
-`bare_hammer`，测试就依赖外部证明器）、`async_mode = Sync`、`read_store = SOME true`：
+`bare_hammer`，测试就依赖外部证明器）、`async_mode = Sync`；除 16c 外 `read_store = SOME true`
+（16c 两个开关都关，见下）：
 
 16. **hash 命中失败不打墓碑**：预置一条 id 未命中、hash 命中但重放必失败的记录（文本 `(fail)[1]`），
     对一个 `simp` 能解的 goal 调 `auto`，`write_store = SOME true`：goal 被解决；`scan` 文件后**没有**

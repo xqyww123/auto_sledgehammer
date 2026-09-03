@@ -129,7 +129,8 @@ val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD'} (t3, "pD")
 val _ = assert (length (frames ()) = n11 + 3) "test12b time-only rewrite is a frame"
 val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t3, "pD")) "test12b by_hash follows"
 
-(*13: 10 and 11 hold after a reload*)
+(*13: the conclusions of 10, 11 and 12b survive a reload: by_hash is derived
+      from the record sequence, not from the current table*)
 val _ = S.force_reload thy
 val _ = assert (S.get_cached_proof_by_hash thy hC = SOME (t1, "pB1")) "test13 a"
 val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t3, "pD")
@@ -262,6 +263,7 @@ val per_replay = !replays
 val _ = assert (per_replay > 0) "test17b count_fail is reached"
 val _ = S.update_cached_proof thy {id = "K17b", hash = SOME h17b} (t1, "(count_fail)[1]")
 val _ = replays := 0
+(*the search records another text under the preset id: the collision guard warns, as it should*)
 val (_, st17b) = run_auto {read = true, write = true} (SOME "K17b") ctxt g17b
 val _ = assert (Thm.no_prems st17b) "test17b solved"
 val _ = assert (!replays = per_replay) ("test17b replayed once, not twice: " ^ string_of_int (!replays))
@@ -277,6 +279,7 @@ val g18b = goal_of ctxt "rev (rev (xs::nat list)) = xs"
 val p18 = "(rule rev_rev_ident)[1]"
 val h18b = Hasher.goal_at 1 (ctxt, g18b)
 val _ = S.update_cached_proof thy {id = "K18a", hash = SOME h18b} (t1, p18)
+(*the search records another text under the preset id: the collision guard warns, as it should*)
 val (_, st18a) = run_auto {read = true, write = true} (SOME "K18a") ctxt g18a
 val _ = assert (Thm.no_prems st18a andalso tombs_of "K18a" = 1) "test18 first call"
 val (txt18, st18b) = run_auto {read = true, write = true} (SOME "K18b") ctxt g18b
