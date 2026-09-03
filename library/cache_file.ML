@@ -800,18 +800,18 @@ fun standard_time t = Time.scale (1.0 / Real.max (Timeout.scale (), 0.001)) t
 
 (*** Proof cache by hash ***)
 
-val hash_cache : proof_cache Symtab.table Synchronized.var
-      = Synchronized.var "\<phi>System.proof_cache.hash" Symtab.empty
+val hash_cache : proof_cache Hasher.Tab.table Synchronized.var
+      = Synchronized.var "\<phi>System.proof_cache.hash" Hasher.Tab.empty
 
 fun access_hash_cache hash =
   let val hc = Synchronized.value hash_cache
-   in Symtab.lookup hc hash end
+   in Hasher.Tab.lookup hc hash end
 
 fun update_hash_cache hash prf =
-  Synchronized.change hash_cache (Symtab.update (hash, prf))
+  Synchronized.change hash_cache (Hasher.Tab.update (hash, prf))
 
 fun clean_hash_cache () =
-  Synchronized.change hash_cache (K Symtab.empty)
+  Synchronized.change hash_cache (K Hasher.Tab.empty)
 
 (* prf' carries the RAW measured elapsed; standard_time normalises it once here,
    for both the in-process table and the disk record, so the two agree and both
@@ -826,7 +826,7 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') =
            (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
        ) ; *)
        update_hash_cache hash prf';
-       update_cached_proof (Proof_Context.theory_of ctxt) (hash, prf') ;
+       update_cached_proof (Proof_Context.theory_of ctxt) (Hasher.hex hash, prf') ;
        (snd prf', sequent')) end
 
 type proof = string
@@ -841,7 +841,7 @@ fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) 
               ; (prf', ret)
             end
    in if Config.get ctxt enable_proof_store
-    then case get_cached_proof (Proof_Context.theory_of ctxt) hash
+    then case get_cached_proof (Proof_Context.theory_of ctxt) (Hasher.hex hash)
           of NONE => fallback' NONE
            | SOME (time,prf) =>
               let val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)

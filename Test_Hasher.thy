@@ -47,7 +47,15 @@ subsection \<open>Correctness Tests\<close>
 ML \<open>
 fun assert_eq msg a b =
   if a = b then ()
-  else error ("Assertion failed: " ^ msg ^ "\nExpected: " ^ b ^ "\nGot: " ^ a)
+  else error ("Assertion failed: " ^ msg ^ "\nExpected: " ^ Hasher.hex b ^ "\nGot: " ^ Hasher.hex a)
+
+(* hex is the only string form of a digest: 16 lower-case hex characters *)
+fun assert_hex msg d =
+  let val h = Hasher.hex d
+   in if size h = 16 andalso forall (fn c => Char.isDigit c orelse (c >= #"a" andalso c <= #"f")) (String.explode h)
+      then ()
+      else error ("Assertion failed: " ^ msg ^ "\nNot a 16-char lower-case hex string: " ^ h)
+  end
 
 fun test_determinism () =
   let
@@ -59,6 +67,8 @@ fun test_determinism () =
     val h1 = Hasher.typ ty
     val h2 = Hasher.typ ty
     val _ = assert_eq "Type hash determinism" h1 h2
+    val _ = assert_hex "String digest hex rendering" s1
+    val _ = assert_hex "Type digest hex rendering" h1
   in
     writeln "✓ Determinism tests passed"
   end

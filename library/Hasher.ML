@@ -49,7 +49,11 @@
 
 signature HASHER = sig
 
-type digest = string
+(*A digest is the raw 64-bit FNV-1a accumulator.  It is a different type from
+  a proof id (a string), so the two keys of a proof store record can never be
+  confused for one another by the compiler.*)
+type digest = Word64.word
+
 val string : string -> digest
 val class : class -> digest
 val sort  : sort -> digest
@@ -59,18 +63,29 @@ val goal : context_state -> digest
 val goal_at : int -> context_state -> digest
 val all_goals : context_state -> digest
 
+(*The 16-character lower-case hexadecimal rendering.  This is the ONLY way a
+  digest becomes a string, used exactly where something outside this process
+  requires one: a proof id of the hash-fallback family, the L1 SQLite key,
+  log messages.*)
+val hex : digest -> string
+
+(*Tables keyed by digest, for the hash-keyed index of a proof store.*)
+structure Tab : TABLE where type key = digest
+
 end
 
 structure Hasher : HASHER = struct
 
-type digest = string
+type digest = Word64.word
+
+structure Tab = Table(type key = Word64.word val ord = Word64.compare)
 
 (* FNV-1a 64-bit hash algorithm constants *)
 val fnv_offset_basis : Word64.word = 0wxcbf29ce484222325
 val fnv_prime : Word64.word = 0wx100000001b3
 
-(* Convert Word64 to hex string for digest representation - optimized with loop *)
-fun word64_to_hex w =
+(* Convert Word64 to hex string - optimized with loop *)
+fun hex w =
   let
     val hex_digits = "0123456789abcdef"
     fun digit i = String.sub (hex_digits, i)
@@ -187,24 +202,23 @@ fun hash_term (t: term) (h: Word64.word) : Word64.word =
       end
 
 (* Public API functions *)
-fun string s = word64_to_hex (hash_string s fnv_offset_basis)
+fun string s = hash_string s fnv_offset_basis
 
 fun class c = string c
 
-fun sort s = word64_to_hex (fold hash_string s fnv_offset_basis)
+fun sort s = fold hash_string s fnv_offset_basis
 
-fun typ ty = word64_to_hex (hash_typ ty fnv_offset_basis)
+fun typ ty = hash_typ ty fnv_offset_basis
 
-fun term t = word64_to_hex (hash_term t fnv_offset_basis)
+fun term t = hash_term t fnv_offset_basis
 
 fun hash_in_context' ctxt terms =
   let
     val thy_name = Context.theory_name {long=false} (Proof_Context.theory_of ctxt)
     val h0 = hash_string thy_name fnv_offset_basis
     val h1 = fold (hash_term o Thm.term_of) (Assumption.all_assms_of ctxt) h0
-    val h2 = fold hash_term terms h1
   in
-    word64_to_hex h2
+    fold hash_term terms h1
   end
 
 fun hash_in_context ctxt term = hash_in_context' ctxt [term]

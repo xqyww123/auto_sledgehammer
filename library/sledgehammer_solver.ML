@@ -1917,7 +1917,7 @@ fun auto (opts : options) ctxt0 sequent =
        proposition would move the key when the conclusion is replaced by a
        promise, so one obligation would key differently sync vs async. *)
     val hash = Hasher.goal_at 1 (ctxt, sequent)
-    val id = case #proof_id opts of SOME s => s | NONE => hash
+    val id = case #proof_id opts of SOME s => s | NONE => Hasher.hex hash
     val do_read = store_flag ctxt (#read_store opts)
     val do_write = store_flag ctxt (#write_store opts)
 
@@ -2007,7 +2007,7 @@ fun all_auto (opts : options) ctxt0 sequent =
        record: the old code reused the caller's single id for all n subgoals, so
        each write overwrote the previous one. *)
     val hash = Hasher.all_goals (ctxt, sequent)
-    val id = case #proof_id opts of SOME s => s | NONE => hash
+    val id = case #proof_id opts of SOME s => s | NONE => Hasher.hex hash
     val do_read = store_flag ctxt (#read_store opts)
     val do_write = store_flag ctxt (#write_store opts)
 
@@ -2119,7 +2119,7 @@ fun sledgehammer_method key run improved = Scan.lift (
        done anyway, only without raising on the way in. *)
     if Thm.no_prems sequent then SOME (Seq.Result (ctxt, sequent), Seq.empty)
     else
-    let val id = key (ctxt, sequent)
+    let val id = Hasher.hex (key (ctxt, sequent))
         fun err () = error_message ctxt sequent
         val sequent' =
               case Seq.pull (Method.insert_tac ctxt uses 1 sequent)
