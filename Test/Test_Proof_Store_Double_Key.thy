@@ -256,7 +256,7 @@ val kws = Keyword.no_major_keywords (Thy_Header.get_keywords (Proof_Context.theo
 val g17b = goal_of ctxt "(u::nat) * 1 = u"
 val h17b = Hasher.goal_at 1 (ctxt, g17b)
 val _ = replays := 0
-val _ = \<^try>\<open>ignore (Solver.eval_prf_str kws 1 t1 "(count_fail)[1]" (ctxt, g17b))
+val _ = \<^try>\<open>ignore (Solver.eval_prf_str kws 1 (S.tolerant_time t1) "(count_fail)[1]" (ctxt, g17b))
                  catch Solver.Auto_Fail _ => ()\<close>
 val per_replay = !replays
 val _ = assert (per_replay > 0) "test17b count_fail is reached"
