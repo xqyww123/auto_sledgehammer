@@ -66,7 +66,7 @@ type options = {improved      : bool,
 (* Single-goal entry: attacks the LEADING subgoal, keyed on it alone.
    Multi-goal entry: attacks EVERY subgoal, keyed on all of them at once, and
    records ONE entry whose text is the subgoal proofs composed --
-   "(p1)[1], (p2)[1], ...".
+   "((p1)[1], (p2)[1], ...)".
 
    The by-product comes back as a future in both, so the synchronous and the
    asynchronous case have exactly the same shape and downstream code is written
@@ -1903,20 +1903,29 @@ fun scoped prf = "(" ^ prf ^ ")[1]"
 
 (*The lookup shared by auto and all_auto; k = how many leading subgoals the
   cached text must close (1, or all of them).  SOME on a hit that replays,
-  exactly as eval_prf_str hands it back; NONE means: search -- and the message
+  exactly as eval_prf_str hands it back -- so its time is THIS replay's
+  measurement, not the stored budget; NONE means: search -- and the message
   announcing that is printed here, where it is known why.
 
   Two keys, tried in order, each failing on its own.  An id hit that does not
   replay is tombstoned at once (invalidate_proof_cache, which prints "outdated")
   and the lookup falls through to the goal hash.  A hash hit that does replay
-  is recorded under THIS call's id (promotion); one that does not is forgotten
-  in memory only (invalidate_proof_cache_by_hash: no frame).  The record that
+  is recorded under THIS call's id as it stands (promotion is a copy: the
+  stored budget travels with the text); one that does not is forgotten in
+  memory only (invalidate_proof_cache_by_hash: no frame).  The record that
   just failed under the id is not replayed again under the hash: same text
-  and same time mean the same budget and the same outcome.*)
-fun replay_store k record {do_read, thy, id, hash, kws} (ctxt, sequent) =
+  and same time mean the same budget and the same outcome.
+
+  eval_prf_str names the text of every replay that actually happens, so the
+  traces here name only the keys.*)
+fun replay_store k record {do_read, id, hash} (ctxt, sequent) =
   let
+    val thy = Proof_Context.theory_of ctxt
+    val kws = Keyword.no_major_keywords (Thy_Header.get_keywords thy)
     val nprem = Thm.nprems_of sequent
-    (*NONE on Auto_Fail, eval_prf_str's whole failure vocabulary*)
+    (*NONE on Auto_Fail, eval_prf_str's whole failure vocabulary.  The
+      comparison spells out what k means; it cannot fail, since eval_prf_str
+      returns only once every exposed subgoal is closed.*)
     fun replay (time, prf) =
       \<^try>\<open>
         let val r as (_, (_, sequent')) =
@@ -1929,24 +1938,27 @@ fun replay_store k record {do_read, thy, id, hash, kws} (ctxt, sequent) =
       (if stale then warning "A cached proof fails. Re-searching proofs..."
        else tracing ("Proof store miss, " ^ id);
        NONE)
-    (*step 2: the goal hash; `failed` is the record step 1 gave up on*)
-    fun by_hash (stale, failed) =
-      case Phi_Proof_Store.get_cached_proof_by_hash thy hash of
-        NONE => miss stale
-      | SOME s =>
-          (tracing ("[store] hash HIT, replaying: " ^ quote (#2 s));
-           case (if failed = SOME s then NONE else replay s) of
-             SOME (r as (tp, _)) => (record tp; SOME r)
-           | NONE => (Phi_Proof_Store.invalidate_proof_cache_by_hash hash thy; miss true))
+    (*step 2: the goal hash; `failed` is the record step 1 gave up on, and
+      its presence is what makes the situation stale*)
+    fun by_hash failed =
+      let val stale = is_some failed in
+        case Phi_Proof_Store.get_cached_proof_by_hash thy hash of
+          NONE => miss stale
+        | SOME s =>
+            (tracing ("[store] hash HIT for " ^ Hasher.hex hash);
+             case (if failed = SOME s then NONE else replay s) of
+               SOME r => (record s; SOME r)
+             | NONE => (Phi_Proof_Store.invalidate_proof_cache_by_hash hash thy; miss true))
+      end
     (*step 1: the proof id*)
     fun by_id () =
       case Phi_Proof_Store.get_cached_proof thy id of
-        NONE => (tracing ("[store] MISS for id " ^ quote id); by_hash (false, NONE))
+        NONE => (tracing ("[store] MISS for id " ^ quote id); by_hash NONE)
       | SOME s =>
-          (tracing ("[store] HIT for id " ^ quote id ^ ", replaying: " ^ quote (#2 s));
+          (tracing ("[store] HIT for id " ^ quote id);
            case replay s of
              SOME r => SOME r
-           | NONE => (Phi_Proof_Store.invalidate_proof_cache true id thy; by_hash (true, SOME s)))
+           | NONE => (Phi_Proof_Store.invalidate_proof_cache true id thy; by_hash (SOME s)))
   in if do_read then by_id () else miss false end
 
 in
@@ -1960,7 +1972,6 @@ fun auto (opts : options) ctxt0 sequent =
   let
     val ctxt = with_timeout (#timeout opts) ctxt0
     val thy = Proof_Context.theory_of ctxt
-    val kws = Keyword.no_major_keywords (Thy_Header.get_keywords thy)
     val hasty = Config.get ctxt hasty_mode
     (* single-goal entry => key on the LEADING subgoal alone.  Hashing the whole
        proposition would move the key when the conclusion is replaced by a
@@ -1970,13 +1981,14 @@ fun auto (opts : options) ctxt0 sequent =
     val do_read = store_flag ctxt (#read_store opts)
     val do_write = store_flag ctxt (#write_store opts)
 
-    (*The log line is deliberately NOT gated on write_store: it reports what the
+    (*The time is standard-machine time already: a search site normalises its
+      measurement before calling, a promotion copies a stored record.
+      The log line is deliberately NOT gated on write_store: it reports what the
       search found, which is worth knowing whether or not we keep it.*)
     fun record (time, prf) =
       (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
        if do_write andalso not hasty
-       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash}
-              (Phi_Proof_Store.standard_time time, prf)
+       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
        else ())
 
     fun search () =
@@ -1988,15 +2000,14 @@ fun auto (opts : options) ctxt0 sequent =
               (ctxt, sequent)
           val out = after futs (fn [(time, prf)] =>
                                    let val text = scoped prf
-                                    in record (time, text); text end
+                                    in record (Phi_Proof_Store.standard_time time, text); text end
                                  | _ => raise Fail "auto: async_prove Leading \
                                                    \yielded the wrong shape")
           val _ = if Future.is_finished out then ()
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
        in (out, sequent') end
   in
-    case replay_store 1 record {do_read = do_read, thy = thy, id = id, hash = hash, kws = kws}
-                      (ctxt, sequent) of
+    case replay_store 1 record {do_read = do_read, id = id, hash = hash} (ctxt, sequent) of
       SOME ((_, prf), (_, sequent')) => (Future.value prf, sequent')
     | NONE => search ()
   end
@@ -2007,7 +2018,6 @@ fun all_auto (opts : options) ctxt0 sequent =
   let
     val ctxt = with_timeout (#timeout opts) ctxt0
     val thy = Proof_Context.theory_of ctxt
-    val kws = Keyword.no_major_keywords (Thy_Header.get_keywords thy)
     val hasty = Config.get ctxt hasty_mode
     val nprem = Thm.nprems_of sequent
     (* multi-goal entry => key on EVERY subgoal at once.  One call, one key, one
@@ -2021,8 +2031,7 @@ fun all_auto (opts : options) ctxt0 sequent =
     fun record (time, prf) =
       (tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ prf);
        if do_write andalso not hasty
-       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash}
-              (Phi_Proof_Store.standard_time time, prf)
+       then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
        else ())
 
     fun search () =
@@ -2040,14 +2049,13 @@ fun all_auto (opts : options) ctxt0 sequent =
                        let val time = fold (curry (op +) o fst) tps Time.zeroTime
                            val text = "(" ^ String.concatWith ", "
                                               (map (scoped o snd) tps) ^ ")"
-                        in record (time, text); (time, text) end)
+                        in record (Phi_Proof_Store.standard_time time, text); (time, text) end)
           val _ = if Future.is_finished out then ()
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
        in (out, sequent') end
   in
     (*k = nprem: the text speaks for every subgoal*)
-    case replay_store nprem record {do_read = do_read, thy = thy, id = id, hash = hash, kws = kws}
-                      (ctxt, sequent) of
+    case replay_store nprem record {do_read = do_read, id = id, hash = hash} (ctxt, sequent) of
       SOME (tp, (_, sequent')) => (Future.value tp, sequent')
     | NONE => search ()
   end

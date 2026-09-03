@@ -17,8 +17,18 @@ rev 4 → rev 5 的变化：
    测试 8/14 去掉 `scan` 表达不出的"tag 3"断言、测试 10/11/13 的记录可区分、测试 17 首个 goal 须 `simp` 可解（§4）。
 评审中被作者驳回或延后的意见见 §6。
 
+rev 5 → rev 6（实施完成后的代码评审，2026-09-03；实施提交 auto_sledgehammer `a9c1b0b`、Isa-Mini `59099f0`）：
+① 裁决 O 的短路判据从"文本相同、hash 相同"放宽为**整条记录相同**（时间也相同）：被跳过的写入因此是真正的
+   空操作，`by_hash` 不会落后于写入序列（§2、§3.3）；
+② `replay_store` 的参数记录缩为 `{do_read, id, hash}`，`thy` 与 `kws` 由它收到的 `ctxt` 推出（§3.4）；
+③ 晋升写入的时间语义统一为"晋升是复制"：`record` 只接收已归一的标准机器时间，搜索现场调用它之前自己做
+   `standard_time`，按 hash 命中时以取回的记录原样写入，与 `store_hit_replay` 的 `write_l2` 一致（§3.4）；
+④ 测试 19 不再要求 G₁ 是 `simp` 不可解的，判别点是逐字文本；新增测试 12b、16b、16c、17b、19c、20b、22b（§4）；
+⑤ `try_cached_proof_by_hash_with_key` 是否也读第二把键，延后为独立议题（§6）。
+
 前置工作已完成并提交：`Hasher.digest` 从十六进制字符串改为 `Word64.word`
-（auto_sledgehammer 提交 `3be3ce8`，Isa-Mini 跟进提交 `e6c8318`，主仓库 `5ac2ca43`）。
+（auto_sledgehammer 提交 `3be3ce8`，Isa-Mini 跟进提交 `e6c8318`；主仓库 `5ac2ca43` 只推进了 Isa-Mini 的指针，
+auto_sledgehammer 的指针随实施提交在主仓库 `6cfefde3` 一起推进）。
 
 行号以 `library/cache_file.ML`、`library/sledgehammer_solver.ML`、`Isa-Mini/Agent/agent_server.ML`、
 `Isa-Mini/Agent/proof_store_AoA.ML` 在上述提交之后的状态为准。
@@ -81,7 +91,7 @@ rev 4 → rev 5 的变化：
 | L | L1 是否跟进 | **另立议题**。本方案不改 L1 的键、内容与三个 RPC |
 | M | 压缩是否保序 | 不需要 |
 | N | 墓碑的时机（rev 5 改） | 在**检测到 id 重放失败的那一刻**打，早于 hash 分支与搜索。`stale` 布尔**保留**为 `replay_store` 的局部变量，只剩一个用途：返回 `NONE`（即接下来搜索）之前据它选择打印 `A cached proof fails. Re-searching proofs...` 还是 `Proof store miss`；它不再决定墓碑 |
-| O | `live_and_identical` 的判据 | "同一 id 下已有活记录，且**证明文本相同、hash 相同**"才短路；只有 hash 变了的重写照常经规则 1 落盘 |
+| O | `live_and_identical` 的判据 | "同一 id 下已有活记录，且**整条记录相同**（证明文本、hash、时间）"才短路（rev 6 放宽，原为文本与 hash 相同）；任何一项变了的重写照常经规则 1 落盘 |
 | P | phi / AoA 义务路径的读取（rev 5 改） | `store_hit_replay` 的查找顺序定为 **L2 按 id → L2 按 hash → L1 按 id**；按 hash 命中且重放成功则晋升到当前 key 下，**晋升只写 L2、不写 L1**；已失败记录在第 2、3 步之前都不再重放；`hammer_or_AoA` 里 hash 的计算保留 `if read orelse write then SOME (…) else NONE` 这一行 |
 | Q | 按 hash 作废的接口 | `invalidate_proof_cache_by_hash : Hasher.digest -> theory -> unit`，只删 `by_hash[h]`，不碰 `proofs`，不写帧，不打印。`invalidate_proof_cache` 的签名**不变**，不加 hash 参数（§6） |
 | R | `auto` 与 `all_auto` 的三步查找（rev 5 新增） | 写成**一个**共用局部函数，唯一的区分参数是要解决的子目标数 `k`（`auto` 为 1，`all_auto` 为 `nprem`）；`record` 与 `search` 仍留在各自入口（§3.4） |
@@ -254,10 +264,10 @@ fun invalidate_proof_cache_by_hash h thy =
 
 `update_cached_proof` 的实现（`:693-723`）：
 
-- `live_and_identical`（`:703-706`）按裁决 O 改为
-  `case Symtab.lookup (#proofs c) id of SOME r => #proof r = #2 s andalso #hash r = hash | NONE => false`。
-  撞键守卫不受影响：`proof_mark`（`:576`）只摘要文本，同文本换 hash 得到同样的摘要，不会误报；
-  无害重复写入（同文本同 hash）仍被短路。
+- `live_and_identical`（`:703-706`）按裁决 O 改为 `Symtab.lookup (#proofs c) id = SOME r`，r 是本次要写的
+  整条记录（rev 6：连时间一起比）。撞键守卫不受影响：`proof_mark`（`:576`）只摘要文本，同文本换 hash 或换
+  时间得到同样的摘要，不会误报；逐字节相同的重复写入仍被短路，而被短路的写入是真正的空操作，
+  `by_hash` 里的项与写入序列一致，签名里"该 hash 最后一次写入的 (time, text)"这句话因此成立。
 - `written` 表与撞键守卫其余部分不变；追加的帧由 `encode_put` 按新记录编码。
 
 ### 3.4 调用点清单
@@ -277,12 +287,19 @@ tracing 标签、交给 `eval_prf_str` 的 protect 数（1 / `nprem`）、成功
   subgoals the cached text must close (1, or all of them).  SOME on a hit
   that replays; NONE means: search -- and the message announcing that is
   printed here, where it is known why.*)
-fun replay_store k record {do_read, thy, id, hash, kws} (ctxt, sequent)
+fun replay_store k record {do_read, id, hash} (ctxt, sequent)
   : ((Time.time * string) * (Proof.context * thm)) option
 ```
 
+参数记录只有三个字段（rev 6）：`thy` 与 `kws` 都由它收到的 `ctxt` 推出，ctxt / thy / kws 不一致因此
+不可表达；`kws` 在两个入口除了传给它之外再无用处。返回值原样是 `eval_prf_str` 的结果，所以其中的
+时间是本次重放的实测，不是记录里存的预算。
+
 `auto` 拿到结果后只取文本，与它今天在 `:1982` 做的一样；`all_auto` 取整对。`record` 与 `search`
 仍留在各自入口，它们的差异是实质的（`Leading` / `Each_Goal`，单段文本 / 拼接文本），本方案不并。
+**`record` 的契约（rev 6）：只接收已归一的标准机器时间。** 两个搜索现场在调用它之前自己做
+`standard_time`；按 hash 命中的晋升以取回的记录 `s` 原样调用 `record s`，即"晋升是复制"，记录里的
+预算随文本一起搬到当前 id 下，与 `store_hit_replay` 的 `write_l2` 同一条规则。
 `stale` 是这个函数的**局部变量**：返回 `NONE` 就意味着调用方接下来必然搜索，所以第 3 步入口的那两句
 消息由这个函数在返回 `NONE` 之前自己打印，不需要把 `stale` 传出去。
 
@@ -295,8 +312,8 @@ fun replay_store k record {do_read, thy, id, hash, kws} (ctxt, sequent)
    未命中 → 继续第 2 步。
 2. 按 hash 查（`get_cached_proof_by_hash thy hash`）。未命中 → `NONE`。命中：若它等于已失败记录
    （**时间与文本都相同**：重放预算 `tolerant_time` 由记录的时间决定，同文本不同时间是两次不同的
-   重放），不重放，直接视为失败；否则重放。重放成功 → `record`（晋升到当前 id 下，带同一个 hash）
-   → `SOME`。失败 → `invalidate_proof_cache_by_hash hash thy`（只作废第二把键，不追加任何帧），
+   重放），不重放，直接视为失败；否则重放。重放成功 → `record s`（把取回的记录原样晋升到当前 id 下，
+   带同一个 hash）→ `SOME`。失败 → `invalidate_proof_cache_by_hash hash thy`（只作废第二把键，不追加任何帧），
    `stale := true` → `NONE`。
 
 返回 `NONE` 之前按 `stale` 选消息打印，**这两行今天的文字原样不动**，只是从调用方的搜索入口搬进
@@ -439,7 +456,8 @@ L2 按 hash → 按 hash 作废、不追加帧；L1 → `l1_invalidate` 并报�
     `Auto_Sledgehammer.pre_simproc_on_concl, ` 开头（`:1783`、`:1900`），手写的 P₁ 不可能由搜索产生，
     而"K₂ 下多一条带 h₁ 的 PUT"在搜索路径上同样会出现（`hash` 每次调用只算一次，`:1919`）。
 19. **跳过规则的判别态**：预置 K₁ → (`(fail)[1]`, `NONE`) 和另一个 id → (P₁, `SOME h`)，h 为 goal G₁
-    （`simp` 不能解、P₁ 能证）的 `Hasher.goal_at 1`；以 `proof_id = SOME K₁`、`write_store = SOME true`
+    （P₁ 能证；G₁ 能否被搜索解掉无关紧要，判别点是逐字文本，rev 6 去掉了"`simp` 不能解"的要求：
+    `improved = true` 的竞赛不只有 `simp`，那个要求买不到它承诺的 `Auto_Fail`）的 `Hasher.goal_at 1`；以 `proof_id = SOME K₁`、`write_store = SOME true`
     对 G₁ 调 `auto`：返回的文本是 P₁（第 1 步失败、第 2 步取回的是**另一条**记录、跳过规则不触发）；
     `scan` 有 `TOMB K₁` 与一条 K₁ 下带 h 的新 PUT（晋升）；`force_reload` 后 K₁ 按 id 命中 P₁。
 19b. **`all_auto` 一侧的 `replay_store`（裁决 R 的第二个调用点）**：构造一个有**两个**子目标、都不需要
@@ -451,6 +469,20 @@ L2 按 hash → 按 hash 作废、不追加帧；L1 → `l1_invalidate` 并报�
     `scan` 无新帧。这条测试针对的是 `k` 传错的后果：`k = 1` 时 `Goal.protect 1` 只暴露一个前提，
     `eval_prf_str` 的 `no_prems` 检查只看得见暴露的那个，两子目标的状态经 `Goal.conclude` 回来剩 1 个
     前提，满足 `1 <= 2 - 1`，`all_auto` 会把一个还开着子目标的状态当作命中交出去。
+
+rev 6 补充的测试（实施评审指出的空白）：
+
+- **12b**：同 id、同文本、同 hash、**不同时间**再写一次，文件多一帧，按 hash 取到新时间（裁决 O 放宽后的判据）。
+- **16b / 19c**：**按 id 命中成功**（`auto` / `all_auto` 各一条）：预置 `{hash = NONE}` 的记录，调用时带真实 hash，
+  返回文本逐字等于预置、goal 关闭、文件无新帧。预置不带 hash 而调用带 hash，是为了让误发生的晋升写入
+  带上不同的 hash、无法被短路吞掉。
+- **16c**：`read_store = false`、`write_store = false`：预置在两把键下都可达，返回的文本不是预置文本
+  （搜索了）、文件无新帧。这是 §3.4 "一处 `do_read` 判断"的反向。
+- **17b / 22b**：**跳过规则的正向**：测试 theory 里用 `method_setup` 声明一个计数后失败的方法 `count_fail`，
+  预置 `{id = K, hash = SOME h}`、文本 `(count_fail)[1]`，以 K 调用：第 1 步重放一次（计数 1）、失败、墓碑；
+  第 2 步取回同一条记录、跳过；断言计数为 1（没有跳过规则时为 2）。`count_fail` 只对 `method_setup` 之后
+  取的 context 可见，这两条测试因此各自取新的 `\<^context>`。
+- **20b**：`store_hit_replay` 的按 id 命中成功，同 16b。
 
 对 `store_hit_replay` 与 `hammer_or_AoA`（裁决 P、I、Q），放在 Isa-Mini 侧
 `Isa-Mini/Test/Test_Proof_Store_Hash_Hit.thy`，`imports Minilang_AoA.Minilang_AoA`
@@ -509,6 +541,12 @@ Python 时静默返回未命中（`proof_store_AoA.ML` 的 `\<^try>`），测试
 4. 测试 theory（§4 第 1–19b 条），经 Isabelle-MCP 跑通。
 5. Isa-Mini：`store_hit_replay` 三级顺序、签名与契约注释、`run_AoA` / `hammer_or_AoA` 调用点、
    测试 20–24（§3.4、§4）。两处写回 fork 无测试，原因见 §4 末。
+   **实测记录（2026-09-03，Isabelle-MCP 的 `HOL` session）**：`Semantic_Embedding.thy:29` 起 RPC host 失败
+   （prover 的 `/usr/bin/python3` 没有 `Isabelle_RPC_Host`），`agent_server.ML` 报的错全部是未声明的结构：
+   `Theory_Structure`（`:784`）、`Goal_Preprocess`（`:897`）、`Semantic_Store`（`:917`、`:1740`、`:1810`）、
+   `Infra_Filter`（`:1356`）；被改的 `:1884-1888`、`:1927`、`:2061-2068`、`:2149` 无错（Isa-Mini 提交
+   `e0db3b0` 后的行号）。测试 20–23 含 20b、22b 通过；24 需要 `MiniLang_Agent_AoA`，待 prover 拿到
+   `ISABELLE_RPC_PYTHON`（作者的 `.mcp.json`）后再跑。
 6. 提交：auto_sledgehammer 一个提交，Isa-Mini 一个提交，主仓库 bump 一个提交。
 
 ---
@@ -535,6 +573,10 @@ Python 时静默返回未命中（`proof_store_AoA.ML` 的 `\<^try>`），测试
 | rev 4 F1 的选项 (i)（删掉 `A cached proof fails. Re-searching proofs...`）与 (iii)（改措辞） | **作者驳回**，取选项 (ii) | 那句话不动，`stale` 保留为选消息用；见裁决 N |
 | rev 4 DROP-1：并发线程在 `get_cached_proof_by_hash` 与 `invalidate_proof_cache_by_hash` 之间写入新项的窗口 | 驳回 | 损失只是一条内存项，且每次命中都重放验证 |
 | rev 4 DROP-2：三处源码注释过时（`:221` 的 `open` 注释、`:555` 的"a second table"计数等） | 实施时顺手改 | 不是设计问题 |
+| 实施评审：`try_cached_proof_by_hash_with_key` 也读第二把键 | **延后**为独立议题 | 触及 §3.3 明列不变的函数；它的重放约定（`replay_mepo_proof`）与 auto / AoA 的 `(…)[1]` 文本不同，须先确认外来文本只会重放失败而不会误动作 |
+| 实施评审：`openning_stores` 条目里无人读取的 bool | 延后 | 先于本次工作；改动触及五处无关写入点 |
+| 实施评审：`store_hit_replay` 的第 1 级内联而第 2、3 级具名 | 驳回 | ML 先定义后使用的顺序使然；加一个 `try_id ()` 只是为对称而设的间接层 |
+| 实施评审：`replay_store` 的成功判据永远为真，建议删除 | 驳回 | 它是把 k 的含义写成后置条件的唯一位置，注释已说明它是断言 |
 
 ---
 

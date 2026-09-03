@@ -22,7 +22,7 @@
 
    Reading scans for the magic, validates the crc and that len fits, and yields
    the records in file order; folding them into tables is the store's business
-   (Phi_Proof_Store.replay).
+   (its `replay`).
    A torn/half-written trailing frame, or a magic byte-sequence that happens
    to occur inside a payload, fails the crc check and the scanner resynchronises
    at the next magic occurrence -- so a crash never corrupts earlier records and
@@ -251,6 +251,9 @@ fun store_update_proof (id, r : proof_record) ({proofs, by_hash, async_tasks}:st
                     | NONE => by_hash),
          async_tasks = async_tasks} : store
 
+(*Dropping async_tasks here predates the second key and its reason is not
+  recorded; the effect is that Theory.at_end then sees no registered task and
+  compacts at once instead of deferring.  Kept as it was: a separate question.*)
 fun store_invalidate_proof id ({proofs, by_hash, ...}:store)
       = {proofs = Symtab.delete_safe id proofs, by_hash = by_hash, async_tasks = []} : store
 
@@ -518,7 +521,7 @@ fun try_write thy body =
    our own stale snapshot over that would drop them.
 
    read_file_state_exn, not the degrading reader: a reader that answers
-   Symtab.empty on an I/O failure would hand write_state_new an empty table and
+   empty_store on an I/O failure would hand write_state_new an empty table and
    silently write the legacy content away.
 
    CALL IT from the five public entry points only, at the very top of their
@@ -707,7 +710,7 @@ fun invalidate_store thy =
 fun get_cached_proof thy id =
   Option.map (fn r => (#time r, #proof r)) (Symtab.lookup (#proofs (get_store thy)) id)
 
-fun get_cached_proof_by_hash thy = Hasher.Tab.lookup (#by_hash (get_store thy))
+fun get_cached_proof_by_hash thy h = Hasher.Tab.lookup (#by_hash (get_store thy)) h
 
 fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
   "Proof store: this session has written two DIFFERENT proofs under one key.\n\
@@ -744,10 +747,9 @@ fun update_cached_proof thy {id, hash} s =
       val (do_append, msg) =
         Synchronized.change_result openning_stores (fn tab =>
           let val ((c, _, w), tab') = get_entry_i thy tab
-              val live_and_identical =
-                    case Symtab.lookup (#proofs c) id
-                      of SOME r' => #proof r' = #proof r andalso #hash r' = hash
-                       | NONE => false
+              (*the whole record, time included: a skipped write is then a
+                true no-op, and by_hash cannot lag behind the write sequence*)
+              val live_and_identical = Symtab.lookup (#proofs c) id = SOME r
            in if live_and_identical
               then ((false, NONE), tab')
               else let val msg = case Symtab.lookup w id
