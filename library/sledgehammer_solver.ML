@@ -1963,6 +1963,17 @@ fun replay_store k record {do_read, id, hash} (ctxt, sequent) =
            | NONE => (Phi_Proof_Store.invalidate_proof_cache true id thy; by_hash (SOME s)))
   in if do_read then by_id () else miss false end
 
+(*The write shared by auto and all_auto, the counterpart of replay_store: a
+  proof found by the search, or one promoted from a goal-hash hit, goes into
+  the store under this call's two keys.  `time` is already standard-machine
+  time; the contract and the reason are at update_cached_proof.  A search site
+  normalises its measurement; a promotion copies a stored record.*)
+fun record_store {do_write, id, hash} ctxt (time, prf) =
+  if do_write andalso not (Config.get ctxt hasty_mode)
+  then Phi_Proof_Store.update_cached_proof (Proof_Context.theory_of ctxt)
+         {id = id, hash = SOME hash} (time, prf)
+  else ()
+
 in
 
 fun auto (opts : options) ctxt0 sequent =
@@ -1974,7 +1985,6 @@ fun auto (opts : options) ctxt0 sequent =
   let
     val ctxt = with_timeout (#timeout opts) ctxt0
     val thy = Proof_Context.theory_of ctxt
-    val hasty = Config.get ctxt hasty_mode
     (* single-goal entry => key on the LEADING subgoal alone.  Hashing the whole
        proposition would move the key when the conclusion is replaced by a
        promise, so one obligation would key differently sync vs async. *)
@@ -1983,13 +1993,7 @@ fun auto (opts : options) ctxt0 sequent =
     val do_read = store_flag ctxt (#read_store opts)
     val do_write = store_flag ctxt (#write_store opts)
 
-    (*`time` is already standard-machine time; the contract and the reason are
-      at update_cached_proof.  A search site normalises its measurement; a
-      promotion copies a stored record.*)
-    fun record (time, prf) =
-      if do_write andalso not hasty
-      then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
-      else ()
+    val record = record_store {do_write = do_write, id = id, hash = hash} ctxt
 
     fun search () =
       let val (_, futs, sequent') =
@@ -2021,7 +2025,6 @@ fun all_auto (opts : options) ctxt0 sequent =
   let
     val ctxt = with_timeout (#timeout opts) ctxt0
     val thy = Proof_Context.theory_of ctxt
-    val hasty = Config.get ctxt hasty_mode
     val nprem = Thm.nprems_of sequent
     (* multi-goal entry => key on EVERY subgoal at once.  One call, one key, one
        record: the old code reused the caller's single id for all n subgoals, so
@@ -2031,13 +2034,7 @@ fun all_auto (opts : options) ctxt0 sequent =
     val do_read = store_flag ctxt (#read_store opts)
     val do_write = store_flag ctxt (#write_store opts)
 
-    (*`time` is already standard-machine time; the contract and the reason are
-      at update_cached_proof.  A search site normalises its measurement; a
-      promotion copies a stored record.*)
-    fun record (time, prf) =
-      if do_write andalso not hasty
-      then Phi_Proof_Store.update_cached_proof thy {id = id, hash = SOME hash} (time, prf)
-      else ()
+    val record = record_store {do_write = do_write, id = id, hash = hash} ctxt
 
     fun search () =
       let val (_, futs, sequent') =

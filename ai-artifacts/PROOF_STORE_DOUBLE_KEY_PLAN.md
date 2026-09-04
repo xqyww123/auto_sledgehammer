@@ -1,6 +1,6 @@
 # Proof store 双键改造：proof id 之外再带一把可选的 goal hash
 
-记于 2026-09-03，**rev 5**。本文收录作者在本轮讨论中做出的全部裁决，是实施的唯一依据。
+记于 2026-09-03，**rev 7**。本文收录作者在本轮讨论中做出的全部裁决，是实施的唯一依据。
 凡本文未写的行为，一律保持现状。
 
 评审史：rev 1 至 rev 4 各经一轮两回合对抗评审（4 质问 + 合并 + 逐条辩护 + 裁判，全部 Opus 5）。
@@ -26,6 +26,9 @@ rev 5 → rev 6（实施完成后的代码评审，2026-09-03；实施提交 aut
    `standard_time`，按 hash 命中时以取回的记录原样写入，与 `store_hit_replay` 的 `write_l2` 一致（§3.4）；
 ④ 测试 19 不再要求 G₁ 是 `simp` 不可解的，判别点是逐字文本；新增测试 12b、16b、16c、17b、19c、20b、22b（§4）；
 ⑤ `try_cached_proof_by_hash_with_key` 是否也读第二把键，延后为独立议题（§6）。
+
+rev 6 → rev 7（2026-09-04，第三轮评审验收后）：`auto` 与 `all_auto` 的两份逐字相同的 `record` 合并为
+`record_store`（§3.4）；`search` 仍不并。
 
 前置工作已完成并提交：`Hasher.digest` 从十六进制字符串改为 `Word64.word`
 （auto_sledgehammer 提交 `3be3ce8`，Isa-Mini 跟进提交 `e6c8318`；主仓库 `5ac2ca43` 只推进了 Isa-Mini 的指针，
@@ -299,8 +302,11 @@ fun replay_store k record {do_read, id, hash} (ctxt, sequent)
 不可表达；`kws` 在两个入口除了传给它之外再无用处。返回值原样是 `eval_prf_str` 的结果，所以其中的
 时间是本次重放的实测，不是记录里存的预算。
 
-`auto` 拿到结果后只取文本，与它今天在 `:1982` 做的一样；`all_auto` 取整对。`record` 与 `search`
-仍留在各自入口，它们的差异是实质的（`Leading` / `Each_Goal`，单段文本 / 拼接文本），本方案不并。
+`auto` 拿到结果后只取文本，与它今天在 `:1982` 做的一样；`all_auto` 取整对。`search` 仍留在各自入口，
+它们的差异是实质的（`Leading` / `Each_Goal`，单段文本 / 拼接文本），本方案不并。**`record` 则共用**
+（rev 7，作者在第三轮评审后批准）：与 `replay_store` 同列一个 `record_store {do_write, id, hash} ctxt`，
+`thy` 与 `hasty` 由 ctxt 推出，两个入口各自 `val record = record_store {…} ctxt`，再交给 `replay_store`
+与自己的 `search`；两个共用函数于是形状对称，`{do_read, id, hash}` 对 `{do_write, id, hash}`。
 **`record` 的契约（rev 6）：只接收已归一的标准机器时间。** 两个搜索现场在调用它之前自己做
 `standard_time`；按 hash 命中的晋升以取回的记录 `s` 原样调用 `record s`，即"晋升是复制"，记录里的
 预算随文本一起搬到当前 id 下，与 `store_hit_replay` 的 `write_l2` 同一条规则。
