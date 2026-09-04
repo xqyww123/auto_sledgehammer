@@ -565,6 +565,9 @@ Python 时静默返回未命中（`proof_store_AoA.ML` 的 `\<^try>`），测试
    `Infra_Filter`（`:1356`）；被改的 `:1884-1888`、`:1927`、`:2061-2068`、`:2149` 无错（Isa-Mini 提交
    `e0db3b0` 后的行号）。测试 20–23 含 20b、22b 通过；24 需要 `MiniLang_Agent_AoA`，待 prover 拿到
    `ISABELLE_RPC_PYTHON`（作者的 `.mcp.json`）后再跑。
+   **补记（2026-09-04）**：作者在 `.mcp.json` 里给 prover 设了 `ISABELLE_RPC_PYTHON`，重启后同样的 `HOL`
+   session 下整个 theory clean：`Minilang_AoA.thy` 无错误加载，第 24 条通过（`hammer_or_AoA` 原样返回
+   预置的 `(simp)[1]`，只重放一次）。§4 的 24 条测试至此全部跑通。
 6. 提交：auto_sledgehammer 一个提交，Isa-Mini 一个提交，主仓库 bump 一个提交。
 
 ---
