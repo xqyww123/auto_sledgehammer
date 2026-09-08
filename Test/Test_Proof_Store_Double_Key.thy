@@ -26,45 +26,55 @@ fun puts_of id =
 fun tombs_of id = length (filter (fn F.TOMB i => i = id | _ => false) (frames ()))
 fun assert b msg = if b then () else error ("FAIL: " ^ msg)
 
-val t1 = Time.fromMilliseconds 100
-val t2 = Time.fromMilliseconds 200
-val t3 = Time.fromMilliseconds 300
+val t1 = S.times_of_ms (100, 100)
+val t2 = S.times_of_ms (200, 200)
+val t3 = S.times_of_ms (300, 300)
 fun digest s = Hasher.string s
 
-(*the pre-hash frame layout, as an old binary wrote it*)
+(*the two legacy frame layouts, as old binaries wrote them: tag 1 (pre-hash)
+  and tag 3 (single time), both decoded forever*)
+local structure P = MessagePackBytesIO.Pack in
 fun tag1_payload (id, time_ms, proof) =
   let val outs = BytesIO.mkOutstream ()
-   in MessagePackBytesIO.Pack.packPair
-        (MessagePackBytesIO.Pack.packInt,
-         MessagePackBytesIO.Pack.packTuple3
-           (MessagePackBytesIO.Pack.packString, MessagePackBytesIO.Pack.packInt,
-            MessagePackBytesIO.Pack.packString))
+   in P.packPair (P.packInt, P.packTuple3 (P.packString, P.packInt, P.packString))
         (1, (id, time_ms, proof)) outs;
       BytesIO.toString outs
   end
+fun tag3_payload (id, hash, time_ms, proof) =
+  let val outs = BytesIO.mkOutstream ()
+   in P.packPair (P.packInt, P.packTuple4 (P.packString, P.packOption P.packWord64, P.packInt, P.packString))
+        (3, (id, hash, time_ms, proof)) outs;
+      BytesIO.toString outs
+  end
+end
 \<close>
 
 section \<open>Format layer: tests 1-3\<close>
 
 ML \<open>
-(*1: tag 3 round trip at both ends of the digest range, and without a hash*)
+(*1: tag 4 round trip at both ends of the digest range, and without a hash*)
 val _ = List.app (fn r =>
           (assert (F.decode_record (F.encode_record r) = r) "test1 round trip";
-           assert (String.sub (F.encode_record r, 1) = Char.chr 3) "test1 tag byte"))
-        [F.PUT {id = "a", hash = SOME 0w0, time_ms = 5, proof = "p"},
-         F.PUT {id = "a", hash = SOME (Word64.notb 0w0), time_ms = 5, proof = "p"},
-         F.PUT {id = "a", hash = NONE, time_ms = 5, proof = "p"}]
+           assert (String.sub (F.encode_record r, 1) = Char.chr 4) "test1 tag byte"))
+        [F.PUT {id = "a", hash = SOME 0w0, cpu_ms = 5, wall_ms = 6, proof = "p"},
+         F.PUT {id = "a", hash = SOME (Word64.notb 0w0), cpu_ms = 5, wall_ms = 6, proof = "p"},
+         F.PUT {id = "a", hash = NONE, cpu_ms = 5, wall_ms = 6, proof = "p"}]
 
-(*2: a tag 1 payload decodes to a record without a hash*)
+(*2: a tag 1 payload decodes to a record without a hash, its single ms in both fields*)
 val _ = assert (F.decode_record (tag1_payload ("x", 7, "q"))
-                = F.PUT {id = "x", hash = NONE, time_ms = 7, proof = "q"}) "test2 tag 1"
+                = F.PUT {id = "x", hash = NONE, cpu_ms = 7, wall_ms = 7, proof = "q"}) "test2 tag 1"
+
+(*2b: a tag 3 payload decodes with its single ms in both fields, hash kept*)
+val h2b = digest "goal 2b"
+val _ = assert (F.decode_record (tag3_payload ("x", SOME h2b, 8, "q"))
+                = F.PUT {id = "x", hash = SOME h2b, cpu_ms = 8, wall_ms = 8, proof = "q"}) "test2b tag 3"
 
 (*3: a mixed buffer scans in file order*)
-val r3 = F.PUT {id = "y", hash = SOME (digest "y"), time_ms = 9, proof = "r"}
+val r3 = F.PUT {id = "y", hash = SOME (digest "y"), cpu_ms = 9, wall_ms = 10, proof = "r"}
 val _ = assert (F.scan (F.frame (tag1_payload ("x", 7, "q"))
                         ^ F.frame (F.encode_record r3)
                         ^ F.encode_tombstone "x")
-                = [F.PUT {id = "x", hash = NONE, time_ms = 7, proof = "q"}, r3, F.TOMB "x"]) "test3 scan"
+                = [F.PUT {id = "x", hash = NONE, cpu_ms = 7, wall_ms = 7, proof = "q"}, r3, F.TOMB "x"]) "test3 scan"
 \<close>
 
 section \<open>Store layer: tests 4-15\<close>
@@ -143,7 +153,7 @@ val _ = S.invalidate_store thy
 val hE = digest "goal E"
 val _ = File.write path
           (F.frame (tag1_payload ("x", 100, "px"))
-           ^ F.encode_put {id = "a", hash = SOME hE, time_ms = 100, proof = "pa"}
+           ^ F.encode_put {id = "a", hash = SOME hE, cpu_ms = 100, wall_ms = 100, proof = "pa"}
            ^ F.encode_tombstone "a")
 val _ = S.force_reload thy
 val _ = assert (S.get_cached_proof thy "x" = SOME (t1, "px")) "test14 x by id"

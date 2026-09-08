@@ -10,15 +10,20 @@
    crc32 is the standard IEEE 802.3 CRC-32 over (be32 len ++ payload).
    payload is a MessagePack-encoded record, tagged by its first element:
 
-     PUT {id, hash, time_ms, proof}  <->  (3, (id, hash | nil, time_ms, proof))
-     TOMB id                         <->  (2, id)
-     (1, (id, time_ms, proof))         --  the pre-hash PUT.  Decoded forever,
-                                           never written: proofstore-merge.sh
-                                           splices frames from old branches in.
+     PUT {id, hash, cpu_ms, wall_ms, proof}
+                       <->  (4, (id, hash | nil, (cpu_ms, wall_ms), proof))
+     TOMB id           <->  (2, id)
+     (3, (id, hash | nil, ms, proof))  --  the single-time PUT, and
+     (1, (id, ms, proof))              --  the pre-hash PUT.  Both decoded
+                                           forever, never written:
+                                           proofstore-merge.sh splices frames
+                                           from old branches in.
 
    hash is the goal digest (Hasher.digest, a 64-bit word) or nil for a record
-   that was stored without one.  Decoding is what migrates: a tag-1 frame and a
-   tag-3 frame with a nil hash decode to the same record.
+   that was stored without one.  cpu_ms is the calling thread's CPU time of
+   the proof's replay and wall_ms its wall-clock time, both standard-machine
+   ms; a legacy frame's single ms fills both.  Decoding is what migrates: a
+   tag-1 frame and a tag-3 frame with a nil hash decode to the same record.
 
    Reading scans for the magic, validates the crc and that len fits, and yields
    the records in file order; folding them into tables is the store's business
@@ -72,28 +77,34 @@ fun crc32 (s : string) : Word32.word =
 end
 
 datatype record =
-    PUT of {id: string, hash: Hasher.digest option, time_ms: int, proof: string}
+    PUT of {id: string, hash: Hasher.digest option, cpu_ms: int, wall_ms: int, proof: string}
   | TOMB of string
 
 local
   structure P = MessagePackBytesIO.Pack
   structure U = MessagePackBytesIO.Unpack
   val put_packer =
-    P.packPair (P.packInt, P.packTuple4 (P.packString, P.packOption P.packWord64, P.packInt, P.packString))
+    P.packPair (P.packInt, P.packTuple4 (P.packString, P.packOption P.packWord64,
+                                         P.packPair (P.packInt, P.packInt), P.packString))
   val tomb_packer = P.packPair (P.packInt, P.packString)
-  fun put (id, hash, time_ms, proof) = PUT {id = id, hash = hash, time_ms = time_ms, proof = proof}
+  fun put (id, hash, (cpu_ms, wall_ms), proof) =
+    PUT {id = id, hash = hash, cpu_ms = cpu_ms, wall_ms = wall_ms, proof = proof}
   val rec_unpacker =
     U.unpackPair_dep' U.unpackInt (fn tag =>
-      if tag = 3 then U.>> (U.unpackTuple4 (U.unpackString, U.unpackOption U.unpackWord64,
-                                            U.unpackInt, U.unpackString), put)
+      if tag = 4 then U.>> (U.unpackTuple4 (U.unpackString, U.unpackOption U.unpackWord64,
+                                            U.unpackPair (U.unpackInt, U.unpackInt), U.unpackString), put)
+      else if tag = 3 then U.>> (U.unpackTuple4 (U.unpackString, U.unpackOption U.unpackWord64,
+                                                 U.unpackInt, U.unpackString),
+                                 fn (id, hash, ms, proof) => put (id, hash, (ms, ms), proof))
       else if tag = 2 then U.>> (U.unpackString, TOMB)
       else if tag = 1 then U.>> (U.unpackTuple3 (U.unpackString, U.unpackInt, U.unpackString),
-                                 fn (id, time_ms, proof) => put (id, NONE, time_ms, proof))
+                                 fn (id, ms, proof) => put (id, NONE, (ms, ms), proof))
       else raise U.Unpack)
 in
 fun encode_record r =
   let val outs = BytesIO.mkOutstream ()
-   in (case r of PUT {id, hash, time_ms, proof} => put_packer (3, (id, hash, time_ms, proof)) outs
+   in (case r of PUT {id, hash, cpu_ms, wall_ms, proof} =>
+                   put_packer (4, (id, hash, (cpu_ms, wall_ms), proof)) outs
                | TOMB id => tomb_packer (2, id) outs);
       BytesIO.toString outs
   end
@@ -146,18 +157,34 @@ end
 signature PHI_PROOF_STORE = sig
 
 type proof_id = string
-type proof_cache = Time.time * string
+
+(*The two times of a record: the calling thread's CPU time of the proof's
+  replay and its wall-clock time.  Each replay limit derives from its own kind
+  (replay_limits below), so a proof that waits on an external solver (its CPU
+  stands still while the wall runs) is budgeted by what it actually costs.
+  The field names are those of Thread_CPU.timing and of replay_limits.
+  Every wire carries the pair as (cpu_ms, wall_ms) nested in ONE slot, and
+  only times_of_ms / ms_of_times spell that order out.*)
+type times = {thread_cpu: Time.time, wall: Time.time}
+val zero_times : times
+val add_times : times -> times -> times
+val map_times : (Time.time -> Time.time) -> times -> times
+val times_of_ms : int * int -> times
+val ms_of_times : times -> int * int
+val string_of_times : times -> string
+
+type proof_cache = times * string
 
 (*A record has two keys: its proof id, under which it is stored, and
   optionally the digest of the goal it proved.  `proofs` is the file's live
-  set, keyed by id.  `by_hash` is the second index: goal digest -> (time, text)
+  set, keyed by id.  `by_hash` is the second index: goal digest -> (times, text)
   of the most recent write carrying that digest that was not short-circuited
   by update_cached_proof.  Which record that is when several ids share a
   digest is deliberately unspecified; every by-hash hit is replay-verified
   before use.  It lives in memory only, is rebuilt from the file's frames on
   load (tombstoned records included), and is insert-only except for
   invalidate_proof_cache_by_hash.  See ai-artifacts/PROOF_STORE_DOUBLE_KEY_PLAN.md.*)
-type proof_record = {hash: Hasher.digest option, time: Time.time, proof: string}
+type proof_record = {hash: Hasher.digest option, time: times, proof: string}
 type store = {proofs: proof_record Symtab.table,
               by_hash: proof_cache Hasher.Tab.table,
               async_tasks: Task_Queue.task list}
@@ -189,37 +216,39 @@ val invalidate_proof_cache_by_hash : Hasher.digest -> theory -> unit
 
 type proof = string
 
-(*Limits for replaying a recorded proof, from the time recorded when it was
-  found.  The thread CPU limit is 1.5 x the recorded time plus a slack for a
-  machine busier now than then; wall_cap is the wall-clock limit, the only one
-  that can fire on a replay whose CPU stands still (an external solver, a loaded
-  machine).  Overrunning either invalidates the entry and re-searches the proof
-  from scratch.  Both are NOMINAL times: Thread_CPU.apply multiplies this
-  machine's timeout_scale in itself -- so never multiply the factor in here.
-  replay_limits_with takes the slack; replay_limits is the store's own (1 s).*)
+(*Limits for replaying a recorded proof, each from the recorded time of its
+  own kind.  The thread CPU limit is 1.5 x the recorded CPU time plus a slack
+  for a machine busier now than then; the wall limit is 2 x the recorded wall
+  time plus 3 s, the only one that can fire on a replay whose CPU stands still
+  (an external solver, a loaded machine).  Overrunning either invalidates the
+  entry and re-searches the proof from scratch.  Both are NOMINAL times:
+  Thread_CPU.apply multiplies this machine's timeout_scale in itself -- so
+  never multiply the factor in here.  replay_limits_with takes the slack;
+  replay_limits is the store's own (1 s).*)
 type replay_limits = {thread_cpu: Time.time, wall: Time.time option}
-val wall_cap : Time.time -> Time.time
-val replay_limits_with : Time.time (*slack*) -> Time.time -> replay_limits
-val replay_limits : Time.time -> replay_limits
+val replay_limits_with : Time.time (*slack*) -> times -> replay_limits
+val replay_limits : times -> replay_limits
 
-(*The write-side counterpart: divide a measured time by this machine's
+(*The write-side counterpart: divide a measurement by this machine's
   timeout_scale, so what lands in the store is standard-machine time and a slow
   machine does not hand every other machine an inflated replay budget.  Every
-  write point must pass its measurement through this before storing it.*)
-val standard_time : Time.time -> Time.time
+  write point must pass its measurement through this before storing it.
+  machine_time is its inverse, for the one reader that must hand a stored
+  record back out as a measurement on this machine's clock.*)
+val standard_time : times -> times
+val machine_time : times -> times
 
-(*What a record point measures: the calling thread's CPU time, or the wall-clock
-  elapsed without a CPU clock.  Only this thread is counted, so f must do its
-  work here: a record point that forks records far less than the replay will
-  cost.  Old records are wall time: they only loosen the CPU limit (wall >= CPU);
-  a CPU record tightens the wall cap, the accepted trade.*)
-val timing : ('a -> 'b) -> 'a -> Time.time * 'b
+(*What a record point measures: the calling thread's CPU time and the
+  wall-clock elapsed; without a CPU clock the wall elapsed stands in for both.
+  Only this thread's CPU is counted, so f must do its work here: a record
+  point that forks records far less CPU than the replay will cost.*)
+val timing : ('a -> 'b) -> 'a -> times * 'b
 
 val try_cached_proof_by_hash :
          (replay_limits -> proof -> context_state -> context_state option) (*evaluator*)
-      -> (string option (*original cached proof*) -> (Time.time * proof) * context_state)
+      -> (string option (*original cached proof*) -> (times * proof) * context_state)
       -> context_state
-      -> (Time.time * proof) * context_state
+      -> (times * proof) * context_state
 
 (*Variant keyed by Hasher.goal_at i — caches a per-subgoal proof.
   Use i = 0 to mean "the whole sequent";
@@ -227,9 +256,9 @@ val try_cached_proof_by_hash :
 val try_cached_proof_by_hash_at :
          int (*subgoal index, 0 = whole sequent*)
       -> (replay_limits -> proof -> context_state -> context_state option) (*evaluator*)
-      -> (string option (*original cached proof*) -> (Time.time * proof) * context_state)
+      -> (string option (*original cached proof*) -> (times * proof) * context_state)
       -> context_state
-      -> (Time.time * proof) * context_state
+      -> (times * proof) * context_state
 
 val enable_proof_store : bool Config.T
 
@@ -241,8 +270,20 @@ structure Phi_Proof_Store : PHI_PROOF_STORE = struct
 val enable_proof_store = Attrib.setup_config_bool \<^binding>\<open>enable_proof_store\<close> (K true)
 
 type proof_id = string
-type proof_cache = Time.time * string
-type proof_record = {hash: Hasher.digest option, time: Time.time, proof: string}
+
+type times = {thread_cpu: Time.time, wall: Time.time}
+val zero_times = {thread_cpu = Time.zeroTime, wall = Time.zeroTime} : times
+fun map_times f ({thread_cpu, wall} : times) = {thread_cpu = f thread_cpu, wall = f wall} : times
+fun add_times (a : times) (b : times) =
+  {thread_cpu = #thread_cpu a + #thread_cpu b, wall = #wall a + #wall b} : times
+fun times_of_ms (cpu_ms, wall_ms) =
+  {thread_cpu = Time.fromMilliseconds cpu_ms, wall = Time.fromMilliseconds wall_ms} : times
+fun ms_of_times ({thread_cpu, wall} : times) = (Time.toMilliseconds thread_cpu, Time.toMilliseconds wall)
+fun string_of_times ({thread_cpu, wall} : times) =
+  "thread_cpu=" ^ Time.toString thread_cpu ^ " wall=" ^ Time.toString wall
+
+type proof_cache = times * string
+type proof_record = {hash: Hasher.digest option, time: times, proof: string}
 type store = {proofs: proof_record Symtab.table,
               by_hash: proof_cache Hasher.Tab.table,
               async_tasks: Task_Queue.task list}
@@ -281,14 +322,15 @@ fun store_add_async task ({proofs, by_hash, async_tasks}:store)
   deletes the id.  Total by construction -- a raise here would let compact_store
   rewrite the file from a half-built table.*)
 fun replay records =
-  fold (fn PUT {id, hash, time_ms, proof} =>
-             store_update_proof (id, {hash = hash, time = Time.fromMilliseconds time_ms, proof = proof})
+  fold (fn PUT {id, hash, cpu_ms, wall_ms, proof} =>
+             store_update_proof (id, {hash = hash, time = times_of_ms (cpu_ms, wall_ms), proof = proof})
          | TOMB id => store_invalidate_proof id)
        records empty_store
 
 (*The one conversion from a live record back to a frame.*)
 fun put_frame id ({hash, time, proof} : proof_record) =
-  encode_put {id = id, hash = hash, time_ms = Time.toMilliseconds time, proof = proof}
+  let val (cpu_ms, wall_ms) = ms_of_times time
+   in encode_put {id = id, hash = hash, cpu_ms = cpu_ms, wall_ms = wall_ms, proof = proof} end
 
 fun store_base thy =
       Path.append (Resources.master_directory thy) (Path.basic (Context.theory_name {long=false} thy))
@@ -627,15 +669,16 @@ fun compact_store thy =
    store_invalidate_proof, force_reload and invalidate_store all leave it
    alone; close_store drops it, and that is precisely the session boundary. *)
 type written = (string * string * int) Symtab.table
-  (*key -> SHA1 of the proof text, its leading characters, standard-machine ms*)
+  (*key -> SHA1 of the proof text, its leading characters, standard-machine wall
+    ms (display only: collision detection compares the SHA1)*)
 
 val proof_head_len = 120
-fun proof_mark (t, text) =
+fun proof_mark (t : times, text) =
   let val syms = Symbol.explode text
    in (SHA1.rep (SHA1.digest text),
        if length syms <= proof_head_len then text
        else String.concat (take proof_head_len syms) ^ " ...",
-       Time.toMilliseconds t)
+       Time.toMilliseconds (#wall t))
   end
 
 fun written_of tab name =
@@ -862,9 +905,14 @@ val _ = Theory.setup (Theory.at_end (fn thy => (
     end
   ; NONE)))
 
-(* Guard the divisor: timeout_scale is a user-settable real, and 0 (or a
-   negative) would blow up or negate every stored time. *)
-fun standard_time t = Time.scale (1.0 / Real.max (Timeout.scale (), 0.001)) t
+(* Guard the factor: timeout_scale is a user-settable real, and 0 (or a
+   negative) would blow up or negate every stored time.  Both scalings are
+   built from this one factor so they are inverses by construction; stock
+   Timeout.scale_time is deliberately not used for machine_time, it is the
+   unguarded spelling. *)
+fun timeout_factor () = Real.max (Timeout.scale (), 0.001)
+val standard_time = map_times (fn t => Time.scale (1.0 / timeout_factor ()) t)
+val machine_time = map_times (fn t => Time.scale (timeout_factor ()) t)
 
 (*** Proof cache by hash ***)
 
@@ -877,7 +925,7 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') =
        (* Silenced: sledgehammer_solver.ML already traces the same message at
           its record points; this copy was the un-migrated twin.
        tracing (
-          "Find proof (" ^ hash ^ ", time: " ^ Time.toString (fst prf') ^ "): " ^
+          "Find proof (" ^ hash ^ ", " ^ string_of_times (fst prf') ^ "): " ^
            (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
        ) ; *)
        update_cached_proof (Proof_Context.theory_of ctxt) {id = Hasher.hex hash, hash = SOME hash} prf' ;
@@ -885,13 +933,14 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') =
 
 type proof = string
 type replay_limits = {thread_cpu: Time.time, wall: Time.time option}
-fun wall_cap t = Time.scale 2.0 t + Time.fromSeconds 3
-fun replay_limits_with slack t = {thread_cpu = Time.scale 1.5 t + slack, wall = SOME (wall_cap t)}
+fun replay_limits_with slack ({thread_cpu, wall} : times) =
+  let val wall_cap = Time.scale 2.0 wall + Time.fromSeconds 3
+   in {thread_cpu = Time.scale 1.5 thread_cpu + slack, wall = SOME wall_cap} : replay_limits end
 val replay_limits = replay_limits_with (Time.fromSeconds 1)
 
 fun timing f x =
   let val ({thread_cpu, elapsed, ...}, y) = Thread_CPU.timing f x
-  in (the_default elapsed thread_cpu, y) end
+  in ({thread_cpu = the_default elapsed thread_cpu, wall = elapsed}, y) end
 
 fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) =
   let val hash = key_fn (ctxt, sequent)

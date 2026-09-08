@@ -73,11 +73,11 @@ type options = {improved      : bool,
    The by-product comes back as a future in both, so the synchronous and the
    asynchronous case have exactly the same shape and downstream code is written
    once (synchronously it is a Future.value and joins for free).  Do NOT join it
-   on the main path -- that turns async back into sync.  The time beside the
-   text is the raw measurement of the replay that produced it, not the
-   standard-machine time written to the store. *)
-val auto     : options -> Proof.context -> thm -> (Time.time * string) future * thm
-val all_auto : options -> Proof.context -> thm -> (Time.time * string) future * thm
+   on the main path -- that turns async back into sync.  The times beside the
+   text are the raw measurement of the replay that produced it, not the
+   standard-machine times written to the store. *)
+val auto     : options -> Proof.context -> thm -> (Phi_Proof_Store.times * string) future * thm
+val all_auto : options -> Proof.context -> thm -> (Phi_Proof_Store.times * string) future * thm
 
 (* "Fail to prove the goal" followed by the pretty-printed leading subgoal.  A
    Sync caller that has to turn Auto_Fail into an ERROR needs this: Auto_Fail
@@ -152,21 +152,21 @@ val run_mepo_and_render : Time.time -> int (*max_facts*)
                        -> Sledgehammer_Fact.lazy_fact list (*MePo pool; [] skips MePo*)
                        -> (string * thm) list (*extra add facts*)
                        -> (string * thm) list (*del facts*)
-                       -> Proof.context -> int -> thm -> thm * string * Time.time
+                       -> Proof.context -> int -> thm -> thm * string * Phi_Proof_Store.times
 val replay_mepo_proof : Keyword.keywords -> Phi_Proof_Store.replay_limits -> int -> string
                      -> context_state -> context_state
 
 val eval_prf_str_stat : Keyword.keywords -> int -> (unit -> string * Proof.state) option
                      -> string -> Proof.state -> string * Proof.state
 
-(* Replay one proof text under Thread_CPU.apply's limits; the time handed back
-   is what Phi_Proof_Store.timing measured for it.  `n` is the number of LEADING
+(* Replay one proof text under Thread_CPU.apply's limits; the times handed back
+   are what Phi_Proof_Store.timing measured for it.  `n` is the number of LEADING
    subgoals the text is expected to close, and must be passed explicitly --
    several call sites run on a state with more subgoals than the text speaks
    for and must keep passing 1.  The protection it installs is what
    Goal.conclude later peels off; the two have to come in a pair. *)
 val eval_prf_str : Keyword.keywords -> int (*protect n*) -> Phi_Proof_Store.replay_limits
-                -> string -> context_state -> (Time.time * string) * context_state
+                -> string -> context_state -> (Phi_Proof_Store.times * string) * context_state
 
 end
 
@@ -1212,10 +1212,10 @@ fun find_local_may_false ctxt =
 fun wrapper f (ctxt,sequent) =
   if Thm.no_prems sequent
   (* "-" says "nothing to do, nothing to replay"; it is not a placeholder. *)
-  then ((Time.zeroTime, "-"), sequent)
+  then ((Phi_Proof_Store.zero_times, "-"), sequent)
   else case Thm.major_prem_of sequent
     of Const (\<^const_name>\<open>Trueprop\<close>, _) $ \<^const>\<open>True\<close> =>
-            ((Time.zeroTime, "rule TrueI"), @{thm TrueI} RS sequent)
+            ((Phi_Proof_Store.zero_times, "rule TrueI"), @{thm TrueI} RS sequent)
      | _ => if getenv "DEBUG_DISABLE_SH" = "yes"
             then error "Proof fails and Sledgehammer is disable due to debugging"
             else
@@ -1407,8 +1407,8 @@ fun render_fast_mepo_proof to_insert to_add del_pairs =
 in
 
 (* Run MePo + fastforce on the i-th subgoal. On success returns the proved
-   sequent, the rendered Isar replay string, and the fastforce-only time as
-   Phi_Proof_Store.timing measures it (NOT including MePo selection time, since
+   sequent, the rendered Isar replay string, and the fastforce-only times as
+   Phi_Proof_Store.timing measures them (NOT including MePo selection time, since
    the cache replay only re-runs fastforce, not MePo). On failure raises Auto_Fail.
    lazy_facts: pool for MePo selection (empty = skip MePo).
    extra_pairs: user-provided (name, thm) pairs always included.
@@ -1785,7 +1785,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
    in case prf
    of SOME (prf, sequent') =>
         if hasty
-        then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
+        then ((Phi_Proof_Store.zero_times, "<cheat>"), (ctxt, sequent'))
         else let val composed = "Auto_Sledgehammer.pre_simproc_on_concl, " ^ prf
                  val _ = tracing ("[sledgehammer] verifying composed proof: " ^ quote composed)
                  (*a fixed wall-clock guard, not a recorded time: no CPU limit
@@ -1804,8 +1804,8 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
    auto / all_auto, where a call computes its key exactly once.
 
    Its shape is fixed by async_prove, which drives it:
-     Proof.context * thm -> (Time.time * string) * thm.
-   The time HAS to come out -- the caching layer records it, and the old code
+     Proof.context * thm -> (Phi_Proof_Store.times * string) * thm.
+   The times HAVE to come out -- the caching layer records it, and the old code
    simply threw it away. *)
 fun auto'i {improved, fact_override, timeout} (ctxt, sequent) =
   let
@@ -1985,7 +1985,7 @@ fun auto (opts : options) ctxt0 sequent =
   (* Zero subgoals returns before anything else happens: no key (goal_at 1 would
      raise), no lookup, no record, no fork.  "-" means "nothing to do, nothing to
      replay". *)
-  if Thm.no_prems sequent then (Future.value (Time.zeroTime, "-"), sequent)
+  if Thm.no_prems sequent then (Future.value (Phi_Proof_Store.zero_times, "-"), sequent)
   else
   let
     val ctxt = with_timeout (#timeout opts) ctxt0
@@ -2011,7 +2011,7 @@ fun auto (opts : options) ctxt0 sequent =
             the search found, which is worth knowing whether or not we keep it.*)
           val out = after futs (fn [(time, prf)] =>
                                    let val text = scoped prf
-                                    in tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ text);
+                                    in tracing ("Find proof (" ^ id ^ ", " ^ Phi_Proof_Store.string_of_times time ^ "): \n" ^ text);
                                        record (Phi_Proof_Store.standard_time time, text); (time, text) end
                                  | _ => raise Fail "auto: async_prove Leading \
                                                    \yielded the wrong shape")
@@ -2025,7 +2025,7 @@ fun auto (opts : options) ctxt0 sequent =
   end
 
 fun all_auto (opts : options) ctxt0 sequent =
-  if Thm.no_prems sequent then (Future.value (Time.zeroTime, "-"), sequent)
+  if Thm.no_prems sequent then (Future.value (Phi_Proof_Store.zero_times, "-"), sequent)
   else
   let
     val ctxt = with_timeout (#timeout opts) ctxt0
@@ -2053,10 +2053,10 @@ fun all_auto (opts : options) ctxt0 sequent =
             all the goals.  Empty list cannot occur -- the entry short-circuits on
             zero subgoals -- so no "()" can ever be stored.*)
           val out = after futs (fn tps =>
-                       let val time = fold (curry (op +) o fst) tps Time.zeroTime
+                       let val time = fold (Phi_Proof_Store.add_times o fst) tps Phi_Proof_Store.zero_times
                            val text = "(" ^ String.concatWith ", "
                                               (map (scoped o snd) tps) ^ ")"
-                        in tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ text);
+                        in tracing ("Find proof (" ^ id ^ ", " ^ Phi_Proof_Store.string_of_times time ^ "): \n" ^ text);
                            record (Phi_Proof_Store.standard_time time, text); (time, text) end)
           val _ = if Future.is_finished out then ()
                   else Phi_Proof_Store.register_async_task (Future.task_of out) thy
