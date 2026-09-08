@@ -189,22 +189,34 @@ val invalidate_proof_cache_by_hash : Hasher.digest -> theory -> unit
 
 type proof = string
 
-(*Budget for replaying a cached proof: the time recorded when it was found, plus
-  slack for a machine that is busier now than it was then.  Overrunning it
-  invalidates the entry and re-searches the proof from scratch.
+(*Limits for replaying a recorded proof, from the time recorded when it was
+  found.  The thread CPU limit is 1.5 x the recorded time plus a slack for a
+  machine busier now than then; wall_cap is the wall-clock limit, the only one
+  that can fire on a replay whose CPU stands still (an external solver, a loaded
+  machine).  Overrunning either invalidates the entry and re-searches the proof
+  from scratch.  Both are NOMINAL times: Thread_CPU.apply multiplies this
+  machine's timeout_scale in itself -- so never multiply the factor in here.
+  replay_limits_with takes the slack; replay_limits is the store's own (1 s).*)
+type replay_limits = {thread_cpu: Time.time, wall: Time.time option}
+val wall_cap : Time.time -> Time.time
+val replay_limits_with : Time.time (*slack*) -> Time.time -> replay_limits
+val replay_limits : Time.time -> replay_limits
 
-  The result is a NOMINAL time handed to Timeout.apply, which multiplies this
-  machine's timeout_scale in itself -- so never multiply the factor in here.*)
-val tolerant_time : Time.time -> Time.time
-
-(*The write-side counterpart: divide a measured elapsed time by this machine's
+(*The write-side counterpart: divide a measured time by this machine's
   timeout_scale, so what lands in the store is standard-machine time and a slow
   machine does not hand every other machine an inflated replay budget.  Every
   write point must pass its measurement through this before storing it.*)
 val standard_time : Time.time -> Time.time
 
+(*What a record point measures: the calling thread's CPU time, or the wall-clock
+  elapsed without a CPU clock.  Only this thread is counted, so f must do its
+  work here: a record point that forks records far less than the replay will
+  cost.  Old records are wall time: they only loosen the CPU limit (wall >= CPU);
+  a CPU record tightens the wall cap, the accepted trade.*)
+val timing : ('a -> 'b) -> 'a -> Time.time * 'b
+
 val try_cached_proof_by_hash :
-         (Time.time -> proof -> context_state -> context_state option) (*evaluator*)
+         (replay_limits -> proof -> context_state -> context_state option) (*evaluator*)
       -> (string option (*original cached proof*) -> (Time.time * proof) * context_state)
       -> context_state
       -> (Time.time * proof) * context_state
@@ -214,7 +226,7 @@ val try_cached_proof_by_hash :
   use i >= 1 to key on the i-th subgoal in isolation.*)
 val try_cached_proof_by_hash_at :
          int (*subgoal index, 0 = whole sequent*)
-      -> (Time.time -> proof -> context_state -> context_state option) (*evaluator*)
+      -> (replay_limits -> proof -> context_state -> context_state option) (*evaluator*)
       -> (string option (*original cached proof*) -> (Time.time * proof) * context_state)
       -> context_state
       -> (Time.time * proof) * context_state
@@ -856,9 +868,9 @@ fun standard_time t = Time.scale (1.0 / Real.max (Timeout.scale (), 0.001)) t
 
 (*** Proof cache by hash ***)
 
-(* prf' carries the RAW measured elapsed; standard_time normalises it once here,
+(* prf' carries the RAW measured time; standard_time normalises it once here,
    so the record holds standard-machine time and the read path (which passes it
-   through tolerant_time into Timeout.apply) gets the factor applied exactly
+   through replay_limits into Thread_CPU.apply) gets the factor applied exactly
    once. *)
 fun update_cache_by_hash hash prf' (ctxt, sequent') =
   let val prf' = apfst standard_time prf' in (
@@ -872,8 +884,14 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') =
        (snd prf', sequent')) end
 
 type proof = string
-val time_delt = Time.fromMilliseconds 1000
-fun tolerant_time t = Time.scale 1.5 t + time_delt
+type replay_limits = {thread_cpu: Time.time, wall: Time.time option}
+fun wall_cap t = Time.scale 2.0 t + Time.fromSeconds 3
+fun replay_limits_with slack t = {thread_cpu = Time.scale 1.5 t + slack, wall = SOME (wall_cap t)}
+val replay_limits = replay_limits_with (Time.fromSeconds 1)
+
+fun timing f x =
+  let val ({thread_cpu, elapsed, ...}, y) = Thread_CPU.timing f x
+  in (the_default elapsed thread_cpu, y) end
 
 fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) =
   let val hash = key_fn (ctxt, sequent)
@@ -887,7 +905,7 @@ fun try_cached_proof_by_hash_with_key key_fn evaluator fallback (ctxt, sequent) 
           of NONE => fallback' NONE
            | SOME (time,prf) =>
               let val ctxt' = ctxt (*if prf = "" then ctxt else Phi_Envir.freeze_dynamic_lemmas ctxt*)
-               in case ( evaluator (tolerant_time time) prf (ctxt', sequent)
+               in case ( evaluator (replay_limits time) prf (ctxt', sequent)
                          handle Timeout.TIMEOUT _ => NONE )
                     of SOME ret => ((time,prf), ret)
                      | NONE => fallback' (SOME prf)

@@ -73,8 +73,10 @@ type options = {improved      : bool,
    The by-product comes back as a future in both, so the synchronous and the
    asynchronous case have exactly the same shape and downstream code is written
    once (synchronously it is a Future.value and joins for free).  Do NOT join it
-   on the main path -- that turns async back into sync. *)
-val auto     : options -> Proof.context -> thm -> string future * thm
+   on the main path -- that turns async back into sync.  The time beside the
+   text is the raw measurement of the replay that produced it, not the
+   standard-machine time written to the store. *)
+val auto     : options -> Proof.context -> thm -> (Time.time * string) future * thm
 val all_auto : options -> Proof.context -> thm -> (Time.time * string) future * thm
 
 (* "Fail to prove the goal" followed by the pretty-printed leading subgoal.  A
@@ -151,19 +153,20 @@ val run_mepo_and_render : Time.time -> int (*max_facts*)
                        -> (string * thm) list (*extra add facts*)
                        -> (string * thm) list (*del facts*)
                        -> Proof.context -> int -> thm -> thm * string * Time.time
-val replay_mepo_proof : Keyword.keywords -> Time.time -> int -> string
+val replay_mepo_proof : Keyword.keywords -> Phi_Proof_Store.replay_limits -> int -> string
                      -> context_state -> context_state
 
 val eval_prf_str_stat : Keyword.keywords -> int -> (unit -> string * Proof.state) option
                      -> string -> Proof.state -> string * Proof.state
 
-(* Replay one proof text.  `n` is the number of LEADING subgoals the text is
-   expected to close, and must be passed explicitly -- several call sites run on
-   a state with more subgoals than the text speaks for and must keep passing 1.
-   The protection it installs is what Goal.conclude later peels off; the two
-   have to come in a pair. *)
-val eval_prf_str : Keyword.keywords -> int (*protect n*) -> Time.time -> string
-                -> context_state -> (Time.time * string) * context_state
+(* Replay one proof text under Thread_CPU.apply's limits; the time handed back
+   is what Phi_Proof_Store.timing measured for it.  `n` is the number of LEADING
+   subgoals the text is expected to close, and must be passed explicitly --
+   several call sites run on a state with more subgoals than the text speaks
+   for and must keep passing 1.  The protection it installs is what
+   Goal.conclude later peels off; the two have to come in a pair. *)
+val eval_prf_str : Keyword.keywords -> int (*protect n*) -> Phi_Proof_Store.replay_limits
+                -> string -> context_state -> (Time.time * string) * context_state
 
 end
 
@@ -608,7 +611,7 @@ fun auto_obligation_solver1 (ctxt, th) = th
    store hit can never start a proof search.  Stock `""` records need no special
    rule: the parser rejects them, which lands in the catch-all below, which the
    caching layer reads as "cached proof no longer works, search again". *)
-fun eval_prf_str0 kws n timeout prf (ctxt,sequent) = \<^try>\<open>
+fun eval_prf_str0 kws n limits prf (ctxt,sequent) = \<^try>\<open>
       let val _ = tracing ("[eval_prf_str] replaying: " ^ quote prf)
           val protected = Goal.protect n sequent
           val seq =
@@ -617,9 +620,9 @@ fun eval_prf_str0 kws n timeout prf (ctxt,sequent) = \<^try>\<open>
                 |> fst
                 |> Method.check_text ctxt
               ) ctxt [] (ctxt, protected)
-        in case Timeout.apply timeout (Timing.timing (
+        in case Thread_CPU.apply limits (Phi_Proof_Store.timing (
                     Position.setmp_thread_data Position.none Seq.pull)) seq
-             of ({elapsed=time,...}, SOME (Seq.Result (ctxt', sequent'), _)) =>
+             of (time, SOME (Seq.Result (ctxt', sequent'), _)) =>
                   if Thm.no_prems sequent'
                   then ((time,prf), (ctxt', Goal.conclude sequent'))
                   else raise Auto_Fail Subgoal_unsolved
@@ -631,15 +634,16 @@ fun eval_prf_str0 kws n timeout prf (ctxt,sequent) = \<^try>\<open>
                          raise Auto_Fail (Unknown (Runtime.exn_message err))) \<close>
 
 (*record point (EVENT_LOG_PLAN 7): a breakdown leaving a replay is attributed
-  with the budget and the elapsed time at that moment; record_breakdown is a
-  no-op otherwise.  Behaviour unchanged.*)
-fun eval_prf_str kws n timeout prf cs =
+  with its limits and the wall-clock elapsed at that moment; record_breakdown
+  is a no-op otherwise.  Behaviour unchanged.*)
+fun eval_prf_str kws n (limits as {thread_cpu, wall}) prf cs =
   let val t0 = Time.now ()
-   in case Exn.capture_body (fn () => eval_prf_str0 kws n timeout prf cs) of
+   in case Exn.capture_body (fn () => eval_prf_str0 kws n limits prf cs) of
         Exn.Res r => r
       | Exn.Exn exn =>
           (Exception_Log.record_breakdown
-             ("eval_prf_str timeout=" ^ Time.toString timeout ^
+             ("eval_prf_str thread_cpu=" ^ Time.toString thread_cpu ^
+              " wall=" ^ (case wall of SOME w => Time.toString w | NONE => "none") ^
               " elapsed=" ^ Time.toString (Time.now () - t0) ^
               " prf=" ^ String.substring (prf, 0, Int.min (size prf, 40))) exn;
            Exn.reraise exn)
@@ -1203,7 +1207,7 @@ fun find_local_may_false ctxt =
            end) ths)
   end
 
-(* Carries the search unit's (elapsed, proof text) pair through, prefixing the
+(* Carries the search unit's (time, proof text) pair through, prefixing the
    text where it had to insert a locally-false fact first. *)
 fun wrapper f (ctxt,sequent) =
   if Thm.no_prems sequent
@@ -1403,9 +1407,9 @@ fun render_fast_mepo_proof to_insert to_add del_pairs =
 in
 
 (* Run MePo + fastforce on the i-th subgoal. On success returns the proved
-   sequent, the rendered Isar replay string, and the fastforce-only elapsed
-   time (NOT including MePo selection time, since the cache replay only
-   re-runs fastforce, not MePo). On failure raises Auto_Fail.
+   sequent, the rendered Isar replay string, and the fastforce-only time as
+   Phi_Proof_Store.timing measures it (NOT including MePo selection time, since
+   the cache replay only re-runs fastforce, not MePo). On failure raises Auto_Fail.
    lazy_facts: pool for MePo selection (empty = skip MePo).
    extra_pairs: user-provided (name, thm) pairs always included.
    del_pairs: user-provided del facts applied to base context. *)
@@ -1468,30 +1472,28 @@ fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt 
     fun fastforce_branch () =
       (Method.insert_tac ctxt insert_thms i THEN Clasimp.fast_force_tac ctxt' i) st
 
-    val start = Time.now ()
   in
-    case Timeout.apply timeout (fn () => Seq.pull (fastforce_branch ())) ()
+    case Phi_Proof_Store.timing (fn () =>
+            Timeout.apply timeout (fn () => Seq.pull (fastforce_branch ())) ()
               handle Timeout.TIMEOUT _ => NONE
-                   | TERM _ => NONE of
-      NONE => raise Auto_Fail Application_Fails
-    | SOME (st', _) =>
-        let val elapsed = Time.- (Time.now (), start)
-            val prf_str = render_fast_mepo_proof to_insert to_add del_pairs
-        in (st', prf_str, elapsed) end
+                   | TERM _ => NONE) () of
+      (_, NONE) => raise Auto_Fail Application_Fails
+    | (time, SOME (st', _)) =>
+        (st', render_fast_mepo_proof to_insert to_add del_pairs, time)
   end
 
 (* Replay a cached Isar method on the i-th subgoal of `st`. For i = 1 we just
    call eval_prf_str directly; for i > 1 we wrap with Goal.restrict / unrestrict
    so the cached "(insert ..., fastforce ...)" string (which acts on subgoal 1
    of whatever sequent it sees) lands on the right subgoal. *)
-fun replay_mepo_proof kws timeout i prf (ctxt, st) =
+fun replay_mepo_proof kws limits i prf (ctxt, st) =
   if i = 1 then
-    let val (_, cs) = eval_prf_str kws 1 timeout prf (ctxt, st) in cs end
+    let val (_, cs) = eval_prf_str kws 1 limits prf (ctxt, st) in cs end
   else
     let
       val st_focused = Goal.restrict i 1 st
       val (_, (ctxt', st_focused')) =
-            eval_prf_str kws 1 timeout prf (ctxt, st_focused)
+            eval_prf_str kws 1 limits prf (ctxt, st_focused)
     in
       (ctxt', Goal.unrestrict i st_focused')
     end
@@ -1511,14 +1513,14 @@ fun fast_mepo_tac timeout ctxt i st =
         val thy = Proof_Context.theory_of ctxt
         val kws = Keyword.no_major_keywords (Thy_Header.get_keywords thy)
 
-        fun evaluator t prf cs =
-              SOME (replay_mepo_proof kws t i prf cs)
+        fun evaluator limits prf cs =
+              SOME (replay_mepo_proof kws limits i prf cs)
               handle Auto_Fail _ => NONE
                    | Timeout.TIMEOUT _ => NONE
 
         fun fallback _ =
-              let val (st', prf_str, elapsed) = run ()
-               in ((elapsed, prf_str), (ctxt, st')) end
+              let val (st', prf_str, time) = run ()
+               in ((time, prf_str), (ctxt, st')) end
       in
         ((case Phi_Proof_Store.try_cached_proof_by_hash_at i evaluator fallback (ctxt, st) of
             (_, (_, st')) => Seq.single st')
@@ -1786,7 +1788,10 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
         then ((Time.zeroTime, "<cheat>"), (ctxt, sequent'))
         else let val composed = "Auto_Sledgehammer.pre_simproc_on_concl, " ^ prf
                  val _ = tracing ("[sledgehammer] verifying composed proof: " ^ quote composed)
-              in eval_prf_str kws 1 (Time.fromSeconds 180) composed (ctxt,sequent)
+                 (*a fixed wall-clock guard, not a recorded time: no CPU limit
+                   (Thread_CPU.apply ignores a thread_cpu below 1 ms)*)
+              in eval_prf_str kws 1 {thread_cpu = Time.zeroTime, wall = SOME (Time.fromSeconds 180)}
+                              composed (ctxt,sequent)
              end
     | NONE => (case !failed_subgoal
                  of SOME t => raise Auto_Fail (Subgoal_Fail t)
@@ -1800,8 +1805,8 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
 
    Its shape is fixed by async_prove, which drives it:
      Proof.context * thm -> (Time.time * string) * thm.
-   The elapsed time HAS to come out -- the caching layer records it, and the old
-   code simply threw it away. *)
+   The time HAS to come out -- the caching layer records it, and the old code
+   simply threw it away. *)
 fun auto'i {improved, fact_override, timeout} (ctxt, sequent) =
   let
     val hasty = Config.get ctxt hasty_mode
@@ -1931,7 +1936,7 @@ fun replay_store k record {do_read, id, hash} (ctxt, sequent) =
     fun replay (time, prf) =
       \<^try>\<open>
         let val r as (_, (_, sequent')) =
-              eval_prf_str kws k (Phi_Proof_Store.tolerant_time time) prf (ctxt, sequent)
+              eval_prf_str kws k (Phi_Proof_Store.replay_limits time) prf (ctxt, sequent)
          in if Thm.nprems_of sequent' <= nprem - k then SOME r
             else raise Auto_Fail Subgoal_unsolved
         end
@@ -1980,7 +1985,7 @@ fun auto (opts : options) ctxt0 sequent =
   (* Zero subgoals returns before anything else happens: no key (goal_at 1 would
      raise), no lookup, no record, no fork.  "-" means "nothing to do, nothing to
      replay". *)
-  if Thm.no_prems sequent then (Future.value "-", sequent)
+  if Thm.no_prems sequent then (Future.value (Time.zeroTime, "-"), sequent)
   else
   let
     val ctxt = with_timeout (#timeout opts) ctxt0
@@ -2007,7 +2012,7 @@ fun auto (opts : options) ctxt0 sequent =
           val out = after futs (fn [(time, prf)] =>
                                    let val text = scoped prf
                                     in tracing ("Find proof (" ^ id ^ ", time: " ^ Time.toString time ^ "): \n" ^ text);
-                                       record (Phi_Proof_Store.standard_time time, text); text end
+                                       record (Phi_Proof_Store.standard_time time, text); (time, text) end
                                  | _ => raise Fail "auto: async_prove Leading \
                                                    \yielded the wrong shape")
           val _ = if Future.is_finished out then ()
@@ -2015,7 +2020,7 @@ fun auto (opts : options) ctxt0 sequent =
        in (out, sequent') end
   in
     case replay_store 1 record {do_read = do_read, id = id, hash = hash} (ctxt, sequent) of
-      SOME ((_, prf), (_, sequent')) => (Future.value prf, sequent')
+      SOME (r, (_, sequent')) => (Future.value r, sequent')
     | NONE => search ()
   end
 

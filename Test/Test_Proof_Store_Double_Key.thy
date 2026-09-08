@@ -180,7 +180,7 @@ fun opts {read, write} pid =
    fact_override = Sledgehammer_Fact.no_fact_override, proof_id = pid,
    timeout = NONE, read_store = SOME read, write_store = SOME write} : Solver.options
 fun run_auto flags pid ctxt st =
-  let val (fut, st') = Solver.auto (opts flags pid) ctxt st in (Future.join fut, st') end
+  let val (fut, st') = Solver.auto (opts flags pid) ctxt st in (snd (Future.join fut), st') end
 
 (*counted by the method below: a replay the skip rule suppresses shows as a
   count that did not move*)
@@ -257,7 +257,7 @@ val kws = Keyword.no_major_keywords (Thy_Header.get_keywords (Proof_Context.theo
 val g17b = goal_of ctxt "(u::nat) * 1 = u"
 val h17b = Hasher.goal_at 1 (ctxt, g17b)
 val _ = replays := 0
-val _ = \<^try>\<open>ignore (Solver.eval_prf_str kws 1 (S.tolerant_time t1) "(count_fail)[1]" (ctxt, g17b))
+val _ = \<^try>\<open>ignore (Solver.eval_prf_str kws 1 (S.replay_limits t1) "(count_fail)[1]" (ctxt, g17b))
                  catch Solver.Auto_Fail _ => ()\<close>
 val per_replay = !replays
 val _ = assert (per_replay > 0) "test17b count_fail is reached"
