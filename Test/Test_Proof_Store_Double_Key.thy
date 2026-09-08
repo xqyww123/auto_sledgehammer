@@ -259,9 +259,9 @@ ML \<open>
 val _ = S.invalidate_store thy
 (*17b: the skip rule seen from the positive side: the record that failed
       under the id is NOT replayed again under the hash.  count_fail is only
-      known to a context taken after its method_setup.  One replay invokes
-      the method more than once (the [1] combinator backtracks), so the
-      yardstick is one replay's count, measured first.*)
+      known to a context taken after its method_setup.  The yardstick is one
+      replay's count, measured first through the same channel, so the test
+      does not depend on how often one replay invokes the method.*)
 val ctxt = \<^context>
 val kws = Keyword.no_major_keywords (Thy_Header.get_keywords (Proof_Context.theory_of ctxt))
 val g17b = goal_of ctxt "(u::nat) * 1 = u"

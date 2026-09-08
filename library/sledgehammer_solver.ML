@@ -614,8 +614,10 @@ fun auto_obligation_solver1 (ctxt, th) = th
 fun eval_prf_str0 kws n limits prf (ctxt,sequent) = \<^try>\<open>
       let val _ = tracing ("[eval_prf_str] replaying: " ^ quote prf)
           val protected = Goal.protect n sequent
+          (*evaluate_runtime, not evaluate: the latter's closure check runs every
+            named method once on a goal-less dummy state, outside the limits*)
           val seq =
-            Method.evaluate (
+            Method.evaluate_runtime (
               Parse.read_embedded ctxt kws (Method.parser 0) (Input.string prf)
                 |> fst
                 |> Method.check_text ctxt
