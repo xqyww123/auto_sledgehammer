@@ -138,6 +138,7 @@ val need_standard_tac : Proof.context -> thm -> bool
 val collapse_iv : Facts.interval list -> Facts.interval list
 
 val hasty_mode : bool Config.T
+val trace_replay : bool Config.T (*auto_sledgehammer_trace_replay: trace every replayed method text*)
 
 val get_sledgehammer_params : Proof.context -> (string * string) list
 
@@ -611,8 +612,12 @@ fun auto_obligation_solver1 (ctxt, th) = th
    store hit can never start a proof search.  Stock `""` records need no special
    rule: the parser rejects them, which lands in the catch-all below, which the
    caching layer reads as "cached proof no longer works, search again". *)
+(*the replay trace, off by default: one line per replayed method text*)
+val trace_replay = Attrib.setup_config_bool \<^binding>\<open>auto_sledgehammer_trace_replay\<close> (K false)
+
 fun eval_prf_str0 kws n limits prf (ctxt,sequent) = \<^try>\<open>
-      let val _ = tracing ("[eval_prf_str] replaying: " ^ quote prf)
+      let val _ = if Config.get ctxt trace_replay
+                  then tracing ("[eval_prf_str] replaying: " ^ quote prf) else ()
           val protected = Goal.protect n sequent
           (*evaluate_runtime, not evaluate: the latter's closure check runs every
             named method once on a goal-less dummy state, outside the limits*)
@@ -631,9 +636,12 @@ fun eval_prf_str0 kws n limits prf (ctxt,sequent) = \<^try>\<open>
               | _ => raise Auto_Fail Application_Fails
       end catch Timeout.TIMEOUT _ => raise Auto_Fail Timeout
               | Auto_Fail err => Exn.reraise (Auto_Fail err)
-              | err => (tracing ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
-                                 Runtime.exn_message err);
-                         raise Auto_Fail (Unknown (Runtime.exn_message err))) \<close>
+              (*a Par_Exn wrapping an interrupt is an interrupt, not an unknown failure:
+                \<^try> lets only a bare interrupt through*)
+              | err => if Interrupt_Family.contains_interrupt err then Exn.reraise err
+                       else (tracing ("[eval_prf_str] FAILED on " ^ quote prf ^ ": " ^
+                                      Runtime.exn_message err);
+                             raise Auto_Fail (Unknown (Runtime.exn_message err))) \<close>
 
 (*record point (EVENT_LOG_PLAN 7): a breakdown leaving a replay is attributed
   with its limits and the wall-clock elapsed at that moment; record_breakdown

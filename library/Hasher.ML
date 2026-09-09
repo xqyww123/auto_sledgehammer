@@ -59,15 +59,21 @@ val class : class -> digest
 val sort  : sort -> digest
 val typ  : typ -> digest
 val term : term -> digest
+(*one digest of a list of terms, in order; the guard digest of PLPR's guard cache*)
+val terms : term list -> digest
 val goal : context_state -> digest
 val goal_at : int -> context_state -> digest
 val all_goals : context_state -> digest
 
-(*The 16-character lower-case hexadecimal rendering.  This is the ONLY way a
-  digest becomes a string, used exactly where something outside this process
-  requires one: a proof id of the hash-fallback family, the L1 SQLite key,
-  log messages.*)
+(*The 16-character lower-case hexadecimal rendering, used exactly where
+  something outside this process requires text: a proof id of the
+  hash-fallback family, the L1 SQLite key, log messages.*)
 val hex : digest -> string
+
+(*The 8-byte big-endian rendering: the raw bytes, half the size of hex and no
+  per-character allocation.  Byte order matches mlmsgpack's packWord64; string
+  order equals numeric order.*)
+val compact : digest -> string
 
 (*Tables keyed by digest, for the hash-keyed index of a proof store.*)
 structure Tab : TABLE where type key = digest
@@ -102,6 +108,15 @@ fun hex w =
         end
   in
     String.implode (loop 7 [])
+  end
+
+(* Poly/ML 5.9.2 has no PackWord64Big, hence two 32-bit halves;
+   Byte.bytesToString is a zero-copy cast. *)
+fun compact w =
+  let val arr = Word8Array.array (8, 0w0)
+  in PackWord32Big.update (arr, 0, Word64.toLargeWord (Word64.>> (w, 0w32)));
+     PackWord32Big.update (arr, 1, Word64.toLargeWord w);
+     Byte.bytesToString (Word8Array.vector arr)
   end
 
 (* Hash a string using imperative while loop with direct byte access *)
@@ -212,6 +227,8 @@ fun typ ty = hash_typ ty fnv_offset_basis
 
 fun term t = hash_term t fnv_offset_basis
 
+fun terms ts = fold hash_term ts fnv_offset_basis
+
 fun hash_in_context' ctxt terms =
   let
     val thy_name = Context.theory_name {long=false} (Proof_Context.theory_of ctxt)
@@ -239,3 +256,7 @@ fun all_goals (ctxt, stat) =
   hash_in_context' ctxt (Logic.strip_imp_prems (Thm.prop_of stat))
 
 end
+
+(*TEMPORARY hunt marker (`exception Option`, 2026-09-03): forces this session to
+  rebuild so its ROOT ML_debugger option takes effect (a ROOT options change alone
+  does not enter the session digest).  Delete with the hunt.*)
