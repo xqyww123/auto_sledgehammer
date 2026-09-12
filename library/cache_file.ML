@@ -265,9 +265,28 @@ val enable_proof_store : bool Config.T
 end
 
 
-structure Phi_Proof_Store : PHI_PROOF_STORE = struct
+(*What differs between the instances of the store (the proof store below, the
+  guard cache of PLPR): the file extension; whether the pre-rename
+  <thy>.proof-cache is migrated on first touch and read where migration could
+  not run; whether a write is marked so that a second, different write under
+  one key in a session warns (the guard cache rewrites an entry legitimately);
+  the words of the user-facing messages, ("Proof cache", "cached proofs"); and
+  the switch -- a functor argument only because Attrib.setup_config_bool cannot
+  declare one binding twice: it gates nothing inside the store (its one reader
+  is the by-hash surface).  Every piece of module-level state in the body --
+  the append locks, the warned directories, the open stores, the Theory.at_end
+  hook -- is per instance.*)
+signature STORE_KIND = sig
+  val ext : string
+  val migrates : bool
+  val marks_writes : bool
+  val describe : string * string
+  val switch : bool Config.T
+end
 
-val enable_proof_store = Attrib.setup_config_bool \<^binding>\<open>enable_proof_store\<close> (K true)
+functor Proof_Store (Kind : STORE_KIND) : PHI_PROOF_STORE = struct
+
+val enable_proof_store = Kind.switch
 
 type proof_id = string
 
@@ -335,13 +354,14 @@ fun put_frame id ({hash, time, proof} : proof_record) =
 fun store_base thy =
       Path.append (Resources.master_directory thy) (Path.basic (Context.theory_name {long=false} thy))
 
-fun store_path thy = Path.ext "proof-store" (store_base thy)
+fun store_path thy = Path.ext Kind.ext (store_base thy)
 
-(* The pre-rename file name.  Only ever READ, and only by migrate_legacy on the
-   first touch of a theory's store; nothing appends to it again. *)
+(* The pre-rename file name of the proof store.  Only ever READ, only where
+   Kind.migrates, and only by migrate_legacy on the first touch of a theory's
+   store and by load_store_raw's fallback; nothing appends to it again. *)
 fun legacy_cache_path thy = Path.ext "proof-cache" (store_base thy)
 
-fun lock_path thy = Path.ext "lock" (store_path thy)   (* <thy>.proof-store.lock *)
+fun lock_path thy = Path.ext "lock" (store_path thy)   (* <thy>.<ext>.lock *)
 
 (* Whether the cache location admits the writes this module performs: creating
    the lock file and the compaction temp file, appending to the data file,
@@ -512,9 +532,9 @@ fun warn_not_writable thy =
    in if Synchronized.change_result warned_dirs (fn tab =>
            (Symtab.defined tab dir, Symtab.update (dir, ()) tab))
       then ()
-      else warning ("Proof cache for theory " ^ Context.theory_name {long=true} thy ^
+      else warning (#1 Kind.describe ^ " for theory " ^ Context.theory_name {long=true} thy ^
                     " is not writable (" ^ Path.print (store_path thy) ^
-                    "); cached proofs will be read but not recorded.")
+                    "); " ^ #2 Kind.describe ^ " will be read but not recorded.")
   end
 
 (* Identifies the cache FILE, and is used ONLY as the append-lock key -- never
@@ -588,10 +608,9 @@ fun try_write thy body =
 fun migrate_legacy thy =
   let val new_path = store_path thy
       val old_path = legacy_cache_path thy
-      val v = store_append_lock (store_file_key thy)
-   in if File.is_file new_path orelse not (File.is_file old_path)
+   in if not Kind.migrates orelse File.is_file new_path orelse not (File.is_file old_path)
       then ()                                          (* fast path, no lock *)
-      else Synchronized.change v (fn confirmed =>
+      else Synchronized.change (store_append_lock (store_file_key thy)) (fn confirmed =>
         if not (store_is_writable thy) then confirmed
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
@@ -638,11 +657,16 @@ fun append_record thy bytes =
    as a fresh new-format file. Also upgrades a never-appended legacy file.
    Guarded like append_record -- this is what protects the Theory.at_end hook
    below, whose deferred Future.forks branch would otherwise surface an IO.Io
-   as a spurious error long after the theory has finished. *)
+   as a spurious error long after the theory has finished.
+   A store that does not exist is not compacted at all: the writability probe
+   and with_file_lock's createf of the lock file come before the body, and
+   would leave a <thy>.<ext>.lock and a probe behind every theory that never
+   wrote (measured 2026-09-03: 85 lock files against 38 stores).  The test is
+   repeated under the lock: invalidate_store may remove the file in between. *)
 fun compact_store thy =
   let val path = store_path thy
-      val v = store_append_lock (store_file_key thy)
-   in Synchronized.change v (fn confirmed =>
+   in if not (File.is_file path) then ()
+      else Synchronized.change (store_append_lock (store_file_key thy)) (fn confirmed =>
         if not (store_is_writable thy) then confirmed
         else \<^try>\<open>
           with_file_lock (lock_path thy) (fn () =>
@@ -682,9 +706,9 @@ fun proof_mark (t : times, text) =
   end
 
 fun written_of tab name =
-  case Symtab.lookup tab name of SOME (_, _, w) => w | NONE => Symtab.empty
+  case Symtab.lookup tab name of SOME (_, w) => w | NONE => Symtab.empty
 
-val openning_stores : (store * bool * written) Symtab.table Synchronized.var
+val openning_stores : (store * written) Symtab.table Synchronized.var
   = Synchronized.var "\<phi>-System.openning_stores" Symtab.empty
 
 (* Read fallback: where migration could not run (an unwritable location) the new
@@ -693,7 +717,7 @@ val openning_stores : (store * bool * written) Symtab.table Synchronized.var
    guard: this path takes no lock and must stay callable from get_store_i. *)
 fun load_store_raw thy =
   let val path = store_path thy
-      val path = if File.is_file path then path else legacy_cache_path thy
+      val path = if File.is_file path orelse not Kind.migrates then path else legacy_cache_path thy
    in read_file_state path end
 
 fun force_reload thy =
@@ -703,18 +727,18 @@ fun force_reload thy =
         val c = load_store_raw thy
         (*re-reading the file says nothing about what this session wrote*)
         val w = written_of tab name
-     in (c, Symtab.update (name, (c, false, w)) tab) end ))
+     in (c, Symtab.update (name, (c, w)) tab) end ))
 
 (*The whole entry, for the writer that needs the written table too; get_store_i
   is the same thing for the readers that only want the store.*)
 fun get_entry_i thy tab =
   case Symtab.lookup tab (Context.theory_name {long=true} thy)
       of SOME e => (e, tab)
-       | _ => let val e = (load_store_raw thy, false, Symtab.empty)
+       | _ => let val e = (load_store_raw thy, Symtab.empty)
                in (e, Symtab.update_new (Context.theory_name {long=true} thy, e) tab) end
 
 fun get_store_i thy tab =
-  let val ((c, _, _), tab') = get_entry_i thy tab in (c, tab') end
+  let val ((c, _), tab') = get_entry_i thy tab in (c, tab') end
 
 fun get_store thy =
  (migrate_legacy thy;                                        (*D44*)
@@ -725,9 +749,9 @@ fun register_async_task task thy =
       val _ = migrate_legacy thy                             (*D44*)
    in Synchronized.change openning_stores (fn tab =>
       case Symtab.lookup tab name
-        of SOME (c, flag, w) => Symtab.update (name, (store_add_async task c, flag, w)) tab
+        of SOME (c, w) => Symtab.update (name, (store_add_async task c, w)) tab
          | _ => let val c = store_add_async task (load_store_raw thy)
-                 in Symtab.update_new (name, (c, false, Symtab.empty)) tab end )
+                 in Symtab.update_new (name, (c, Symtab.empty)) tab end )
   end
 
 (* Persistence is now continuous (each update appends immediately), so storing
@@ -760,7 +784,7 @@ fun invalidate_store thy =
          if File.is_file (store_path thy) then File.rm (store_path thy) else ()));
      Synchronized.change openning_stores (fn tab =>
        (*dropping the data does not un-write what this session wrote*)
-       Symtab.update (name, (empty_store, true, written_of tab name)) tab);
+       Symtab.update (name, (empty_store, written_of tab name)) tab);
      false))
   end
 
@@ -804,13 +828,15 @@ fun update_cached_proof thy {id, hash} s =
         concurrent writers (\<phi>SH.record_proof, hammer_or_AoA_store_write).*)
       val (do_append, msg) =
         Synchronized.change_result openning_stores (fn tab =>
-          let val ((c, _, w), tab') = get_entry_i thy tab
+          let val ((c, w), tab') = get_entry_i thy tab
               (*the whole record, time included: a skipped write then leaves
                 proofs[id] byte-identical, so the frame it would append is
                 redundant*)
               val live_and_identical = Symtab.lookup (#proofs c) id = SOME r
            in if live_and_identical
               then ((false, NONE), tab')
+              else if not Kind.marks_writes
+              then ((true, NONE), Symtab.update (name, (store_update_proof (id, r) c, w)) tab')
               else let val msg = case Symtab.lookup w id
                                    of SOME old =>
                                         if #1 old = #1 mark then NONE
@@ -818,8 +844,7 @@ fun update_cached_proof thy {id, hash} s =
                                     | NONE => NONE
                     in ((true, msg),
                         Symtab.update
-                          (name, (store_update_proof (id, r) c, true,
-                                  Symtab.update (id, mark) w)) tab')
+                          (name, (store_update_proof (id, r) c, Symtab.update (id, mark) w)) tab')
                    end
           end)
       val _ = case msg of SOME m => warning m | NONE => ()
@@ -828,7 +853,7 @@ fun update_cached_proof thy {id, hash} s =
 
 fun report_cache_is_outdated warn thy =
   if warn
-  then warning ("Proof cache for theory " ^ Context.theory_name {long=true} thy ^ " is outdated!")
+  then warning (#1 Kind.describe ^ " for theory " ^ Context.theory_name {long=true} thy ^ " is outdated!")
   else ()
 
 fun invalidate_proof_cache warn id thy =
@@ -839,7 +864,7 @@ fun invalidate_proof_cache warn id thy =
      in Symtab.map_entry (Context.theory_name {long=true} thy)
                          (*w survives: this is the very path a collision takes,
                            and a mark dropped here is evidence destroyed*)
-                         (fn (c, _, w) => (store_invalidate_proof id c, true, w)) tab'
+                         (fn (c, w) => (store_invalidate_proof id c, w)) tab'
     end);
   append_record thy (encode_tombstone id))
 
@@ -849,7 +874,7 @@ fun invalidate_proof_cache warn id thy =
 fun invalidate_proof_cache_by_hash h thy =
   Synchronized.change openning_stores
     (Symtab.map_entry (Context.theory_name {long=true} thy)
-       (fn (c, f, w) => (store_forget_hash h c, f, w)))
+       (fn (c, w) => (store_forget_hash h c, w)))
 
 (** Document_ID of each construct to detect if caches are invalid **)
 (*
@@ -971,3 +996,13 @@ val try_cached_proof_by_hash = try_cached_proof_by_hash_with_key (Hasher.goal_at
 fun try_cached_proof_by_hash_at i = try_cached_proof_by_hash_with_key (Hasher.goal_at i)
 
 end
+
+(*The proof store: the instance every existing caller knows, name, signature
+  and file unchanged.*)
+structure Phi_Proof_Store = Proof_Store (struct
+  val ext = "proof-store"
+  val migrates = true
+  val marks_writes = true
+  val describe = ("Proof cache", "cached proofs")
+  val switch = Attrib.setup_config_bool \<^binding>\<open>enable_proof_store\<close> (K true)
+end)
