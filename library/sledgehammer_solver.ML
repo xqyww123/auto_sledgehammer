@@ -1986,7 +1986,7 @@ fun replay_store k record {do_read, id, hash} (ctxt, sequent) =
 fun record_store {do_write, id, hash} ctxt (time, prf) =
   if do_write andalso not (Config.get ctxt hasty_mode)
   then Phi_Proof_Store.update_cached_proof (Proof_Context.theory_of ctxt)
-         {id = id, hash = SOME hash} (time, prf)
+         {id = id, hash = SOME hash, rewrites = false} (time, prf)
   else ()
 
 in

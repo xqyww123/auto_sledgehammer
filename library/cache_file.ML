@@ -210,7 +210,11 @@ val report_cache_is_outdated : bool (*whether warn*) -> theory -> unit
   file is untouched).*)
 val get_cached_proof : theory -> proof_id -> proof_cache option
 val get_cached_proof_by_hash : theory -> Hasher.digest -> proof_cache option
-val update_cached_proof : theory -> {id: proof_id, hash: Hasher.digest option} -> proof_cache -> unit
+(*rewrites = true: the writer rewrites its own key by design (a guard-cache
+  entry, whose verdict and delta change as decisions are made); a differing
+  earlier text under that id is then an update, not a collision, and the write
+  leaves no mark in the collision table.*)
+val update_cached_proof : theory -> {id: proof_id, hash: Hasher.digest option, rewrites: bool} -> proof_cache -> unit
 val invalidate_proof_cache : bool (*whether warn*) -> proof_id -> theory -> unit
 val invalidate_proof_cache_by_hash : Hasher.digest -> theory -> unit
 
@@ -667,7 +671,11 @@ fun compact_store thy =
    tombstone -> rewrite), so a mark kept in `proofs` would erase its own
    evidence and the collision count would be a constant zero.  Hence
    store_invalidate_proof, force_reload and invalidate_store all leave it
-   alone; close_store drops it, and that is precisely the session boundary. *)
+   alone; close_store drops it, at theory begin and at theory end, so a
+   session is one evaluation of the theory: the marks of an evaluation that
+   never reached its end (cancelled in PIDE) do not survive into the next.
+   A writer that rewrites its own key by design (rewrites = true) is neither
+   checked against this table nor marked in it. *)
 type written = (string * string * int) Symtab.table
   (*key -> SHA1 of the proof text, its leading characters, standard-machine wall
     ms (display only: collision detection compares the SHA1)*)
@@ -794,7 +802,7 @@ fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
   record passes it on unchanged.  Normalising here instead would double-divide
   the measuring callers, which (per the time-semantics rule) do it themselves
   before handing the record over.*)
-fun update_cached_proof thy {id, hash} s =
+fun update_cached_proof thy {id, hash, rewrites} s =
  (migrate_legacy thy;                                        (*D44: a write can be the first touch*)
   let val name = Context.theory_name {long=true} thy
       val mark = proof_mark s
@@ -811,15 +819,15 @@ fun update_cached_proof thy {id, hash} s =
               val live_and_identical = Symtab.lookup (#proofs c) id = SOME r
            in if live_and_identical
               then ((false, NONE), tab')
-              else let val msg = case Symtab.lookup w id
-                                   of SOME old =>
-                                        if #1 old = #1 mark then NONE
-                                        else SOME (collision_message id old mark)
-                                    | NONE => NONE
+              else let val msg = if rewrites then NONE
+                                 else (case Symtab.lookup w id
+                                         of SOME old =>
+                                              if #1 old = #1 mark then NONE
+                                              else SOME (collision_message id old mark)
+                                          | NONE => NONE)
+                       val w' = if rewrites then w else Symtab.update (id, mark) w
                     in ((true, msg),
-                        Symtab.update
-                          (name, (store_update_proof (id, r) c, true,
-                                  Symtab.update (id, mark) w)) tab')
+                        Symtab.update (name, (store_update_proof (id, r) c, true, w')) tab')
                    end
           end)
       val _ = case msg of SOME m => warning m | NONE => ()
@@ -905,6 +913,12 @@ val _ = Theory.setup (Theory.at_end (fn thy => (
     end
   ; NONE)))
 
+(* At theory begin, drop whatever an earlier evaluation of this theory left in
+   memory -- its store table and its collision marks: an evaluation cancelled
+   before its end never ran close_store, and its marks would otherwise pass for
+   this evaluation's writes.  The store reloads from the file on first use. *)
+val _ = Theory.setup (Theory.at_begin (fn thy => (close_store thy; NONE)))
+
 (* Guard the factor: timeout_scale is a user-settable real, and 0 (or a
    negative) would blow up or negate every stored time.  Both scalings are
    built from this one factor so they are inverses by construction; stock
@@ -928,7 +942,7 @@ fun update_cache_by_hash hash prf' (ctxt, sequent') =
           "Find proof (" ^ hash ^ ", " ^ string_of_times (fst prf') ^ "): " ^
            (if snd prf' = "" then "classical automation" else "\n" ^ snd prf')
        ) ; *)
-       update_cached_proof (Proof_Context.theory_of ctxt) {id = Hasher.hex hash, hash = SOME hash} prf' ;
+       update_cached_proof (Proof_Context.theory_of ctxt) {id = Hasher.hex hash, hash = SOME hash, rewrites = false} prf' ;
        (snd prf', sequent')) end
 
 type proof = string

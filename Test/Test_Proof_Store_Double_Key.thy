@@ -84,7 +84,7 @@ val _ = S.invalidate_store thy
 val hA = digest "goal A"
 
 (*4: the frame on disk carries the hash*)
-val _ = S.update_cached_proof thy {id = "k1", hash = SOME hA} (t1, "pA")
+val _ = S.update_cached_proof thy {id = "k1", hash = SOME hA, rewrites = false} (t1, "pA")
 val _ = assert (map #hash (puts_of "k1") = [SOME hA]) "test4 disk"
 
 (*5: both keys hit the same record*)
@@ -107,8 +107,8 @@ val _ = assert (S.get_cached_proof_by_hash thy hA = NONE) "test7 after compactio
 
 (*8: compaction keeps the hash field; 9: a record without one is reachable by id*)
 val hB = digest "goal B"
-val _ = S.update_cached_proof thy {id = "k2", hash = SOME hB} (t1, "pB")
-val _ = S.update_cached_proof thy {id = "k3", hash = NONE} (t1, "pC")
+val _ = S.update_cached_proof thy {id = "k2", hash = SOME hB, rewrites = false} (t1, "pB")
+val _ = S.update_cached_proof thy {id = "k3", hash = NONE, rewrites = false} (t1, "pC")
 val _ = S.compact_and_store thy
 val _ = assert (map #hash (puts_of "k2") = [SOME hB] andalso map #hash (puts_of "k3") = [NONE]) "test8 disk"
 val _ = S.force_reload thy
@@ -117,25 +117,25 @@ val _ = assert (S.get_cached_proof thy "k3" = SOME (t1, "pC")) "test9 id"
 
 (*10: one hash, two ids: the later write wins*)
 val hC = digest "goal C"
-val _ = S.update_cached_proof thy {id = "kA", hash = SOME hC} (t1, "pA1")
-val _ = S.update_cached_proof thy {id = "kB", hash = SOME hC} (t1, "pB1")
+val _ = S.update_cached_proof thy {id = "kA", hash = SOME hC, rewrites = false} (t1, "pA1")
+val _ = S.update_cached_proof thy {id = "kB", hash = SOME hC, rewrites = false} (t1, "pB1")
 val _ = assert (S.get_cached_proof_by_hash thy hC = SOME (t1, "pB1")) "test10"
 
 (*11: one id, one text, two hashes and two times: both hash entries stay*)
 val hD = digest "goal D"
 val hD' = digest "goal D'"
 val n11 = length (frames ())
-val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD} (t1, "pD")
-val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD'} (t2, "pD")
+val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD, rewrites = false} (t1, "pD")
+val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD', rewrites = false} (t2, "pD")
 val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t2, "pD")) "test11 h'"
 val _ = assert (S.get_cached_proof_by_hash thy hD = SOME (t1, "pD")) "test11 h"
 val _ = assert (length (frames ()) = n11 + 2) "test11 two frames"
 
 (*12: the identical write is short-circuited; 12b: a write that differs only
       in its time is not (ruling O covers the whole record)*)
-val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD'} (t2, "pD")
+val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD', rewrites = false} (t2, "pD")
 val _ = assert (length (frames ()) = n11 + 2) "test12 no frame"
-val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD'} (t3, "pD")
+val _ = S.update_cached_proof thy {id = "kD", hash = SOME hD', rewrites = false} (t3, "pD")
 val _ = assert (length (frames ()) = n11 + 3) "test12b time-only rewrite is a frame"
 val _ = assert (S.get_cached_proof_by_hash thy hD' = SOME (t3, "pD")) "test12b by_hash follows"
 
@@ -168,7 +168,7 @@ val _ = assert (S.get_cached_proof thy "x" = SOME (t1, "px")
 
 (*15: forgetting a hash touches neither the id nor the file*)
 val hF = digest "goal F"
-val _ = S.update_cached_proof thy {id = "kF", hash = SOME hF} (t1, "pF")
+val _ = S.update_cached_proof thy {id = "kF", hash = SOME hF, rewrites = false} (t1, "pF")
 val n15 = length (frames ())
 val _ = S.invalidate_proof_cache_by_hash hF thy
 val _ = assert (S.get_cached_proof_by_hash thy hF = NONE) "test15 hash gone"
@@ -207,7 +207,7 @@ val _ = S.invalidate_store thy
      then overwrites the forgotten hash entry*)
 val g16 = goal_of ctxt "(x::nat) + 0 = x"
 val h16 = Hasher.goal_at 1 (ctxt, g16)
-val _ = S.update_cached_proof thy {id = "other16", hash = SOME h16} (t1, "(fail)[1]")
+val _ = S.update_cached_proof thy {id = "other16", hash = SOME h16, rewrites = false} (t1, "(fail)[1]")
 val (txt16, st16) = run_auto {read = true, write = true} (SOME "K16") ctxt g16
 val _ = assert (Thm.no_prems st16) "test16 solved"
 val _ = assert (tombs_of "K16" = 0 andalso tombs_of "other16" = 0) "test16 no tombstone"
@@ -221,7 +221,7 @@ val _ = S.invalidate_store thy
       The preset has no hash while the call has one, so a stray promotion
       write would differ from it and could not be short-circuited.*)
 val g16b = goal_of ctxt "(w::nat) + 0 = w"
-val _ = S.update_cached_proof thy {id = "K16b", hash = NONE} (t1, "(simp)[1]")
+val _ = S.update_cached_proof thy {id = "K16b", hash = NONE, rewrites = false} (t1, "(simp)[1]")
 val n16b = length (frames ())
 val (txt16b, st16b) = run_auto {read = true, write = true} (SOME "K16b") ctxt g16b
 val _ = assert (txt16b = "(simp)[1]" andalso Thm.no_prems st16b) "test16b verbatim"
@@ -234,7 +234,7 @@ val _ = S.invalidate_store thy
       under both -- and write_store off writes nothing*)
 val g16c = goal_of ctxt "(v::nat) + 0 = v"
 val h16c = Hasher.goal_at 1 (ctxt, g16c)
-val _ = S.update_cached_proof thy {id = "K16c", hash = SOME h16c} (t1, "(simp)[1]")
+val _ = S.update_cached_proof thy {id = "K16c", hash = SOME h16c, rewrites = false} (t1, "(simp)[1]")
 val n16c = length (frames ())
 val (txt16c, st16c) = run_auto {read = false, write = false} (SOME "K16c") ctxt g16c
 val _ = assert (txt16c <> "(simp)[1]" andalso Thm.no_prems st16c) "test16c searched"
@@ -247,7 +247,7 @@ val _ = S.invalidate_store thy
      the hash and is forgotten; write_store off, so no PUT follows*)
 val g17 = goal_of ctxt "(y::nat) * 1 = y"
 val h17 = Hasher.goal_at 1 (ctxt, g17)
-val _ = S.update_cached_proof thy {id = "K17", hash = SOME h17} (t1, "(fail)[1]")
+val _ = S.update_cached_proof thy {id = "K17", hash = SOME h17, rewrites = false} (t1, "(fail)[1]")
 val (_, st17) = run_auto {read = true, write = false} (SOME "K17") ctxt g17
 val _ = assert (Thm.no_prems st17) "test17 solved"
 val _ = assert (tombs_of "K17" = 1 andalso length (puts_of "K17") = 1) "test17 tombstone, no PUT"
@@ -271,7 +271,7 @@ val _ = \<^try>\<open>ignore (Solver.eval_prf_str kws 1 (S.replay_limits t1) "(c
                  catch Solver.Auto_Fail _ => ()\<close>
 val per_replay = !replays
 val _ = assert (per_replay > 0) "test17b count_fail is reached"
-val _ = S.update_cached_proof thy {id = "K17b", hash = SOME h17b} (t1, "(count_fail)[1]")
+val _ = S.update_cached_proof thy {id = "K17b", hash = SOME h17b, rewrites = false} (t1, "(count_fail)[1]")
 val _ = replays := 0
 (*the search records another text under the preset id: the collision guard warns, as it should*)
 val (_, st17b) = run_auto {read = true, write = true} (SOME "K17b") ctxt g17b
@@ -288,7 +288,7 @@ val g18a = goal_of ctxt "(z::nat) + 0 = z"
 val g18b = goal_of ctxt "rev (rev (xs::nat list)) = xs"
 val p18 = "(rule rev_rev_ident)[1]"
 val h18b = Hasher.goal_at 1 (ctxt, g18b)
-val _ = S.update_cached_proof thy {id = "K18a", hash = SOME h18b} (t1, p18)
+val _ = S.update_cached_proof thy {id = "K18a", hash = SOME h18b, rewrites = false} (t1, p18)
 (*the search records another text under the preset id: the collision guard warns, as it should*)
 val (_, st18a) = run_auto {read = true, write = true} (SOME "K18a") ctxt g18a
 val _ = assert (Thm.no_prems st18a andalso tombs_of "K18a" = 1) "test18 first call"
@@ -306,8 +306,8 @@ val _ = S.invalidate_store thy
 val g19 = goal_of ctxt "rev (rev (ys::nat list)) = ys"
 val h19 = Hasher.goal_at 1 (ctxt, g19)
 val p19 = "(rule rev_rev_ident)[1]"
-val _ = S.update_cached_proof thy {id = "K19", hash = NONE} (t1, "(fail)[1]")
-val _ = S.update_cached_proof thy {id = "other19", hash = SOME h19} (t1, p19)
+val _ = S.update_cached_proof thy {id = "K19", hash = NONE, rewrites = false} (t1, "(fail)[1]")
+val _ = S.update_cached_proof thy {id = "other19", hash = SOME h19, rewrites = false} (t1, p19)
 (*the promotion rewrites K19 with another text: the collision guard warns, as it should*)
 val (txt19, st19) = run_auto {read = true, write = true} (SOME "K19") ctxt g19
 val _ = assert (txt19 = p19 andalso Thm.no_prems st19) "test19 verbatim"
@@ -328,7 +328,7 @@ val g19b = goal_of ctxt "(u::nat) + 0 = u & rev (rev (vs::nat list)) = vs"
 val _ = assert (Thm.nprems_of g19b = 2) "test19b two subgoals"
 val h19b = Hasher.all_goals (ctxt, g19b)
 val p19b = "((rule add_0_right)[1], (rule rev_rev_ident)[1])"
-val _ = S.update_cached_proof thy {id = "other19b", hash = SOME h19b} (t1, p19b)
+val _ = S.update_cached_proof thy {id = "other19b", hash = SOME h19b, rewrites = false} (t1, p19b)
 val n19b = length (frames ())
 val (fut19b, st19b) = Solver.all_auto (opts {read = true, write = false} (SOME "K19b")) ctxt g19b
 val (_, txt19b) = Future.join fut19b
@@ -337,7 +337,7 @@ val _ = assert (Thm.no_prems st19b) "test19b closed"
 val _ = assert (length (frames ()) = n19b) "test19b no frame"
 
 (*19c: all_auto's hit by id, handed back as it stands*)
-val _ = S.update_cached_proof thy {id = "K19c", hash = NONE} (t1, p19b)
+val _ = S.update_cached_proof thy {id = "K19c", hash = NONE, rewrites = false} (t1, p19b)
 val n19c = length (frames ())
 val (fut19c, st19c) = Solver.all_auto (opts {read = true, write = true} (SOME "K19c")) ctxt g19b
 val _ = assert (snd (Future.join fut19c) = p19b) "test19c verbatim"
