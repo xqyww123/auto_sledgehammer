@@ -352,58 +352,94 @@ ML \<open>
   is for a single-threaded stretch of a test*)
 fun capture_warnings f =
   let val got = Unsynchronized.ref ([] : string list)
-      val r = Unsynchronized.setmp Private_Output.warning_fn (fn outs => got := implode outs :: ! got) f ()
-   in (r, rev (! got)) end
+   in Unsynchronized.setmp Private_Output.warning_fn (fn outs => got := implode outs :: ! got) f ();
+      rev (! got)
+  end
 fun collision_warnings ws = filter (String.isPrefix "Proof store: ") ws
+fun four_lines id (old_ms, old_head) (new_ms, new_head) =
+  "Proof store: two different proofs were written under one proof id in this session.\n\
+  \  id: " ^ id ^ "\n\
+  \  first (" ^ string_of_int old_ms ^ " ms): " ^ old_head ^ "\n\
+  \  now (" ^ string_of_int new_ms ^ " ms): " ^ new_head
 (*the marks are a debugging aid: the store reads ML_debugger at each write, from
   the theory it is given, so the option is set on that value alone -- in both
   directions, since the process may have been started with it on*)
 val thy_dbg = Config.put_global ML_Options.debugger true thy
 val thy_off = Config.put_global ML_Options.debugger false thy
+fun write thy id rewrites (t, text) = S.update_cached_proof thy {id = id, hash = NONE, rewrites = rewrites} (t, text)
 
+(*close_store first: invalidate_store keeps this session's marks by design, and a
+  second evaluation of this block would otherwise meet the first one's*)
+val _ = S.close_store thy
 val _ = S.invalidate_store thy
 (*20: under ML_debugger, a second, different text under an id this session wrote
      warns, with exactly these four lines ...*)
-val (_, w20) = capture_warnings (fn () =>
+val w20 = capture_warnings (fn () =>
   (S.update_cached_proof thy_dbg {id = "K20", hash = NONE, rewrites = false} (t1, "pA");
    S.update_cached_proof thy_dbg {id = "K20", hash = NONE, rewrites = false} (t1, "pB")))
-val _ = assert (collision_warnings w20 =
-                ["Proof store: two different proofs were written under one proof id in this session.\n\
-                 \  id: K20\n\
-                 \  first (100 ms): pA\n\
-                 \  now (100 ms): pB"]) "test20 a differing write under a marked id warns, in four lines"
+val _ = assert (collision_warnings w20 = [four_lines "K20" (100, "pA") (100, "pB")])
+               "test20 a differing write under a marked id warns, in four lines"
 
 (*20b: ... unless the writer rewrites its own key by design: such writes neither
       warn nor mark, so a later rewrites = false write of yet another text under
       that id finds no mark and stays silent*)
-val (_, w20b) = capture_warnings (fn () =>
-  (S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = true} (t1, "pA");
-   S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = true} (t1, "pB");
-   S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = false} (t1, "pC")))
+val w20b = capture_warnings (fn () =>
+  (write thy_dbg "K20b" true (t1, "pA"); write thy_dbg "K20b" true (t1, "pB");
+   write thy_dbg "K20b" false (t1, "pC")))
 val _ = assert (null (collision_warnings w20b)) "test20b rewrites = true neither warns nor marks"
 val _ = assert (S.get_cached_proof thy "K20b" = SOME (t1, "pC")) "test20b the last write stands"
 
 (*20c: without ML_debugger nothing is marked and nothing warns, whatever is written*)
-val (_, w20c) = capture_warnings (fn () =>
-  (S.update_cached_proof thy_off {id = "K20c", hash = NONE, rewrites = false} (t1, "pA");
-   S.update_cached_proof thy_off {id = "K20c", hash = NONE, rewrites = false} (t1, "pB");
-   S.update_cached_proof thy_dbg {id = "K20c", hash = NONE, rewrites = false} (t1, "pC")))
+val w20c = capture_warnings (fn () =>
+  (write thy_off "K20c" false (t1, "pA"); write thy_off "K20c" false (t1, "pB");
+   write thy_dbg "K20c" false (t1, "pC")))
 val _ = assert (null (collision_warnings w20c)) "test20c no marks without ML_debugger"
 
 (*20d: the same text again, at another time, is not a collision: the digest of the
       text is what is compared*)
-val (_, w20d) = capture_warnings (fn () =>
-  (S.update_cached_proof thy_dbg {id = "K20d", hash = NONE, rewrites = false} (t1, "pA");
-   S.update_cached_proof thy_dbg {id = "K20d", hash = NONE, rewrites = false} (t2, "pA")))
+val w20d = capture_warnings (fn () =>
+  (write thy_dbg "K20d" false (t1, "pA"); write thy_dbg "K20d" false (t2, "pA")))
 val _ = assert (null (collision_warnings w20d)) "test20d the same text at another time is silent"
 
-(*20e: a rewriting write in between leaves the mark alone: the third write finds the
-      first one's mark, the same text, and stays silent*)
-val (_, w20e) = capture_warnings (fn () =>
-  (S.update_cached_proof thy_dbg {id = "K20e", hash = NONE, rewrites = false} (t1, "pA");
-   S.update_cached_proof thy_dbg {id = "K20e", hash = NONE, rewrites = true} (t1, "pB");
-   S.update_cached_proof thy_dbg {id = "K20e", hash = NONE, rewrites = false} (t1, "pA")))
-val _ = assert (null (collision_warnings w20e)) "test20e a rewriting write does not move the mark"
+(*20e: a rewriting write in between neither moves the mark nor clears it: the third
+      write, a third text, is still measured against the FIRST one*)
+val w20e = capture_warnings (fn () =>
+  (write thy_dbg "K20e" false (t1, "pA"); write thy_dbg "K20e" true (t1, "pB");
+   write thy_dbg "K20e" false (t1, "pC")))
+val _ = assert (collision_warnings w20e = [four_lines "K20e" (100, "pA") (100, "pC")])
+               "test20e a rewriting write neither moves nor clears the mark"
+
+(*20f: the mark outlives its record through a tombstone -- why `written` is not
+      derived from `proofs`*)
+val w20f = capture_warnings (fn () =>
+  (write thy_dbg "K20f" false (t1, "pA"); S.invalidate_proof_cache false "K20f" thy;
+   write thy_dbg "K20f" false (t1, "pB")))
+val _ = assert (collision_warnings w20f = [four_lines "K20f" (100, "pA") (100, "pB")])
+               "test20f the mark outlives the tombstoned record"
+
+(*20g: re-reading the file says nothing about what this session wrote*)
+val w20g = capture_warnings (fn () =>
+  (write thy_dbg "K20g" false (t1, "pA"); ignore (S.force_reload thy);
+   write thy_dbg "K20g" false (t1, "pB")))
+val _ = assert (not (null (collision_warnings w20g))) "test20g the mark survives a reload"
+
+(*20h: two texts with one head -- the first 120 symbols, a newline among them
+      rendered as a space -- still collide: the digest is compared, the head only
+      shown, as one line*)
+val long_a = "a,\n" ^ replicate_string 200 "b" ^ "A"
+val long_b = "a,\n" ^ replicate_string 200 "b" ^ "B"
+val head_ab = "a, " ^ replicate_string 117 "b" ^ " ..."
+val w20h = capture_warnings (fn () =>
+  (write thy_dbg "K20h" false (t1, long_a); write thy_dbg "K20h" false (t1, long_b)))
+val _ = assert (collision_warnings w20h = [four_lines "K20h" (100, head_ab) (100, head_ab)])
+               "test20h two texts with one head collide, and the head is one line"
+
+(*20i, last, since it removes the file the frame assertions scan: dropping the data
+      does not un-write what this session wrote*)
+val w20i = capture_warnings (fn () =>
+  (write thy_dbg "K20i" false (t1, "pA"); S.invalidate_store thy;
+   write thy_dbg "K20i" false (t1, "pB")))
+val _ = assert (not (null (collision_warnings w20i))) "test20i the mark survives invalidate_store"
 \<close>
 
 end

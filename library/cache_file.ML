@@ -673,24 +673,29 @@ fun compact_store thy =
    evidence and the collision count would be a constant zero.  Hence
    store_invalidate_proof, force_reload and invalidate_store all leave it
    alone; close_store drops it whenever the theory is begun again in this
-   process (a re-executed header, a changed import, a reload, a batch load)
-   and at theory end.  A PIDE evaluation cancelled mid-theory and resumed
-   does not begin the theory again, so one stale mark can survive there and
-   cost at most one spurious warning.  A write that leaves the live record
-   byte-identical installs nothing, and marks nothing either.
-   A writer that rewrites its own key by design (rewrites = true) is neither
-   checked against this table nor marked in it.  The whole mechanism is a
-   debugging aid for the key mint and runs only under ML_debugger, read at
-   each write: a normal build computes no digest and keeps no marks. *)
-type written = (Hasher.digest * string * int) Symtab.table
-  (*key -> the digest of the proof text, its leading characters, standard-machine
-    wall ms (display only: collision detection compares the digest)*)
+   process (a re-executed header, a changed import, a reload) and at theory
+   end.  A PIDE evaluation cancelled mid-theory and resumed does not begin
+   the theory again, so one stale mark can survive there and cost at most
+   one spurious warning.
 
+   A write that leaves the live record byte-identical installs nothing, and
+   marks nothing either.  A writer that rewrites its own key by design
+   (rewrites = true) is neither checked against this table nor marked in it.
+
+   The whole mechanism is a debugging aid for the key mint and runs only
+   under ML_debugger, read at each write: a normal build computes no digest
+   and keeps no marks. *)
+type mark = {digest: Hasher.digest, head: string, ms: int}
+  (*ms: standard-machine wall time, display only, like head*)
+type written = mark Symtab.table
+
+(*the head is the text's beginning with its blanks rendered as single spaces,
+  so the warning stays four lines on the multi-part texts the solver composes*)
 val proof_head_len = 120
-fun proof_mark (t : times, text) =
-  (Hasher.string text,
-   Symbol.beginning proof_head_len (Symbol.explode text),
-   Time.toMilliseconds (#wall t))
+fun proof_mark (t : times, text) : mark =
+  {digest = Hasher.string text,
+   head = Symbol.beginning proof_head_len (Symbol.explode text),
+   ms = Time.toMilliseconds (#wall t)}
 
 fun written_of tab name =
   case Symtab.lookup tab name of SOME (_, _, w) => w | NONE => Symtab.empty
@@ -780,21 +785,22 @@ fun get_cached_proof thy id =
 
 fun get_cached_proof_by_hash thy h = Hasher.Tab.lookup (#by_hash (get_store thy)) h
 
-fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
+fun collision_message id (old : mark) (new : mark) =
   "Proof store: two different proofs were written under one proof id in this session.\n\
   \  id: " ^ id ^ "\n\
-  \  first (" ^ string_of_int old_ms ^ " ms): " ^ old_head ^ "\n\
-  \  now (" ^ string_of_int new_ms ^ " ms): " ^ new_head
+  \  first (" ^ string_of_int (#ms old) ^ " ms): " ^ #head old ^ "\n\
+  \  now (" ^ string_of_int (#ms new) ^ " ms): " ^ #head new
 
-(*This guard cannot stop a key collision, only make the write that produces one
-  say so on the spot, instead of leaving it to surface days later in another
-  theory as an unexplained replay failure.  It sits at the single point every
-  writer goes through, so it also sees the writers that a Post_App probe hook
-  structurally cannot (holds_fact, led_future_proof).
+(*The collision marks cannot stop a key collision, only make the write that
+  produces one say so on the spot, instead of leaving it to surface days later
+  in another theory as an unexplained replay failure.  They sit at the single
+  point every writer goes through, so they also see the writers that a Post_App
+  probe hook structurally cannot (holds_fact, led_future_proof).
 
-  Its two questions go to two different tables on purpose -- the reasons are
-  with the declaration of `written` above.  The skip half additionally drops the
-  benign duplicate appends of the rw_access retry path.
+  update_cached_proof asks two questions of two different tables on purpose --
+  the reasons are with the declaration of `written` above.  The byte-identical
+  skip additionally drops the benign duplicate appends of the rw_access retry
+  path.
 
   The time in `s` must ALREADY be standard-machine time: a caller that MEASURED
   it passes it through standard_time first, a caller that COPIES a stored
@@ -824,7 +830,7 @@ fun update_cached_proof thy {id, hash, rewrites} s =
               then ((false, NONE), tab')
               else let val msg = case (mark, Symtab.lookup w id)
                                    of (SOME m, SOME old) =>
-                                        if #1 old = #1 m then NONE
+                                        if #digest old = #digest m then NONE
                                         else SOME (collision_message id old m)
                                     | _ => NONE
                        val w' = case mark of SOME m => Symtab.update (id, m) w | NONE => w
