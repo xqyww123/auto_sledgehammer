@@ -273,7 +273,7 @@ val per_replay = !replays
 val _ = assert (per_replay > 0) "test17b count_fail is reached"
 val _ = S.update_cached_proof thy {id = "K17b", hash = SOME h17b, rewrites = false} (t1, "(count_fail)[1]")
 val _ = replays := 0
-(*the search records another text under the preset id: the collision guard warns, as it should*)
+(*the search records another text under the preset id (the collision marks, under ML_debugger, would say so: test 20)*)
 val (_, st17b) = run_auto {read = true, write = true} (SOME "K17b") ctxt g17b
 val _ = assert (Thm.no_prems st17b) "test17b solved"
 val _ = assert (!replays = per_replay) ("test17b replayed once, not twice: " ^ string_of_int (!replays))
@@ -289,7 +289,7 @@ val g18b = goal_of ctxt "rev (rev (xs::nat list)) = xs"
 val p18 = "(rule rev_rev_ident)[1]"
 val h18b = Hasher.goal_at 1 (ctxt, g18b)
 val _ = S.update_cached_proof thy {id = "K18a", hash = SOME h18b, rewrites = false} (t1, p18)
-(*the search records another text under the preset id: the collision guard warns, as it should*)
+(*the search records another text under the preset id (the collision marks, under ML_debugger, would say so: test 20)*)
 val (_, st18a) = run_auto {read = true, write = true} (SOME "K18a") ctxt g18a
 val _ = assert (Thm.no_prems st18a andalso tombs_of "K18a" = 1) "test18 first call"
 val (txt18, st18b) = run_auto {read = true, write = true} (SOME "K18b") ctxt g18b
@@ -308,7 +308,7 @@ val h19 = Hasher.goal_at 1 (ctxt, g19)
 val p19 = "(rule rev_rev_ident)[1]"
 val _ = S.update_cached_proof thy {id = "K19", hash = NONE, rewrites = false} (t1, "(fail)[1]")
 val _ = S.update_cached_proof thy {id = "other19", hash = SOME h19, rewrites = false} (t1, p19)
-(*the promotion rewrites K19 with another text: the collision guard warns, as it should*)
+(*the promotion rewrites K19 with another text (the collision marks, under ML_debugger, would say so: test 20)*)
 val (txt19, st19) = run_auto {read = true, write = true} (SOME "K19") ctxt g19
 val _ = assert (txt19 = p19 andalso Thm.no_prems st19) "test19 verbatim"
 val _ = assert (tombs_of "K19" = 1 andalso map #hash (puts_of "K19") = [NONE, SOME h19]) "test19 frames"
@@ -358,23 +358,33 @@ fun capture_warnings f =
       val _ = Private_Output.warning_fn := saved
    in (Exn.release r, rev (! got)) end
 fun collision_warned ws = exists (String.isPrefix "Proof store: ") ws
+(*the marks are a debugging aid: the store reads ML_debugger at each write, from
+  the theory it is given, so the option is set on that value alone*)
+val thy_dbg = Config.put_global ML_Options.debugger true thy
 
 val _ = S.invalidate_store thy
-(*20: a second, different text under an id this session wrote warns ...*)
+(*20: under ML_debugger, a second, different text under an id this session wrote warns ...*)
 val (_, w20) = capture_warnings (fn () =>
-  (S.update_cached_proof thy {id = "K20", hash = NONE, rewrites = false} (t1, "pA");
-   S.update_cached_proof thy {id = "K20", hash = NONE, rewrites = false} (t1, "pB")))
+  (S.update_cached_proof thy_dbg {id = "K20", hash = NONE, rewrites = false} (t1, "pA");
+   S.update_cached_proof thy_dbg {id = "K20", hash = NONE, rewrites = false} (t1, "pB")))
 val _ = assert (collision_warned w20) "test20 a differing write under a marked id warns"
 
 (*20b: ... unless the writer rewrites its own key by design: such writes neither
       warn nor mark, so a later rewrites = false write of yet another text under
       that id finds no mark and stays silent*)
 val (_, w20b) = capture_warnings (fn () =>
-  (S.update_cached_proof thy {id = "K20b", hash = NONE, rewrites = true} (t1, "pA");
-   S.update_cached_proof thy {id = "K20b", hash = NONE, rewrites = true} (t1, "pB");
-   S.update_cached_proof thy {id = "K20b", hash = NONE, rewrites = false} (t1, "pC")))
+  (S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = true} (t1, "pA");
+   S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = true} (t1, "pB");
+   S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = false} (t1, "pC")))
 val _ = assert (not (collision_warned w20b)) "test20b rewrites = true neither warns nor marks"
 val _ = assert (S.get_cached_proof thy "K20b" = SOME (t1, "pC")) "test20b the last write stands"
+
+(*20c: without ML_debugger nothing is marked and nothing warns, whatever is written*)
+val (_, w20c) = capture_warnings (fn () =>
+  (S.update_cached_proof thy {id = "K20c", hash = NONE, rewrites = false} (t1, "pA");
+   S.update_cached_proof thy {id = "K20c", hash = NONE, rewrites = false} (t1, "pB");
+   S.update_cached_proof thy_dbg {id = "K20c", hash = NONE, rewrites = false} (t1, "pC")))
+val _ = assert (not (collision_warned w20c)) "test20c no marks without ML_debugger"
 \<close>
 
 end

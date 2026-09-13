@@ -213,7 +213,8 @@ val get_cached_proof_by_hash : theory -> Hasher.digest -> proof_cache option
 (*rewrites = true: the writer rewrites its own key by design (a guard-cache
   entry, whose verdict and delta change as decisions are made); a differing
   earlier text under that id is then an update, not a collision, and the write
-  leaves no mark in the collision table.*)
+  leaves no mark in the collision table.  The collision table itself is kept
+  only under ML_debugger (see `written` below).*)
 val update_cached_proof : theory -> {id: proof_id, hash: Hasher.digest option, rewrites: bool} -> proof_cache -> unit
 val invalidate_proof_cache : bool (*whether warn*) -> proof_id -> theory -> unit
 val invalidate_proof_cache_by_hash : Hasher.digest -> theory -> unit
@@ -675,7 +676,9 @@ fun compact_store thy =
    session is one evaluation of the theory: the marks of an evaluation that
    never reached its end (cancelled in PIDE) do not survive into the next.
    A writer that rewrites its own key by design (rewrites = true) is neither
-   checked against this table nor marked in it. *)
+   checked against this table nor marked in it.  The whole mechanism is a
+   debugging aid for the key mint and runs only under ML_debugger, read at
+   each write: a normal build computes no digest and keeps no marks. *)
 type written = (Hasher.digest * string * int) Symtab.table
   (*key -> the digest of the proof text, its leading characters, standard-machine
     wall ms (display only: collision detection compares the digest)*)
@@ -778,14 +781,10 @@ fun get_cached_proof thy id =
 fun get_cached_proof_by_hash thy h = Hasher.Tab.lookup (#by_hash (get_store thy)) h
 
 fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
-  "Proof store: this session has written two DIFFERENT proofs under one key.\n\
-  \  key: " ^ id ^ "\n\
+  "Proof store: two different proofs were written under one proof id in this session.\n\
+  \  id: " ^ id ^ "\n\
   \  first (" ^ string_of_int old_ms ^ " ms): " ^ old_head ^ "\n\
-  \  now replaced by (" ^ string_of_int new_ms ^ " ms): " ^ new_head ^ "\n\
-  \Two proof obligations share one proof id.  The first proof is gone, and \
-  \whichever of the two obligations next meets the survivor will fail to replay \
-  \it -- with the AoA gate shut, that is a failed build.  \
-  \See PROOF_ID_COLLISION_FIX_PLAN.md."
+  \  now (" ^ string_of_int new_ms ^ " ms): " ^ new_head
 
 (*This guard cannot stop a key collision, only make the build that produces one
   say so on the spot, instead of leaving it to surface days later in another
@@ -805,7 +804,11 @@ fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
 fun update_cached_proof thy {id, hash, rewrites} s =
  (migrate_legacy thy;                                        (*D44: a write can be the first touch*)
   let val name = Context.theory_name {long=true} thy
-      val mark = proof_mark s
+      (*the collision marks are a debugging aid: computed, kept and compared
+        only under ML_debugger -- its value at the time of this write -- and
+        never for a writer that rewrites its own key*)
+      val mark = if rewrites orelse not (Config.get_global thy ML_Options.debugger) then NONE
+                 else SOME (proof_mark s)
       val r = {hash = hash, time = #1 s, proof = #2 s} : proof_record
       (*The message is built inside the critical section but emitted outside it:
         output synchronises on its own, and this section already serialises the
@@ -819,13 +822,12 @@ fun update_cached_proof thy {id, hash, rewrites} s =
               val live_and_identical = Symtab.lookup (#proofs c) id = SOME r
            in if live_and_identical
               then ((false, NONE), tab')
-              else let val msg = if rewrites then NONE
-                                 else (case Symtab.lookup w id
-                                         of SOME old =>
-                                              if #1 old = #1 mark then NONE
-                                              else SOME (collision_message id old mark)
-                                          | NONE => NONE)
-                       val w' = if rewrites then w else Symtab.update (id, mark) w
+              else let val msg = case (mark, Symtab.lookup w id)
+                                   of (SOME m, SOME old) =>
+                                        if #1 old = #1 m then NONE
+                                        else SOME (collision_message id old m)
+                                    | _ => NONE
+                       val w' = case mark of SOME m => Symtab.update (id, m) w | NONE => w
                     in ((true, msg),
                         Symtab.update (name, (store_update_proof (id, r) c, true, w')) tab')
                    end
