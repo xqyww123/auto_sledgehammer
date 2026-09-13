@@ -676,14 +676,14 @@ fun compact_store thy =
    never reached its end (cancelled in PIDE) do not survive into the next.
    A writer that rewrites its own key by design (rewrites = true) is neither
    checked against this table nor marked in it. *)
-type written = (string * string * int) Symtab.table
-  (*key -> SHA1 of the proof text, its leading characters, standard-machine wall
-    ms (display only: collision detection compares the SHA1)*)
+type written = (Hasher.digest * string * int) Symtab.table
+  (*key -> the digest of the proof text, its leading characters, standard-machine
+    wall ms (display only: collision detection compares the digest)*)
 
 val proof_head_len = 120
 fun proof_mark (t : times, text) =
   let val syms = Symbol.explode text
-   in (SHA1.rep (SHA1.digest text),
+   in (Hasher.string text,
        if length syms <= proof_head_len then text
        else String.concat (take proof_head_len syms) ^ " ...",
        Time.toMilliseconds (#wall t))

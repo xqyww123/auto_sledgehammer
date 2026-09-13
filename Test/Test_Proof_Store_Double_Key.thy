@@ -345,4 +345,36 @@ val _ = assert (Thm.no_prems st19c) "test19c closed"
 val _ = assert (length (frames ()) = n19c) "test19c no frame"
 \<close>
 
+section \<open>The collision marks: test 20\<close>
+
+ML \<open>
+(*warnings printed while f runs, in order; the hook is process-global, so this
+  is for a single-threaded stretch of a test*)
+fun capture_warnings f =
+  let val saved = ! Private_Output.warning_fn
+      val got = Unsynchronized.ref ([] : string list)
+      val _ = Private_Output.warning_fn := (fn outs => got := implode outs :: ! got)
+      val r = Exn.capture_body f
+      val _ = Private_Output.warning_fn := saved
+   in (Exn.release r, rev (! got)) end
+fun collision_warned ws = exists (String.isPrefix "Proof store: ") ws
+
+val _ = S.invalidate_store thy
+(*20: a second, different text under an id this session wrote warns ...*)
+val (_, w20) = capture_warnings (fn () =>
+  (S.update_cached_proof thy {id = "K20", hash = NONE, rewrites = false} (t1, "pA");
+   S.update_cached_proof thy {id = "K20", hash = NONE, rewrites = false} (t1, "pB")))
+val _ = assert (collision_warned w20) "test20 a differing write under a marked id warns"
+
+(*20b: ... unless the writer rewrites its own key by design: such writes neither
+      warn nor mark, so a later rewrites = false write of yet another text under
+      that id finds no mark and stays silent*)
+val (_, w20b) = capture_warnings (fn () =>
+  (S.update_cached_proof thy {id = "K20b", hash = NONE, rewrites = true} (t1, "pA");
+   S.update_cached_proof thy {id = "K20b", hash = NONE, rewrites = true} (t1, "pB");
+   S.update_cached_proof thy {id = "K20b", hash = NONE, rewrites = false} (t1, "pC")))
+val _ = assert (not (collision_warned w20b)) "test20b rewrites = true neither warns nor marks"
+val _ = assert (S.get_cached_proof thy "K20b" = SOME (t1, "pC")) "test20b the last write stands"
+\<close>
+
 end
