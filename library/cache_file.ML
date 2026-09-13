@@ -213,8 +213,8 @@ val get_cached_proof_by_hash : theory -> Hasher.digest -> proof_cache option
 (*rewrites = true: the writer rewrites its own key by design (a guard-cache
   entry, whose verdict and delta change as decisions are made); a differing
   earlier text under that id is then an update, not a collision, and the write
-  leaves no mark in the collision table.  The collision table itself is kept
-  only under ML_debugger (see `written` below).*)
+  leaves no collision mark.  Marks are computed only under ML_debugger (see
+  `written` below).*)
 val update_cached_proof : theory -> {id: proof_id, hash: Hasher.digest option, rewrites: bool} -> proof_cache -> unit
 val invalidate_proof_cache : bool (*whether warn*) -> proof_id -> theory -> unit
 val invalidate_proof_cache_by_hash : Hasher.digest -> theory -> unit
@@ -672,9 +672,12 @@ fun compact_store thy =
    tombstone -> rewrite), so a mark kept in `proofs` would erase its own
    evidence and the collision count would be a constant zero.  Hence
    store_invalidate_proof, force_reload and invalidate_store all leave it
-   alone; close_store drops it, at theory begin and at theory end, so a
-   session is one evaluation of the theory: the marks of an evaluation that
-   never reached its end (cancelled in PIDE) do not survive into the next.
+   alone; close_store drops it whenever the theory is begun again in this
+   process (a re-executed header, a changed import, a reload, a batch load)
+   and at theory end.  A PIDE evaluation cancelled mid-theory and resumed
+   does not begin the theory again, so one stale mark can survive there and
+   cost at most one spurious warning.  A write that leaves the live record
+   byte-identical installs nothing, and marks nothing either.
    A writer that rewrites its own key by design (rewrites = true) is neither
    checked against this table nor marked in it.  The whole mechanism is a
    debugging aid for the key mint and runs only under ML_debugger, read at
@@ -685,12 +688,9 @@ type written = (Hasher.digest * string * int) Symtab.table
 
 val proof_head_len = 120
 fun proof_mark (t : times, text) =
-  let val syms = Symbol.explode text
-   in (Hasher.string text,
-       if length syms <= proof_head_len then text
-       else String.concat (take proof_head_len syms) ^ " ...",
-       Time.toMilliseconds (#wall t))
-  end
+  (Hasher.string text,
+   Symbol.beginning proof_head_len (Symbol.explode text),
+   Time.toMilliseconds (#wall t))
 
 fun written_of tab name =
   case Symtab.lookup tab name of SOME (_, _, w) => w | NONE => Symtab.empty
@@ -786,7 +786,7 @@ fun collision_message id (_, old_head, old_ms) (_, new_head, new_ms) =
   \  first (" ^ string_of_int old_ms ^ " ms): " ^ old_head ^ "\n\
   \  now (" ^ string_of_int new_ms ^ " ms): " ^ new_head
 
-(*This guard cannot stop a key collision, only make the build that produces one
+(*This guard cannot stop a key collision, only make the write that produces one
   say so on the spot, instead of leaving it to surface days later in another
   theory as an unexplained replay failure.  It sits at the single point every
   writer goes through, so it also sees the writers that a Post_App probe hook
@@ -915,10 +915,11 @@ val _ = Theory.setup (Theory.at_end (fn thy => (
     end
   ; NONE)))
 
-(* At theory begin, drop whatever an earlier evaluation of this theory left in
-   memory -- its store table and its collision marks: an evaluation cancelled
-   before its end never ran close_store, and its marks would otherwise pass for
-   this evaluation's writes.  The store reloads from the file on first use. *)
+(* When a theory is begun again in this process, drop whatever its earlier
+   evaluation left in memory -- its store table and its collision marks -- so
+   that they do not pass for this evaluation's; the store reloads from the file
+   on first use.  (A PIDE evaluation cancelled mid-theory and resumed does not
+   begin the theory again: see `written`.) *)
 val _ = Theory.setup (Theory.at_begin (fn thy => (close_store thy; NONE)))
 
 (* Guard the factor: timeout_scale is a user-settable real, and 0 (or a

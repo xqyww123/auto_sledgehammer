@@ -351,23 +351,27 @@ ML \<open>
 (*warnings printed while f runs, in order; the hook is process-global, so this
   is for a single-threaded stretch of a test*)
 fun capture_warnings f =
-  let val saved = ! Private_Output.warning_fn
-      val got = Unsynchronized.ref ([] : string list)
-      val _ = Private_Output.warning_fn := (fn outs => got := implode outs :: ! got)
-      val r = Exn.capture_body f
-      val _ = Private_Output.warning_fn := saved
-   in (Exn.release r, rev (! got)) end
-fun collision_warned ws = exists (String.isPrefix "Proof store: ") ws
+  let val got = Unsynchronized.ref ([] : string list)
+      val r = Unsynchronized.setmp Private_Output.warning_fn (fn outs => got := implode outs :: ! got) f ()
+   in (r, rev (! got)) end
+fun collision_warnings ws = filter (String.isPrefix "Proof store: ") ws
 (*the marks are a debugging aid: the store reads ML_debugger at each write, from
-  the theory it is given, so the option is set on that value alone*)
+  the theory it is given, so the option is set on that value alone -- in both
+  directions, since the process may have been started with it on*)
 val thy_dbg = Config.put_global ML_Options.debugger true thy
+val thy_off = Config.put_global ML_Options.debugger false thy
 
 val _ = S.invalidate_store thy
-(*20: under ML_debugger, a second, different text under an id this session wrote warns ...*)
+(*20: under ML_debugger, a second, different text under an id this session wrote
+     warns, with exactly these four lines ...*)
 val (_, w20) = capture_warnings (fn () =>
   (S.update_cached_proof thy_dbg {id = "K20", hash = NONE, rewrites = false} (t1, "pA");
    S.update_cached_proof thy_dbg {id = "K20", hash = NONE, rewrites = false} (t1, "pB")))
-val _ = assert (collision_warned w20) "test20 a differing write under a marked id warns"
+val _ = assert (collision_warnings w20 =
+                ["Proof store: two different proofs were written under one proof id in this session.\n\
+                 \  id: K20\n\
+                 \  first (100 ms): pA\n\
+                 \  now (100 ms): pB"]) "test20 a differing write under a marked id warns, in four lines"
 
 (*20b: ... unless the writer rewrites its own key by design: such writes neither
       warn nor mark, so a later rewrites = false write of yet another text under
@@ -376,15 +380,30 @@ val (_, w20b) = capture_warnings (fn () =>
   (S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = true} (t1, "pA");
    S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = true} (t1, "pB");
    S.update_cached_proof thy_dbg {id = "K20b", hash = NONE, rewrites = false} (t1, "pC")))
-val _ = assert (not (collision_warned w20b)) "test20b rewrites = true neither warns nor marks"
+val _ = assert (null (collision_warnings w20b)) "test20b rewrites = true neither warns nor marks"
 val _ = assert (S.get_cached_proof thy "K20b" = SOME (t1, "pC")) "test20b the last write stands"
 
 (*20c: without ML_debugger nothing is marked and nothing warns, whatever is written*)
 val (_, w20c) = capture_warnings (fn () =>
-  (S.update_cached_proof thy {id = "K20c", hash = NONE, rewrites = false} (t1, "pA");
-   S.update_cached_proof thy {id = "K20c", hash = NONE, rewrites = false} (t1, "pB");
+  (S.update_cached_proof thy_off {id = "K20c", hash = NONE, rewrites = false} (t1, "pA");
+   S.update_cached_proof thy_off {id = "K20c", hash = NONE, rewrites = false} (t1, "pB");
    S.update_cached_proof thy_dbg {id = "K20c", hash = NONE, rewrites = false} (t1, "pC")))
-val _ = assert (not (collision_warned w20c)) "test20c no marks without ML_debugger"
+val _ = assert (null (collision_warnings w20c)) "test20c no marks without ML_debugger"
+
+(*20d: the same text again, at another time, is not a collision: the digest of the
+      text is what is compared*)
+val (_, w20d) = capture_warnings (fn () =>
+  (S.update_cached_proof thy_dbg {id = "K20d", hash = NONE, rewrites = false} (t1, "pA");
+   S.update_cached_proof thy_dbg {id = "K20d", hash = NONE, rewrites = false} (t2, "pA")))
+val _ = assert (null (collision_warnings w20d)) "test20d the same text at another time is silent"
+
+(*20e: a rewriting write in between leaves the mark alone: the third write finds the
+      first one's mark, the same text, and stays silent*)
+val (_, w20e) = capture_warnings (fn () =>
+  (S.update_cached_proof thy_dbg {id = "K20e", hash = NONE, rewrites = false} (t1, "pA");
+   S.update_cached_proof thy_dbg {id = "K20e", hash = NONE, rewrites = true} (t1, "pB");
+   S.update_cached_proof thy_dbg {id = "K20e", hash = NONE, rewrites = false} (t1, "pA")))
+val _ = assert (null (collision_warnings w20e)) "test20e a rewriting write does not move the mark"
 \<close>
 
 end
