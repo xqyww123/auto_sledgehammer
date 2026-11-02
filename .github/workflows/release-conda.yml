@@ -1,10 +1,13 @@
 # Release this repo as the conda package `auto-sledgehammer` on
 # https://conda.qiyuan.me.
 #
-# This repo owns its own release: bump ./VERSION, push a `v*` tag, done.  The only thing
-# it does not own is the R2 publish step, which is shared with every other Isabelle conda
-# package via a reusable workflow in xqyww123/isabelle-packaging-ci -- so the
-# channel-indexing rules exist in exactly one place.
+# Releasing: the SKILL conda-release.  Changing this workflow or its recipe:
+# PACKAGING_RULES.md.  Both are in xqyww123/isabelle-packaging-ci.
+#
+# This repo owns its own release.  The only thing it does not own is the R2 publish
+# step, which is shared with every other Isabelle conda package via a reusable workflow
+# in xqyww123/isabelle-packaging-ci -- so the channel-indexing rules exist in exactly
+# one place.
 #
 # The R2 CREDENTIALS cannot be centralised the same way: a reusable workflow receives the
 # CALLING repo's secrets, and a personal account has no org-level secrets.  They must be
