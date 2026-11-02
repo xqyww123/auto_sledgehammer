@@ -37,6 +37,9 @@ jobs:
     name: "Build auto-sledgehammer (noarch)"
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Step outputs do not cross jobs; `smoke` reads the version through this.
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -188,11 +191,13 @@ jobs:
           set -euo pipefail
           # Unlike the base repo we have no local `isabelle` artifact to solve against, so
           # the run dependency comes from the published channel while the package under
-          # test comes from the local one.  --override-channels pins the channel list
-          # exactly; conda-forge is in it because isabelle run-depends on python from there.
+          # test comes from the local one -- named with it, because by bare name conda
+          # silently installs the published build whenever this one cannot be solved.
+          # --override-channels pins the channel list exactly; conda-forge is in it because
+          # isabelle run-depends on python from there.
           conda create -y -n v \
             -c "file://$CH" -c https://conda.qiyuan.me -c conda-forge --override-channels \
-            auto-sledgehammer
+            "file://$CH::auto-sledgehammer"
           conda activate v
           conda list isabelle
 
@@ -248,7 +253,7 @@ jobs:
   # isabelle-packaging-ci's smoke-logic-probe.
   smoke:
     name: "Smoke: conda install from conda.qiyuan.me (${{ matrix.os }})"
-    needs: publish
+    needs: [build, publish]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -268,9 +273,11 @@ jobs:
       - name: "conda install -c https://conda.qiyuan.me auto-sledgehammer"
         run: |
           set -euo pipefail
+          # Pinned to the build just published: by bare name conda would install an older
+          # build whenever this one cannot be solved.
           conda create -y -n t \
             -c https://conda.qiyuan.me -c conda-forge --override-channels \
-            auto-sledgehammer
+            "auto-sledgehammer==${{ needs.build.outputs.version }}=*_${{ inputs.build_number || '0' }}"
           conda activate t
           conda list auto-sledgehammer
 
