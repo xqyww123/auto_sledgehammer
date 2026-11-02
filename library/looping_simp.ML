@@ -94,7 +94,7 @@ fun thms_to_once_simprocs ctxt (thms: thm list) : simproc list =
       in
         SOME (Simplifier.make_simproc ctxt
           { name = "once_simproc_" ^ string_of_int i,
-            kind = Simproc,
+            kind = Simplifier.Simproc,
             lhss = [lhs],
             proc = K proc,
             identifier = [] })
@@ -106,7 +106,7 @@ fun pass_looping_simps cfg ctxt facts =
     val (looping, safe) = List.partition (fn (_, th) =>
         simp_rule_may_loop cfg ctxt (Thm.prop_of th)) facts
     val simprocs = thms_to_once_simprocs ctxt (map snd looping)
-    val ctxt' = ctxt addsimprocs simprocs
+    val ctxt' = fold Simplifier.add_proc simprocs ctxt
   in (safe, ctxt') end
 
 end

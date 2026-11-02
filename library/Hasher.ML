@@ -9,6 +9,8 @@
     - Type hashing:      4.7x - 9.0x faster than SHA1
     - Term hashing:      1.2x - 7.0x faster than SHA1
     - Batch operations:  12.4x - 14.1x faster than SHA1
+    Measured in 2026-03 against the native ML SHA1 of that time, which Isabelle2026
+    discontinued; these ratios are historical.
 
   KEY OPTIMIZATION TECHNIQUES:
     1. Direct fold accumulation: Hash values are accumulated during traversal

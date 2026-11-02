@@ -5,41 +5,8 @@ begin
 section \<open>Hasher Performance Tests and Benchmarks\<close>
 
 text \<open>
-  This theory tests the performance of the FNV-1a hash implementation
-  compared to the original SHA1-based implementation.
-\<close>
-
-subsection \<open>SHA1 Baseline Implementation (for comparison)\<close>
-
-ML \<open>
-structure Hasher_SHA1 = struct
-
-type digest = string
-
-fun typ_str (Type (N,TYs)) ret = fold (typ_str) TYs (N::ret)
-  | typ_str (TFree (N,S)) ret = N::S@ret
-  | typ_str (TVar ((N,i),S)) ret = N::string_of_int i::S@ret
-
-fun term_str (Const (N,T)) ret = typ_str T (N::ret)
-  | term_str (Free (N,T)) ret = typ_str T (N::ret)
-  | term_str (Var ((N,i),T)) ret = N::string_of_int i::typ_str T ret
-  | term_str (Bound i) ret = string_of_int i :: ret
-  | term_str (Abs (N,T,X)) ret = term_str X (typ_str T (N :: ret))
-  | term_str (A $ B) ret = term_str A (term_str B ret)
-
-fun string s = SHA1.digest s |> SHA1.rep
-fun hash strs = SHA1.digest (String.concat strs) |> SHA1.rep
-
-val class = string
-val sort = hash
-fun typ ty = hash (typ_str ty [])
-fun term term = hash (term_str term [])
-
-fun goal (ctxt,stat) =
-  hash (fold (term_str o Thm.term_of) (Assumption.all_assms_of ctxt)
-             (Context.theory_name {long=false} (Proof_Context.theory_of ctxt) :: term_str (Thm.prop_of stat) []))
-
-end
+  This theory tests the correctness and the performance of the FNV-1a hash
+  implementation.
 \<close>
 
 subsection \<open>Correctness Tests\<close>
@@ -63,7 +30,7 @@ fun test_determinism () =
     val s2 = Hasher.string "test"
     val _ = assert_eq "String hash determinism" s1 s2
 
-    val ty = Type ("fun", [TFree ("a", ["HOL.type"]), TFree ("b", [])])
+    val ty = Type ("fun", [TFree ("a", [\<^class>\<open>type\<close>]), TFree ("b", [])])
     val h1 = Hasher.typ ty
     val h2 = Hasher.typ ty
     val _ = assert_eq "Type hash determinism" h1 h2
@@ -138,44 +105,6 @@ fun benchmark name n f x =
     writeln ("Per operation: " ^ Real.fmt (StringCvt.FIX (SOME 3)) us_per_op ^ " μs");
     writeln ("Throughput:    " ^ Real.fmt (StringCvt.FIX (SOME 0)) ops_per_sec ^ " ops/sec")
   end
-
-fun comparative_benchmark name n fnv_f sha1_f x =
-  let
-    val _ = writeln ("\n" ^ name)
-    val _ = writeln (String.concat (replicate 60 "="))
-
-    (* Warmup *)
-    val _ = (fnv_f x; sha1_f x)
-
-    (* FNV-1a benchmark *)
-    val (ms_fnv, _) = time_ms (fn _ =>
-      let fun loop 0 = ()
-            | loop i = (fnv_f x; loop (i - 1))
-      in loop n end) ()
-
-    (* SHA1 benchmark *)
-    val (ms_sha1, _) = time_ms (fn _ =>
-      let fun loop 0 = ()
-            | loop i = (sha1_f x; loop (i - 1))
-      in loop n end) ()
-
-    val speedup = Real.fromInt ms_sha1 / Real.fromInt ms_fnv
-    val fnv_ops = Real.fromInt n / (Real.fromInt ms_fnv / 1000.0)
-    val sha1_ops = Real.fromInt n / (Real.fromInt ms_sha1 / 1000.0)
-    val fnv_us = (Real.fromInt ms_fnv * 1000.0) / Real.fromInt n
-    val sha1_us = (Real.fromInt ms_sha1 * 1000.0) / Real.fromInt n
-  in
-    writeln ("Iterations: " ^ string_of_int n ^ "\n");
-    writeln ("FNV-1a:");
-    writeln ("  Time:       " ^ string_of_int ms_fnv ^ " ms");
-    writeln ("  Per op:     " ^ Real.fmt (StringCvt.FIX (SOME 3)) fnv_us ^ " μs");
-    writeln ("  Throughput: " ^ Real.fmt (StringCvt.FIX (SOME 0)) fnv_ops ^ " ops/sec\n");
-    writeln ("SHA1:");
-    writeln ("  Time:       " ^ string_of_int ms_sha1 ^ " ms");
-    writeln ("  Per op:     " ^ Real.fmt (StringCvt.FIX (SOME 3)) sha1_us ^ " μs");
-    writeln ("  Throughput: " ^ Real.fmt (StringCvt.FIX (SOME 0)) sha1_ops ^ " ops/sec\n");
-    writeln ("SPEEDUP:      " ^ Real.fmt (StringCvt.FIX (SOME 2)) speedup ^ "x faster")
-  end
 \<close>
 
 subsubsection \<open>String Hashing Benchmarks\<close>
@@ -185,20 +114,20 @@ val short_string = "test"
 val medium_string = String.concat (replicate 10 "The quick brown fox jumps over the lazy dog. ")
 val long_string = String.concat (replicate 300 "The quick brown fox jumps over the lazy dog. ")
 
-val _ = comparative_benchmark "String Hash: Short (4 chars)" 1000000
-          Hasher.string Hasher_SHA1.string short_string
+val _ = benchmark "String Hash: Short (4 chars)" 1000000
+          Hasher.string short_string
 
-val _ = comparative_benchmark "String Hash: Medium (~450 chars)" 100000
-          Hasher.string Hasher_SHA1.string medium_string
+val _ = benchmark "String Hash: Medium (~450 chars)" 100000
+          Hasher.string medium_string
 
-val _ = comparative_benchmark "String Hash: Long (~135000 chars)" 100000
-          Hasher.string Hasher_SHA1.string long_string
+val _ = benchmark "String Hash: Long (~135000 chars)" 100000
+          Hasher.string long_string
 \<close>
 
 subsubsection \<open>Type Hashing Benchmarks\<close>
 
 ML \<open>
-val simple_type = TFree ("a", ["HOL.type"])
+val simple_type = TFree ("a", [\<^class>\<open>type\<close>])
 val nested_type = Type ("fun", [Type ("list", [TFree ("a", [])]), TFree ("b", [])])
 val complex_type =
   let
@@ -208,14 +137,14 @@ val complex_type =
     mk_fun_type 10
   end
 
-val _ = comparative_benchmark "Type Hash: Simple (TFree)" 1000000
-          Hasher.typ Hasher_SHA1.typ simple_type
+val _ = benchmark "Type Hash: Simple (TFree)" 1000000
+          Hasher.typ simple_type
 
-val _ = comparative_benchmark "Type Hash: Nested" 500000
-          Hasher.typ Hasher_SHA1.typ nested_type
+val _ = benchmark "Type Hash: Nested" 500000
+          Hasher.typ nested_type
 
-val _ = comparative_benchmark "Type Hash: Complex (10 levels)" 100000
-          Hasher.typ Hasher_SHA1.typ complex_type
+val _ = benchmark "Type Hash: Complex (10 levels)" 100000
+          Hasher.typ complex_type
 \<close>
 
 subsubsection \<open>Term Hashing Benchmarks\<close>
@@ -228,17 +157,17 @@ val medium_term = @{term "(\<lambda>x. x + 1) 42"}
 val complex_term = @{term "\<forall>x y z. (x::nat) + y + z = z + y + x"}
 val large_term = @{term "\<forall>f g h. (\<lambda>x. f (g (h x))) = (\<lambda>x. (f o g o h) x)"}
 
-val _ = comparative_benchmark "Term Hash: Simple constant" 1000000
-          Hasher.term Hasher_SHA1.term simple_term
+val _ = benchmark "Term Hash: Simple constant" 1000000
+          Hasher.term simple_term
 
-val _ = comparative_benchmark "Term Hash: Medium (lambda + app)" 500000
-          Hasher.term Hasher_SHA1.term medium_term
+val _ = benchmark "Term Hash: Medium (lambda + app)" 500000
+          Hasher.term medium_term
 
-val _ = comparative_benchmark "Term Hash: Complex (quantified)" 200000
-          Hasher.term Hasher_SHA1.term complex_term
+val _ = benchmark "Term Hash: Complex (quantified)" 200000
+          Hasher.term complex_term
 
-val _ = comparative_benchmark "Term Hash: Large (nested)" 100000
-          Hasher.term Hasher_SHA1.term large_term
+val _ = benchmark "Term Hash: Large (nested)" 100000
+          Hasher.term large_term
 \<close>
 
 subsubsection \<open>Extremely Large Term Benchmarks\<close>
@@ -297,20 +226,20 @@ val many_vars_term = mk_many_vars 1000
 
 val _ = writeln "\n=== EXTREMELY LARGE TERM BENCHMARKS ===\n"
 
-val _ = comparative_benchmark "Extreme: Deep nesting (100 lambdas)" 10000
-          Hasher.term Hasher_SHA1.term very_deep_term
+val _ = benchmark "Extreme: Deep nesting (100 lambdas)" 10000
+          Hasher.term very_deep_term
 
-val _ = comparative_benchmark "Extreme: Wide term (200 additions)" 10000
-          Hasher.term Hasher_SHA1.term wide_term
+val _ = benchmark "Extreme: Wide term (200 additions)" 10000
+          Hasher.term wide_term
 
-val _ = comparative_benchmark "Extreme: Large list (500 elements)" 10000
-          Hasher.term Hasher_SHA1.term large_list_term
+val _ = benchmark "Extreme: Large list (500 elements)" 10000
+          Hasher.term large_list_term
 
-val _ = comparative_benchmark "Extreme: Heavy quantification (50 levels)" 10000
-          Hasher.term Hasher_SHA1.term heavily_quantified_term
+val _ = benchmark "Extreme: Heavy quantification (50 levels)" 10000
+          Hasher.term heavily_quantified_term
 
-val _ = comparative_benchmark "Extreme: Many variables (300 vars)" 10000
-          Hasher.term Hasher_SHA1.term many_vars_term
+val _ = benchmark "Extreme: Many variables (300 vars)" 10000
+          Hasher.term many_vars_term
 \<close>
 
 subsubsection \<open>Batch Operations\<close>
@@ -320,16 +249,14 @@ val many_strings = map string_of_int (1 upto 1000)
 val many_types = map (fn i => Type ("t" ^ string_of_int i, [])) (1 upto 100)
 
 fun hash_all_strings_fnv () = map Hasher.string many_strings
-fun hash_all_strings_sha1 () = map Hasher_SHA1.string many_strings
 
 fun hash_all_types_fnv () = map Hasher.typ many_types
-fun hash_all_types_sha1 () = map Hasher_SHA1.typ many_types
 
-val _ = comparative_benchmark "Batch: 1000 strings" 1000
-          hash_all_strings_fnv hash_all_strings_sha1 ()
+val _ = benchmark "Batch: 1000 strings" 1000
+          hash_all_strings_fnv ()
 
-val _ = comparative_benchmark "Batch: 100 types" 10000
-          hash_all_types_fnv hash_all_types_sha1 ()
+val _ = benchmark "Batch: 100 types" 10000
+          hash_all_types_fnv ()
 \<close>
 
 subsection \<open>Hash Distribution Analysis\<close>
@@ -356,49 +283,6 @@ val test_types = map (fn i => Type ("type_" ^ string_of_int i, [])) (1 upto 1000
 
 val _ = analyze_distribution "Strings (10000)" test_strings Hasher.string
 val _ = analyze_distribution "Types (1000)" test_types Hasher.typ
-\<close>
-
-subsection \<open>Summary\<close>
-
-ML \<open>
-val _ = writeln "\n"
-val _ = writeln (String.concat (replicate 60 "="))
-val _ = writeln "BENCHMARK SUMMARY"
-val _ = writeln (String.concat (replicate 60 "="))
-val _ = writeln ""
-val _ = writeln "The FNV-1a implementation uses:"
-val _ = writeln "  • Direct fold accumulation (no intermediate lists)"
-val _ = writeln "  • Byte-level character processing via String.fold"
-val _ = writeln "  • 64-bit hash values with constructor tagging"
-val _ = writeln "  • Optimized hex conversion with tail-recursive loop"
-val _ = writeln ""
-val _ = writeln "Performance Results vs SHA1:"
-val _ = writeln "  String hashing:"
-val _ = writeln "    - Short (4 chars):      11.22x faster"
-val _ = writeln "    - Medium (~450 chars):   1.69x faster"
-val _ = writeln "    - Long (~4500 chars):    0.82x (acceptable)"
-val _ = writeln ""
-val _ = writeln "  Type hashing:"
-val _ = writeln "    - Simple (TFree):        8.50x faster"
-val _ = writeln "    - Nested:                9.00x faster"
-val _ = writeln "    - Complex (10 levels):   4.67x faster"
-val _ = writeln ""
-val _ = writeln "  Term hashing:"
-val _ = writeln "    - Simple constant:       7.00x faster"
-val _ = writeln "    - Medium:                1.54x faster"
-val _ = writeln "    - Complex:               1.40x faster"
-val _ = writeln "    - Large:                 1.19x faster"
-val _ = writeln ""
-val _ = writeln "  Batch operations:"
-val _ = writeln "    - 1000 strings:         14.12x faster"
-val _ = writeln "    - 100 types:            12.44x faster"
-val _ = writeln ""
-val _ = writeln "  Hash quality:"
-val _ = writeln "    - 0.00% collision rate (10,000 strings, 1,000 types)"
-val _ = writeln ""
-val _ = writeln "CONCLUSION: Target exceeded! 5-10x improvement achieved"
-val _ = writeln "for all practical use cases (types, terms, batch ops)."
-val _ = writeln ""
 \<close>
 
 end

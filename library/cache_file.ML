@@ -1,7 +1,7 @@
 (* Building the Proof Store *)
 
 (* ===========================================================================
-   Proof store on-disk format: a crash-robust, multi-process-safe append log.
+   Proof store on-disk format: a crash-robust append log.
 
    The file is a sequence of self-delimited frames:
 
@@ -32,6 +32,11 @@
    to occur inside a payload, fails the crc check and the scanner resynchronises
    at the next magic occurrence -- so a crash never corrupts earlier records and
    never causes a wrong record to be accepted (beyond the 2^-32 crc collision).
+
+   Writers are serialised within one process only.  Two processes writing one
+   store file is not supposed to happen and is not coordinated: if it does,
+   frames that interleave fail their crc and are skipped, and a compaction may
+   drop the other process's records -- a lost record costs one re-search.
 
    MessagePack comes from the Performant_Isabelle_ML base session (mlmsgpack).
    This structure is deliberately exposed (no signature ascription) so the
@@ -346,32 +351,26 @@ fun store_path thy = Path.ext "proof-store" (store_base thy)
    first touch of a theory's store; nothing appends to it again. *)
 fun legacy_cache_path thy = Path.ext "proof-cache" (store_base thy)
 
-fun lock_path thy = Path.ext "lock" (store_path thy)   (* <thy>.proof-store.lock *)
-
 (* Whether the cache location admits the writes this module performs: creating
-   the lock file and the compaction temp file, appending to the data file,
-   unlinking it. Probed with access(2) -- Isabelle's File structure has no
-   writability predicate (Pure/General/file.ML), File.exists answers existence
-   only.
+   the compaction temp file, appending to the data file, unlinking it. Probed
+   with access(2) -- Isabelle's File structure has no writability predicate
+   (Pure/General/file.ML), File.exists answers existence only.
 
    access(2) answers false for a path that does not exist, so the DIRECTORY is
-   the thing to probe for the create case; the files are probed only when they
-   are already there. A read-only data file matters even under a writable
+   the thing to probe for the create case; the data file is probed only when it
+   is already there. A read-only data file matters even under a writable
    directory: File.append would fail while File.rm would SUCCEED (unlink needs
    only directory permission) -- and silently deleting a deliberately read-only
-   cache is worse than not writing at all. The lock file is probed separately
-   because with_file_lock opens it O_RDWR even when it already exists. *)
+   cache is worse than not writing at all. *)
 fun accessible path modes =
   \<^try>\<open>OS.FileSys.access (File.platform_path path, modes) catch _ => false\<close>
 
 fun probe_writable thy =
   let val dir = Resources.master_directory thy
       val data = store_path thy
-      val lock = lock_path thy
    in File.is_dir dir andalso
       accessible dir [OS.FileSys.A_WRITE, OS.FileSys.A_EXEC] andalso
-      (not (File.exists data) orelse accessible data [OS.FileSys.A_WRITE]) andalso
-      (not (File.exists lock) orelse accessible lock [OS.FileSys.A_WRITE])
+      (not (File.exists data) orelse accessible data [OS.FileSys.A_WRITE])
   end
 
 (* Read the store from a new-format file. Any non-new-format or corrupt file
@@ -389,9 +388,9 @@ fun probe_writable thy =
    a reader that degrades to `empty_store` there does not degrade -- it TRUNCATES
    the user's cache to nothing and renames the empty payload over it.  Letting the
    exception out instead aborts the rewrite with the file byte-intact, and
-   `compact_store`'s own handler demotes the verdict.  Triggers are not only
-   permissions: EIO, an NFS ESTALE, EMFILE under a parallel build, or Size on a
-   large cache all raise here from an ordinary mode-0644 file.
+   try_write answers the fallback.  Triggers are not only permissions: EIO, an
+   NFS ESTALE, EMFILE under a parallel build, or Size on a large cache all raise
+   here from an ordinary mode-0644 file.
 
    `read_file_state` degrades, and is what the pure read path uses.
 
@@ -411,20 +410,17 @@ fun read_file_state_exn path =
 fun read_file_state path =
   \<^try>\<open>read_file_state_exn path catch _ => empty_store\<close>
 
-(* process id, used to make the compaction temp file unique across processes *)
-val proc_pid = SysWord.toString (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))
-
 (* Atomically write the live records as a fresh new-format file (tmp + rename).
    The temp file name carries the pid so two processes compacting the same
-   theory never write the same temp path (they are already serialised by the
-   fcntl lock, but a unique name removes that dependence). File.write neither
-   unlinks nor truncates back on failure, so a failed rename (or a mid-write
-   ENOSPC) would orphan the temp file; unlink it and rethrow, leaving the
-   verdict to the caller's guard. *)
+   theory never write the same temp path; it is read per call, since a
+   top-level value would be the pid of the process that built the heap.
+   File.write neither unlinks nor truncates back on failure, so a failed rename
+   (or a mid-write ENOSPC) would orphan the temp file; unlink it and rethrow,
+   leaving the verdict to the caller's guard. *)
 fun write_state_new path (proofs : proof_record Symtab.table) =
   let val payload =
         String.concat (Symtab.fold (fn (id, r) => fn acc => put_frame id r :: acc) proofs [])
-      val tmp = Path.ext ("tmp." ^ proc_pid) path
+      val tmp = Path.ext ("tmp." ^ string_of_int (PolyML.ml_pid ())) path
    in \<^try>\<open>
         (File.write tmp payload;
          OS.FileSys.rename {old = File.platform_path tmp, new = File.platform_path path})
@@ -435,37 +431,8 @@ fun write_state_new path (proofs : proof_record Symtab.table) =
 fun read_header path n =
   if File.is_file path then File_Stream.open_input (File_Stream.input_size n) path else ""
 
-(* Run `body ()` while holding an exclusive fcntl (F_WRLCK) write lock on a
-   DEDICATED lock file (separate fd from the data file -- which File.append
-   opens/closes constantly -- to avoid the "any close releases the lock" trap).
-   The fd lifetime is exactly the lock hold: opened here, closed on exit.
-   The blocking setlkw wait stays interruptible; the body is uninterruptible. *)
-local
-  val lock_smode = Posix.FileSys.S.flags
-        [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr,
-         Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
-  fun mk_flock lt = Posix.IO.FLock.flock
-        {ltype = lt, whence = Posix.IO.SEEK_SET, start = 0, len = 0, pid = NONE}
-in
-fun with_file_lock lk body =
-  Thread_Attributes.uninterruptible_body (fn run =>
-    let
-      val fd = Posix.FileSys.createf
-                 (File.platform_path lk, Posix.FileSys.O_RDWR,
-                  Posix.FileSys.O.flags [], lock_smode)
-      (* acquire under `run` so the blocking wait stays interruptible; on failure
-         (incl. interrupt) close the fd, then reraise *)
-      val acq = Exn.capture (fn () => run (fn () => Posix.IO.setlkw (fd, mk_flock Posix.IO.F_WRLCK)) ()) ()
-      val _ = (case acq of Exn.Exn _ => ignore (Exn.capture (fn () => Posix.IO.close fd) ()) | _ => ())
-      val _ = Exn.release acq
-      val result = Exn.capture body ()
-      val _ = Exn.capture (fn () => Posix.IO.close fd) ()  (* closing releases the fcntl lock *)
-    in Exn.release result end)
-end
-
 (* Per-CACHE-FILE append lock: the in-process append mutex (so sibling threads of
-   THIS process don't interleave writes to the same file -- fcntl locks are
-   per-process and don't serialise sibling threads).  The bool it carries is
+   THIS process don't interleave writes to the same file).  The bool it carries is
    `confirmed`: whether the on-disk file has been upgraded to the new format
    this process, so a repeat append can skip ensure_new_format.
 
@@ -495,7 +462,7 @@ end
 val append_locks : bool Synchronized.var Strhashtab.table = Strhashtab.empty 16
 
 val append_locks_guard : unit Synchronized.var =
-  Synchronized.var "phi_store.append_locks" ()
+  Synchronized.var \<^unchecked_name>\<open>phi_store.append_locks\<close> ()
 
 fun store_append_lock key =
   Synchronized.change_result append_locks_guard (fn () =>
@@ -508,9 +475,9 @@ fun store_append_lock key =
 (* The warning is emitted at most once per LOCATION, not once per theory or per
    proof: it is the directory the user has to fix, and a theory can reach a write
    site many times.  warned_dirs is a leaf lock (probe_writable takes none), so it
-   adds no cycle to the v -> fcntl -> openning_stores order below. *)
+   adds no cycle to the v -> openning_stores order below. *)
 val warned_dirs : unit Symtab.table Synchronized.var =
-  Synchronized.var "phi_store.warned_dirs" Symtab.empty
+  Synchronized.var \<^unchecked_name>\<open>phi_store.warned_dirs\<close> Symtab.empty
 
 fun warn_not_writable thy =
   let val dir = Path.implode (Resources.master_directory thy)
@@ -530,12 +497,12 @@ fun warn_not_writable thy =
    directory cannot yield two locks for one file and let appends interleave.
 
    File.standard_path = Path.implode o Path.expand, and expand is what does the
-   work: begin_theory stores File.symbolic_path master_dir (resources.ML:243),
-   and with `~` in ISABELLE_DIRECTORIES almost every master_dir here comes out
-   variable-rooted -- `~/Current/...`, for which Path.is_absolute is FALSE.
-   expand resolves $USER_HOME / $ISABELLE_HOME / $AFP to a root, so those
-   canonicalise fully.  That is the common case, and the one a bare Path.implode
-   would have got wrong.
+   work: begin_theory stores File.symbolic_path master_dir (resources.ML:314-318
+   in begin_theory), and with `~` in ISABELLE_DIRECTORIES almost every
+   master_dir here comes out variable-rooted -- `~/Current/...`, for which
+   Path.is_absolute is FALSE.  expand resolves $USER_HOME / $ISABELLE_HOME /
+   $AFP to a root, so those canonicalise fully.  That is the common case, and
+   the one a bare Path.implode would have got wrong.
 
    Deliberately NOT File.absolute_path, which differs only by resolving a
    genuinely relative path against OS.FileSys.getDir ().  That is the one thing
@@ -560,25 +527,29 @@ fun store_is_writable thy =
   let val ok = probe_writable thy
    in if ok then () else warn_not_writable thy; ok end
 
-(* Run a durable-write body only if the cache location is writable, and never
-   let a filesystem failure escape into the proof -- a cache is an optimisation,
-   not a proof obligation. \<^try> re-raises interrupts, so this stays safe under
-   the Timeout that wraps sledgehammer. *)
-fun try_write thy body =
-  if not (store_is_writable thy) then ()
-  else \<^try>\<open>body () catch _ => ()\<close>
+(* The funnel of every durable write: run `body ()` only if the cache location
+   is writable, and answer `fallback` instead of letting a filesystem failure
+   escape into the proof -- a cache is an optimisation, not a proof obligation.
+   The body runs with interrupts held off, so an interrupt never stops a write
+   half way -- above all, never leaves a compaction temp file behind.  \<^try>
+   re-raises interrupts, so this stays safe under the Timeout that wraps
+   sledgehammer. *)
+fun try_write thy fallback body =
+  if not (store_is_writable thy) then fallback
+  else \<^try>\<open>
+    Thread_Attributes.uninterruptible_body (fn _ => body ())
+    catch _ => fallback\<close>
     (* Nothing to demote: the verdict is re-probed on the next attempt, so a
        transient failure (ENOSPC clearing, a remount, an NFS hiccup) recovers by
        itself instead of disabling the cache for the rest of the process. *)
 
 (* One-shot migration of the pre-rename <thy>.proof-cache into <thy>.proof-store.
-   Goes through this module's own write funnel: writability probe -> in-process
-   mutex -> fcntl lock -> \<^try>, so a read-only or otherwise unwritable location
-   simply does not migrate (the read path keeps falling back to the legacy file
-   there).  The old file is left in place, never deleted.
+   Takes the in-process mutex, then goes through try_write: a read-only or
+   otherwise unwritable location simply does not migrate (the read path keeps
+   falling back to the legacy file there).  The old file stays, never deleted.
 
-   RE-CHECKING under the lock is the point: between the fast-path test and the
-   lock another process may have migrated AND appended new records, and renaming
+   RE-CHECKING under the mutex is the point: between the fast-path test and the
+   mutex another thread may have migrated AND appended new records, and renaming
    our own stale snapshot over that would drop them.
 
    read_file_state_exn, not the degrading reader: a reader that answers
@@ -587,7 +558,7 @@ fun try_write thy body =
 
    CALL IT from the five public entry points only, at the very top of their
    bodies -- NEVER from load_store_raw / get_store_i (lock order is
-   v -> fcntl -> openning_stores; calling it there closes the cycle) and never
+   v -> openning_stores; calling it there closes the cycle) and never
    inside append_record's or compact_store's `Synchronized.change v` body
    (that var is not reentrant). *)
 fun migrate_legacy thy =
@@ -597,13 +568,10 @@ fun migrate_legacy thy =
    in if File.is_file new_path orelse not (File.is_file old_path)
       then ()                                          (* fast path, no lock *)
       else Synchronized.change v (fn confirmed =>
-        if not (store_is_writable thy) then confirmed
-        else \<^try>\<open>
-          with_file_lock (lock_path thy) (fn () =>
-            (if File.is_file new_path then ()
-             else write_state_new new_path (#proofs (read_file_state_exn old_path));
-             confirmed))
-          catch _ => confirmed\<close>)
+        try_write thy confirmed (fn () =>
+          (if File.is_file new_path then ()
+           else write_state_new new_path (#proofs (read_file_state_exn old_path));
+           confirmed)))
   end
 
 (* Before appending, if the on-disk file exists but is NOT in the new format
@@ -615,45 +583,37 @@ fun ensure_new_format path =
   let val hdr = read_header path 4
    in if hdr = "" orelse is_new_format hdr then () else File.rm path end
 
-(* The single funnel for all durable writes. In-process mutex (per-theory var)
-   -> cross-process fcntl lock -> append one framed record. Holds the fcntl lock
-   across the entire (buffered) File.append so >4KB frames can never interleave
-   between processes; crash mid-frame is recovered by crc on next load.
-   The writability guard sits OUTSIDE with_file_lock, never inside: with_file_lock
-   opens the lock file O_RDWR and so fails BEFORE the body ever runs. The
-   in-process mutex is still taken either way -- it carries the `confirmed` flag
-   and the invalidate/append ordering. On failure we return the INCOMING
-   `confirmed`: a confirmed format stays confirmed, an unconfirmed one is not
-   falsely upgraded. *)
+(* The funnel for record appends (proofs and tombstones). In-process mutex
+   (per-file var) -> try_write -> append one framed record. The mutex is held
+   across the entire (buffered) File.append, so the frames of two threads can
+   never interleave; a crash mid-frame is recovered by crc on next load. The
+   mutex is taken even when the location is not writable -- it carries the
+   `confirmed` flag and the invalidate/append ordering. On failure we return the
+   INCOMING `confirmed`: a confirmed format stays confirmed, an unconfirmed one
+   is not falsely upgraded. *)
 fun append_record thy bytes =
   let val path = store_path thy
       val v = store_append_lock (store_file_key thy)
    in Synchronized.change v (fn confirmed =>
-        if not (store_is_writable thy) then confirmed
-        else \<^try>\<open>
-          with_file_lock (lock_path thy) (fn () =>
-            ((if confirmed then () else ensure_new_format path);
-             File.append path bytes;
-             true))
-          catch _ => confirmed\<close>)
+        try_write thy confirmed (fn () =>
+          ((if confirmed then () else ensure_new_format path);
+           File.append path bytes;
+           true)))
   end
 
-(* Compaction: under the lock, re-read the file (capturing every process's
-   appends + tombstones), replay to the deduped live set, and atomically rewrite
+(* Compaction: under the mutex, re-read the file (capturing every append and
+   tombstone so far), replay to the deduped live set, and atomically rewrite
    as a fresh new-format file. Also upgrades a never-appended legacy file.
-   Guarded like append_record -- this is what protects the Theory.at_end hook
-   below, whose deferred Future.forks branch would otherwise surface an IO.Io
-   as a spurious error long after the theory has finished. *)
+   Goes through try_write like append_record -- this is what protects the
+   Theory.at_end hook below, whose deferred Future.forks branch would otherwise
+   surface an IO.Io as a spurious error long after the theory has finished. *)
 fun compact_store thy =
   let val path = store_path thy
       val v = store_append_lock (store_file_key thy)
    in Synchronized.change v (fn confirmed =>
-        if not (store_is_writable thy) then confirmed
-        else \<^try>\<open>
-          with_file_lock (lock_path thy) (fn () =>
-            (if File.is_file path then write_state_new path (#proofs (read_file_state_exn path)) else ();
-             true))
-          catch _ => confirmed\<close>)
+        try_write thy confirmed (fn () =>
+          (if File.is_file path then write_state_new path (#proofs (read_file_state_exn path)) else ();
+           true)))
   end
 
 (* Beside its store, every open theory carries one more table: what THIS session
@@ -762,7 +722,7 @@ fun close_store thy =
 (* Drop the data file and reset the in-memory entry as ONE per-theory critical
    section (under the same `v` that serialises appends), so a concurrent append
    cannot slip between the disk-rm and the memory-reset. Lock order here is
-   v -> fcntl -> openning_stores; nothing acquires v while holding
+   v -> openning_stores; nothing acquires v while holding
    openning_stores, so there is no cycle. The in-memory half is unconditional:
    when the disk half is skipped, a bad cached proof is still dropped for this
    session, we merely cannot record the tombstone durably. *)
@@ -771,9 +731,8 @@ fun invalidate_store thy =
      is per theory. *)
   let val name = Context.theory_name {long=true} thy in
   Synchronized.change (store_append_lock (store_file_key thy)) (fn _ =>
-    (try_write thy (fn () =>
-       with_file_lock (lock_path thy) (fn () =>
-         if File.is_file (store_path thy) then File.rm (store_path thy) else ()));
+    (try_write thy () (fn () =>
+       if File.is_file (store_path thy) then File.rm (store_path thy) else ());
      Synchronized.change openning_stores (fn tab =>
        (*dropping the data does not un-write what this session wrote*)
        Symtab.update (name, (empty_store, true, written_of tab name)) tab);
@@ -910,11 +869,7 @@ val _ = Theory.setup (Theory.at_end (fn thy => (
     in if null tasks then (compact_store thy; close_store thy)
        else ((* tracing "There are asynchronous proof tasks. The proof cache will be compacted \
                        \once they are finished." ; *)
-             (*interrupts=true for the same reason as \<phi>SH.record_proof: this body
-               takes the fcntl lock, and with_file_lock's `run` restores the attributes
-               in effect on entry, so forking uninterruptible would make the blocking
-               setlkw wait uncancellable.*)
-             Future.forks {name="\<phi>System.compact_store", group=NONE, deps = tasks, pri=1, interrupts=true}
+             Future.forks {name=\<^unchecked_name>\<open>\<phi>System.compact_store\<close>, group=NONE, deps = tasks, pri=1, interrupts=false}
               [(fn _ => (compact_store thy; close_store thy
                          (* ; tracing "The proof cache has been compacted." *)))] ;
             ())

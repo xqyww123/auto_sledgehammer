@@ -435,93 +435,8 @@ fun need_standard_tac ctxt st =
 
 (*** Adapter of Sledgehammer ***)
 
-(*copied and modified from Isabelle-2022/src/HOL/Tools/Sledgehammer/sledgehammer_proof_methods.ML
-  Original Author: Jasmin Blanchette, TU Muenchen
-                   Steffen Juilf Smolka, TU Muenchen
-
-  May need to be synced once updated.
-*)
-local open Sledgehammer_Proof_Methods
-
-fun is_proof_method_direct (Metis_Method _) = true
-  | is_proof_method_direct Meson_Method = true
-  | is_proof_method_direct (SMT_Method _) = true
-  | is_proof_method_direct Simp_Method = true
-  | is_proof_method_direct _ = false
-
-fun is_proof_method_multi_goal Auto_Method = true
-  | is_proof_method_multi_goal _ = false
-
-fun string_of_proof_method ss meth =
-  let
-    val meth_s =
-      (case meth of
-        Metis_Method (NONE, NONE, additional_fact_names) =>
-        space_implode " " ("metis" :: additional_fact_names)
-      | Metis_Method (type_enc_opt, lam_trans_opt, additional_fact_names) =>
-        space_implode " "
-          (("metis (" ^ commas (map_filter I [type_enc_opt, lam_trans_opt]) ^ ")")
-            :: additional_fact_names)
-      | Meson_Method => "meson"
-      | SMT_Method SMT_Z3 => "smt (z3)"
-      | SMT_Method (SMT_Verit strategy) =>
-        "smt (" ^ commas ("verit" :: (if strategy = "default" then [] else [strategy])) ^ ")"
-      | SATx_Method => "satx"
-      | Blast_Method => "blast"
-      | Simp_Method => if null ss then "simp" else "simp add:"
-      | Auto_Method => "auto"
-      | Fastforce_Method => "fastforce"
-      | Force_Method => "force"
-      | Moura_Method => "moura"
-      | Linarith_Method => "linarith"
-      | Presburger_Method => "presburger"
-      | Algebra_Method => "algebra")
-  in
-    space_implode " " (meth_s :: ss)
-  end
-
-in
-
-fun proof_method_command meth n extras =
-  let
-    val (indirect_ss, direct_ss) =
-      if is_proof_method_direct meth then ([], extras) else (extras, [])
-  in
-    (if null indirect_ss then "" else "(insert " ^ space_implode " " indirect_ss ^ ")[1], ") ^
-    (if is_proof_method_multi_goal meth andalso n <> 1
-      then "(" ^ string_of_proof_method direct_ss meth ^ ")[1]"
-      else string_of_proof_method direct_ss meth)
-  end
-
-fun one_line_proof_text (used_facts, meth, subgoal_count) =
-  let val (_, extra) = List.partition (fn (_, (sc, _)) => sc = ATP_Problem_Generate.Chained) used_facts in
-    map fst extra
-    |> proof_method_command meth subgoal_count
-  end
-
-end
-
 val silence_state =
       Proof.map_contexts (Try0_HOL.silence_methods #> Config.put SMT_Config.verbose false)
-
-val debug_state =
-      Proof.map_contexts (Try0_HOL.silence_methods #> Config.put SMT_Config.verbose true
-          #> Config.put SMT_Config.trace true #> Config.put SMT_Config.statistics true )
-
-fun time_ord (t1 : Time.time, t2) =
-  if t1 = t2 then EQUAL else if t1 < t2 then LESS else GREATER
-fun preplay_ord ((_, Sledgehammer_Proof_Methods.Played t1, _),
-                 (_, Sledgehammer_Proof_Methods.Played t2, _))
-      = time_ord (t1,t2)
-  | preplay_ord ((_, Sledgehammer_Proof_Methods.Played _, _),
-                 (_, Sledgehammer_Proof_Methods.Play_Timed_Out _, _))
-      = LESS
-  | preplay_ord ((_, Sledgehammer_Proof_Methods.Play_Timed_Out _, _),
-                 (_, Sledgehammer_Proof_Methods.Played _, _))
-      = GREATER
-  | preplay_ord ((_, Sledgehammer_Proof_Methods.Play_Timed_Out _, _),
-                 (_, Sledgehammer_Proof_Methods.Play_Timed_Out _, _))
-      = EQUAL
 
 datatype fail_reason = Too_Many_Subgoals | Timeout | Application_Fails | Subgoal_unsolved
                      | Unknown of string
@@ -553,7 +468,7 @@ fun reason_rank (Internal_Failure _) = 7
 (* Classify ONE non-interrupt exception: the callers have already re-raised
    any interrupt, container components included. *)
 fun classify exn =
-      (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.classify" exn;
+      (Exception_Log.record_breakdown \<^unchecked_name>\<open>Phi_Sledgehammer_Solver.classify\<close> exn;
       case exn of
         Auto_Fail r       => r
       | Timeout.TIMEOUT _ => Timeout
@@ -572,7 +487,7 @@ fun classify exn =
    race engine and PLPR's guard race.  Do NOT substitute it into `joins_norm`
    below: its `flatten` unpacks Par_Exn RECURSIVELY, by design. *)
 fun normalise exn =
-  (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.normalise" exn;
+  (Exception_Log.record_breakdown \<^unchecked_name>\<open>Phi_Sledgehammer_Solver.normalise\<close> exn;
   case Interrupt_Family.find_interrupt exn of
     SOME interrupt => Exn.reraise interrupt
   | NONE =>
@@ -750,30 +665,12 @@ fun mk_proof_candidates s_prf =
   end
 end
 
-fun debug_param {debug=debug, verbose=verbose, overlord=overlord, spy=spy, provers=provers,
-                 abduce=abduce, falsify=falsify, type_enc=type_enc, strict=strict, lam_trans=lam_trans,
-                 uncurried_aliases=uncurried_aliases, learn=learn, fact_filter=fact_filter,
-                 induction_rules=induction_rules, max_facts=max_facts, fact_thresholds=fact_thresholds,
-                 max_mono_iters=max_mono_iters, max_new_mono_instances=max_new_mono_instances,
-                 max_proofs=max_proofs, isar_proofs=isar_proofs, compress=compress, try0=try0,
-                 smt_proofs=smt_proofs, minimize=minimize, slices=slices, timeout=timeout,
-                 preplay_timeout=preplay_timeout, expect=expect} =
-      {debug=true, verbose=true, overlord=overlord, spy=spy, provers=provers,
-       abduce=abduce, falsify=falsify, type_enc=type_enc, strict=strict, lam_trans=lam_trans,
-       uncurried_aliases=uncurried_aliases, learn=learn, fact_filter=fact_filter,
-       induction_rules=induction_rules, max_facts=max_facts, fact_thresholds=fact_thresholds,
-       max_mono_iters=max_mono_iters, max_new_mono_instances=max_new_mono_instances,
-       max_proofs=max_proofs, isar_proofs=isar_proofs, compress=compress, try0=try0,
-       smt_proofs=smt_proofs, minimize=minimize, slices=slices, timeout=timeout,
-       preplay_timeout=preplay_timeout, expect=expect}
-
-
 fun raw_sledgehammer timeout_opt override hasty stat =
   let val N = #goal (Proof.goal stat) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
-      val shortcut = Single_Assignment.var "\<phi>sledgehammer.shortcut"
-      val futures = Synchronized.var "\<phi>sledgehammer.futures" []
-      val found_proof = Synchronized.var "\<phi>sledgehammer.found_proof" false
+      val shortcut = Single_Assignment.var \<^unchecked_name>\<open>\<phi>sledgehammer.shortcut\<close>
+      val futures = Synchronized.var \<^unchecked_name>\<open>\<phi>sledgehammer.futures\<close> []
+      val found_proof = Synchronized.var \<^unchecked_name>\<open>\<phi>sledgehammer.found_proof\<close> false
       val sledgehammer_params = get_sledgehammer_params (Proof.context_of stat)
       val ctxt = Proof.context_of stat
       val pptimeout = Config.get ctxt preplay_timeout
@@ -811,9 +708,9 @@ fun raw_sledgehammer timeout_opt override hasty stat =
                   if name = Markup.sendbackN then SOME (String.concat (map tree_text ts))
                   else get_first find_sendback ts
               | find_sendback (XML.Text _) = NONE
-         (* Isabelle2025-2: the proof command lives inside a `sendback` markup
-            element (Active.sendback_markup_command); the old 2nd/3rd-ENQ slice
-            now lands on an inserted `Markup.break " "` (a single space).
+         (* The proof command is the text of the `sendback` markup element
+            (Active.sendback_markup_command); its facts may come first as
+            `using ...`, which mk_proof_candidates turns into `insert`.
             Non-suggestion messages ("... found a proof ...", "Duplicate proof")
             carry no sendback element and are just logged. *)
          in case get_first find_sendback (YXML.parse_body s)
@@ -1207,7 +1104,7 @@ fun find_local_may_false ctxt =
                    |> the_list
   in
     Facts.dest_static false outer_facts local_facts
-    |> filter (fn ("local.this", _) => false | _ => true)
+    |> filter (fn (\<^unchecked_name>\<open>local.this\<close>, _) => false | _ => true)
     |> get_first (fn (name0, ths) =>
          get_first (fn th =>
            let val th' = Thm.transfer' ctxt th
@@ -1337,7 +1234,7 @@ fun facts_as_mepo_lazy_facts local_only ctxt =
            |> Option.map Proof_Context.facts_of |> the_list
       else []
     val named_locals = Facts.dest_static false outer_facts local_facts
-                    |> filter (fn ("local.this", _) => false | _ => true)
+                    |> filter (fn (\<^unchecked_name>\<open>local.this\<close>, _) => false | _ => true)
   in
     maps (fn (name0, ths) =>
       let val n = length ths
@@ -1876,7 +1773,7 @@ fun joins_norm futs =
   case Exn.capture_body (fn () => Future.joins futs) of
     Exn.Res r => r
   | Exn.Exn exn =>
-      (Exception_Log.record_breakdown "Phi_Sledgehammer_Solver.joins_norm" exn;
+      (Exception_Log.record_breakdown \<^unchecked_name>\<open>Phi_Sledgehammer_Solver.joins_norm\<close> exn;
        case flatten exn of
          [] => Exn.reraise exn
        | exns =>
@@ -1903,12 +1800,9 @@ end
 fun after futs g =
   if forall Future.is_finished futs
   then Future.value (g (joins_norm futs))
-  (*interrupts = true: the body takes the fcntl lock, and with_file_lock's `run`
-    restores the attributes in effect on entry -- forked uninterruptible, the
-    blocking setlkw wait could never be cancelled.*)
-  else singleton (Future.forks {name = "\<phi>SH.record_proof", group = NONE,
+  else singleton (Future.forks {name = \<^unchecked_name>\<open>\<phi>SH.record_proof\<close>, group = NONE,
                                 deps = map Future.task_of futs, pri = 0,
-                                interrupts = true})
+                                interrupts = false})
          (fn () => g (joins_norm futs))
 
 (*Proof texts are stored with their own scope.  `[n]` is the real Isar combinator

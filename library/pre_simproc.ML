@@ -12,7 +12,7 @@ structure Pre_Simproc : sig
   val pre_simproc_on_concl : Proof.context -> thm -> thm
 end = struct
 
-val simplify_timeout_seconds = Config.declare_int ("Pre_Simproc.simplify_timeout_seconds", \<^here>) (K 10)
+val simplify_timeout_seconds = Config.declare_int (\<^unchecked_name>\<open>Pre_Simproc.simplify_timeout_seconds\<close>, \<^here>) (K 10)
 
 datatype scope = Everywhere | Concl_Only
 

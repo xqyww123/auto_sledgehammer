@@ -133,7 +133,7 @@ requirements:
     # keeps a constant name at a per-release version, so an unbounded dep would let conda
     # pair this with a future Isabelle it was never built for -- installing cleanly and
     # then failing in `isabelle build` on ML API drift.
-    - isabelle >=2025.2,<2025.3
+    - isabelle >=2026,<2026.1
     # ROOT:1 `session Auto_Sledgehammer = Performant_Isabelle_HOL +`, ROOT:3 `sessions
     # Performant_Isabelle_ML`, and Auto_Sledgehammer.thy:2 imports
     # Performant_Isabelle_HOL.SSymb.  Without this the session does not build at all.

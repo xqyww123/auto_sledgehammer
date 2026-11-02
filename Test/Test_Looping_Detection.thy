@@ -6,7 +6,8 @@ ML \<open>
 let
   val ctxt = \<^context>
   val default_cfg : Looping_Simp.config =
-    {only_check_local = false, ignore_cond = false, local_ignore_cond = false}
+    {only_check_local = false, ignore_cond = false, local_ignore_cond = false,
+     schematize_local_frees = false}
   val check = Looping_Simp.simp_rule_may_loop default_cfg ctxt
 
   fun test_thm name expected =
@@ -20,9 +21,9 @@ let
     in () end
 
   (* Permutative rules — should NOT be flagged *)
-  val _ = test_thm "add.commute" false
-  val _ = test_thm "add.left_commute" false
-  val _ = test_thm "mult.commute" false
+  val _ = test_thm \<^unchecked_name>\<open>add.commute\<close> false
+  val _ = test_thm \<^unchecked_name>\<open>add.left_commute\<close> false
+  val _ = test_thm \<^unchecked_name>\<open>mult.commute\<close> false
   val _ = test_thm "conj_commute" false
   val _ = test_thm "disj_commute" false
 
@@ -50,7 +51,8 @@ let
 
   (* With ignore_cond=true: conditional rule IS flagged regardless *)
   val ic_cfg : Looping_Simp.config =
-    {only_check_local = false, ignore_cond = true, local_ignore_cond = false}
+    {only_check_local = false, ignore_cond = true, local_ignore_cond = false,
+     schematize_local_frees = false}
   val _ = let val r = Looping_Simp.simp_rule_may_loop ic_cfg ctxt cond_prop
               val _ = writeln ("cond loop [ignore_cond=true]: loops=" ^
                                Bool.toString r ^ " (expected=true)" ^
@@ -70,7 +72,8 @@ ML \<open>
 let
   val ctxt = \<^context>
   val lic_cfg : Looping_Simp.config =
-    {only_check_local = false, ignore_cond = false, local_ignore_cond = true}
+    {only_check_local = false, ignore_cond = false, local_ignore_cond = true,
+     schematize_local_frees = false}
 
   (* Conditional rule using only locale params (not proof-local) => not flagged *)
   val prop = Syntax.read_prop ctxt "P x \<Longrightarrow> f x = g (f x)"
@@ -87,7 +90,8 @@ let
   val ctxt0 = \<^context>
   val ([y], ctxt) = Variable.add_fixes ["y"] ctxt0
   val lic_cfg : Looping_Simp.config =
-    {only_check_local = false, ignore_cond = false, local_ignore_cond = true}
+    {only_check_local = false, ignore_cond = false, local_ignore_cond = true,
+     schematize_local_frees = false}
 
   (* Conditional rule with a proof-local var => flagged *)
   val prop = Syntax.read_prop ctxt "P y \<Longrightarrow> f y = g (f y)"
@@ -109,7 +113,8 @@ let
   val ([y], ctxt) = Variable.add_fixes ["y"] ctxt0
 
   val lic_cfg : Looping_Simp.config =
-    {only_check_local = false, ignore_cond = false, local_ignore_cond = true}
+    {only_check_local = false, ignore_cond = false, local_ignore_cond = true,
+     schematize_local_frees = false}
   val prop = Syntax.read_prop ctxt "P y \<Longrightarrow> f y = g (f y)"
   val r = Looping_Simp.simp_rule_may_loop lic_cfg ctxt prop
   val _ = writeln ("proof-local var [lic=true]: loops=" ^
@@ -129,7 +134,8 @@ ML \<open>
 let
   val ctxt = \<^context>
   val ocl_cfg : Looping_Simp.config =
-    {only_check_local = true, ignore_cond = false, local_ignore_cond = false}
+    {only_check_local = true, ignore_cond = false, local_ignore_cond = false,
+     schematize_local_frees = false}
 
   (* Only locale params, no local vars => not flagged *)
   val prop = Syntax.read_prop ctxt "f x = g (f x)"
@@ -146,7 +152,8 @@ let
   val ctxt0 = \<^context>
   val ([y], ctxt) = Variable.add_fixes ["y"] ctxt0
   val ocl_cfg : Looping_Simp.config =
-    {only_check_local = true, ignore_cond = false, local_ignore_cond = false}
+    {only_check_local = true, ignore_cond = false, local_ignore_cond = false,
+     schematize_local_frees = false}
 
   (* Has proof-local var y => flagged *)
   val prop = Syntax.read_prop ctxt "f y = g (f y)"
