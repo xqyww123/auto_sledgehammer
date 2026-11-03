@@ -189,7 +189,7 @@ jobs:
           echo "CH=$CH" >> "$GITHUB_ENV"
           ls -l "$CH/noarch/"
 
-      - name: "Install it -- local channel for US, conda.qiyuan.me for the base isabelle"
+      - name: "Install it -- local channel for US, conda-ci.qiyuan.me for the base isabelle"
         run: |
           set -euo pipefail
           # Unlike the base repo we have no local `isabelle` artifact to solve against, so
@@ -199,7 +199,7 @@ jobs:
           # --override-channels pins the channel list exactly; conda-forge is in it because
           # isabelle run-depends on python from there.
           conda create -y -n v \
-            -c "file://$CH" -c https://conda.qiyuan.me -c conda-forge --override-channels \
+            -c "file://$CH" -c https://conda-ci.qiyuan.me -c conda-forge --override-channels \
             "file://$CH::auto-sledgehammer"
           conda activate v
           conda list isabelle
@@ -255,7 +255,7 @@ jobs:
   # This logic was validated against the live channel first, by
   # isabelle-packaging-ci's smoke-logic-probe.
   smoke:
-    name: "Smoke: conda install from conda.qiyuan.me (${{ matrix.os }})"
+    name: "Smoke: conda install from conda-ci.qiyuan.me (${{ matrix.os }})"
     needs: [build, publish]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -273,13 +273,13 @@ jobs:
         with:
           auto-update-conda: true
 
-      - name: "conda install -c https://conda.qiyuan.me auto-sledgehammer"
+      - name: "conda install -c https://conda-ci.qiyuan.me auto-sledgehammer"
         run: |
           set -euo pipefail
           # Pinned to the build just published: by bare name conda would install an older
           # build whenever this one cannot be solved.
           conda create -y -n t \
-            -c https://conda.qiyuan.me -c conda-forge --override-channels \
+            -c https://conda-ci.qiyuan.me -c conda-forge --override-channels \
             "auto-sledgehammer==${{ needs.build.outputs.version }}=*_${{ inputs.build_number || '0' }}"
           conda activate t
           conda list auto-sledgehammer
