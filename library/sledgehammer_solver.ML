@@ -753,10 +753,10 @@ fun raw_sledgehammer timeout_opt override hasty stat =
               else ()))
           deadline
 
-   in Future.forks {name="\<phi>SH", group = SOME group, deps = [], pri=10, interrupts=true} [(fn () =>
+      val results =
+        Future.forks {name="\<phi>SH", group = SOME group, deps = [], pri=10, interrupts=true} [(fn () =>
         (*capture site (EVENT_LOG_PLAN 7): the sledgehammer arm runs on a
-          worker and its failures are otherwise swallowed by join_results
-          below; the region is bounded by the hammer timeout*)
+          worker; the region is bounded by the hammer timeout*)
         Exception_Log.capture
           {site = "hammer sledgehammer", record = Exception_Log.default_record}
           (fn () =>
@@ -766,10 +766,15 @@ fun raw_sledgehammer timeout_opt override hasty stat =
                     (SOME dirty_hack) 1 override
                     (silence_state stat)
             ; ())))]
-    |> Future.join_results
-     ; Future.join_results (Synchronized.value futures)
+        |> Future.join_results
+   in Future.join_results (Synchronized.value futures)
      ; (case watchdog of SOME req => ignore (Event_Timer.cancel req) | NONE => ())
      ; Future.cancel_group group
+       (*a bug must not be hidden: after the cleanup, a failure of the sledgehammer arm is
+         raised unless it is an interrupt (a proof was found, or the watchdog fired)*)
+     ; List.app (fn Exn.Exn exn =>
+                      if Interrupt_Family.contains_interrupt exn then () else Exn.reraise exn
+                  | Exn.Res () => ()) results
      ; Single_Assignment.peek shortcut
   end
 
