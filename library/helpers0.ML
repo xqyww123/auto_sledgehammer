@@ -13,6 +13,10 @@ val leading_antecedent' : thm -> term
 val quote_space : string -> string
 val quote_fact  : string -> string
 
+(*the context outside the proof: the local theory target, or, if there is none, the global
+  context of the background theory*)
+val outer_context : Proof.context -> Proof.context
+
 end
 
 
@@ -53,5 +57,9 @@ fun quote_fact s =
          not (Char.isAlpha (String.sub (s,0))) )
       then quote s
       else s
+
+fun outer_context ctxt =
+  if Local_Theory.level ctxt > 0 then Local_Theory.target_of ctxt
+  else Proof_Context.init_global (Proof_Context.theory_of ctxt)
 
 end

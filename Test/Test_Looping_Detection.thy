@@ -46,8 +46,17 @@ let
                                " (expected=true)" ^ (if r then " OK" else " FAIL"))
           in if r then () else error "Test failed: cond loop with default cfg" end
 
-  (* With local_ignore_cond=true: tested below in locale context where
-     we can distinguish local vs non-local variables *)
+  (* With local_ignore_cond=true, here at level 0 (no local theory target): no variable
+     of cond_prop is fixed, so none is proof-local and the rule is not flagged.  More
+     cases below, in locale contexts and with a fixed variable. *)
+  val lic_cfg : Looping_Simp.config =
+    {only_check_local = false, ignore_cond = false, local_ignore_cond = true,
+     schematize_local_frees = false}
+  val _ = let val r = Looping_Simp.simp_rule_may_loop lic_cfg ctxt cond_prop
+              val _ = writeln ("cond loop [lic=true, level 0, unfixed]: loops=" ^
+                               Bool.toString r ^ " (expected=false)" ^
+                               (if not r then " OK" else " FAIL"))
+          in if not r then () else error "Test failed: unfixed var at level 0 is not local" end
 
   (* With ignore_cond=true: conditional rule IS flagged regardless *)
   val ic_cfg : Looping_Simp.config =

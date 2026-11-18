@@ -43,16 +43,11 @@ fun dest_simp_eq prop =
   in go [] [] prop end
 
 fun has_local_free_vars ctxt t =
-  if Local_Theory.level ctxt = 0
-  then Term.exists_subterm is_Free t
-  else not (null (Variable.add_newly_fixed ctxt (Local_Theory.target_of ctxt) t []))
+  not (null (Variable.add_newly_fixed ctxt (Phi_Help.outer_context ctxt) t []))
 
 fun schematize_local_frees ctxt pat0 =
   let
-    val is_keep =
-      if Local_Theory.level ctxt > 0
-      then Variable.is_fixed (Local_Theory.target_of ctxt)
-      else K false
+    val is_keep = Variable.is_fixed (Phi_Help.outer_context ctxt)
     val frees = Term.add_frees pat0 []
     val idx = maxidx_of_term pat0 + 1
     val (_, subst) = fold (fn (n, T) => fn (i, acc) =>

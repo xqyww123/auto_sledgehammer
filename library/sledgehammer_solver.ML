@@ -114,6 +114,16 @@ val classical_prover_timeout : int Config.T
 val mk_proof_candidates :
       string -> {is_metis : bool, metis_prf : string, smt_prf_opt : string option}
 
+(* Sledgehammer on the LEADING subgoal of the state, with every other subgoal hidden from
+   Sledgehammer and from the replay of what it finds.  SOME (text, state') on success:
+   text proves exactly the leading subgoal and is written "(...)[1]", so it replays the same
+   on a state with more subgoals; state' is the state without that subgoal.  In hasty mode,
+   text is "<cheat>" and state' is obtained by cheating.  NONE when no proof that
+   Sledgehammer found could be replayed. *)
+val sledgehammer_leading_subgoal :
+  Time.time option -> Sledgehammer.fact_override -> bool (*hasty*) -> Proof.state ->
+  (string * Proof.state) option
+
 (* Internal_Failure means "this is a bug in the engine, not a proof that got
    away" -- it must reach the user with its payload, never be relabelled as
    "could not prove the goal" and never be answered by calling a fallback
@@ -150,7 +160,7 @@ val fast_mepo_tac : Time.time -> Proof.context -> int -> tactic
 val facts_as_mepo_lazy_facts : bool (*local facts only*) -> Proof.context
                             -> Sledgehammer_Fact.lazy_fact list
 val run_mepo_and_render : Time.time -> int (*max_facts*)
-                       -> Sledgehammer_Fact.lazy_fact list (*MePo pool; [] skips MePo*)
+                       -> Sledgehammer_Fact.lazy_fact list (*MePo pool; may be empty*)
                        -> (string * thm) list (*extra add facts*)
                        -> (string * thm) list (*del facts*)
                        -> Proof.context -> int -> thm -> thm * string * Phi_Proof_Store.times
@@ -400,9 +410,7 @@ fun may_entail_false prop =
   in go_prop prop end
 
 fun should_be_inserted ctxt  =
-  let val outter = try Local_Theory.target_of ctxt
-      fun is_new name = case outter of NONE => true
-                                     | SOME ctxt' => Variable.is_newly_fixed ctxt ctxt' name
+  let val is_new = Variable.is_newly_fixed ctxt (Phi_Help.outer_context ctxt)
    in fn rule =>
       may_entail_false rule orelse (
       Term.add_free_names rule []
@@ -665,9 +673,18 @@ fun mk_proof_candidates s_prf =
   end
 end
 
-fun raw_sledgehammer timeout_opt override hasty stat =
-  let val N = #goal (Proof.goal stat) |> Thm.nprems_of
+(*Proof texts are stored with their own scope.  `[n]` is the real Isar combinator
+  Select_Goals, so the record says for itself which goals it speaks for instead
+  of depending on the reader to arrange the state.  It only attaches to a bare
+  method name or a PARENTHESISED group -- `auto [1]` parses as an argument to
+  auto -- hence the parentheses.*)
+fun scoped prf = "(" ^ prf ^ ")[1]"
+
+fun sledgehammer_leading_subgoal timeout_opt override hasty stat0 =
+  let val N = #goal (Proof.goal stat0) |> Thm.nprems_of
       val _ = if N = 0 then error "No subgoal!" else ()
+      (*every other subgoal is hidden in the protected conclusion*)
+      val stat = Proof.refine_primitive (K (Goal.protect 1)) stat0
       val shortcut = Single_Assignment.var \<^unchecked_name>\<open>\<phi>sledgehammer.shortcut\<close>
       val futures = Synchronized.var \<^unchecked_name>\<open>\<phi>sledgehammer.futures\<close> []
       val found_proof = Synchronized.var \<^unchecked_name>\<open>\<phi>sledgehammer.found_proof\<close> false
@@ -686,19 +703,28 @@ fun raw_sledgehammer timeout_opt override hasty stat =
                        in if secs <= 0 then NONE else SOME (Time.fromSeconds secs) end)
       val deadline = Option.map (fn t => Time.scale 0.8 t) effective_timeout
 
+      (*a candidate counts only if its scoped text closes the subgoal: Goal.finish raises
+        otherwise*)
+      fun replay timeout prf =
+        let val text = scoped prf
+            val (_, stat') = eval_prf_str_stat keywords timeout NONE text stat
+         in (text, Proof.refine_primitive Goal.finish stat') end
+      (*the one place where a result is taken; the other tasks are cancelled*)
+      fun take result =
+        ((Single_Assignment.assign shortcut result handle Fail _ => ())
+       ; Future.cancel_group group)
+
       fun dirty_hack s =
         if String.isSubstring "found a falsification" s
         then Future.cancel_group group
         else if hasty
         then if String.isSubstring "found a proof" s
-          then let
-             val ret = Proof.refine (Method.Basic (fn ctxt =>
-                          Method.METHOD (fn _ => Skip_Proof.cheat_tac ctxt 1))) stat
-                    |> Seq.the_result "cheat fails?!"
-          in (Single_Assignment.assign shortcut ("<cheat>", ret) handle Fail _ => ())
-           ; Future.cancel_group group
-         end
-         else ()
+          then take ("<cheat>",
+                     Proof.refine (Method.Basic (fn ctxt =>
+                         Method.METHOD (fn _ => Skip_Proof.cheat_tac ctxt 1))) stat
+                     |> Seq.the_result "cheat fails?!"
+                     |> Proof.refine_primitive Goal.finish)
+          else ()
         else
         let val _ = if String.isSubstring "found a proof" s
                     then Synchronized.change found_proof (K true) else ()
@@ -729,18 +755,14 @@ fun raw_sledgehammer timeout_opt override hasty stat =
                 let val candidates = prf :: (case smt_prf_opt of SOME s => [s] | NONE => [])
                     val new_futures = Future.forks {name="SH-preplay", group = SOME group, deps = [], pri=50, interrupts=true}
                       (map (fn p => fn () =>
-                        case try (Future.interruptible_task (eval_prf_str_stat keywords pptimeout NONE p)) stat
-                          of SOME ret => (
-                               (Single_Assignment.assign shortcut ret handle Fail _ => ())
-                             ; Future.cancel_group group)
+                        case try (Future.interruptible_task (replay pptimeout)) p
+                          of SOME r => take r
                            | NONE => ()) candidates)
                  in Synchronized.change futures (fn L => new_futures @ L)
                 end
               in if preplay_succeeded
-               then case try (eval_prf_str_stat keywords 3 NONE prf) stat
-                   of SOME ret => (
-                          (Single_Assignment.assign shortcut ret handle Fail _ => ())
-                        ; Future.cancel_group group)
+               then case try (replay 3) prf
+                   of SOME r => take r
                     | NONE => eval_future ()
                else eval_future ()
              end
@@ -1101,23 +1123,23 @@ fun async_prove mode scope f (ctxt, sequent) =
 
 end
 
+(*the named facts of ctxt, without "this"; with local_only, only those that are not
+  facts of the context outside the proof*)
+fun named_facts_of local_only ctxt =
+  Facts.dest_static false
+    (if local_only then [Proof_Context.facts_of (Phi_Help.outer_context ctxt)] else [])
+    (Proof_Context.facts_of ctxt)
+  |> filter_out (fn (name, _) => name = \<^unchecked_name>\<open>local.this\<close>)
+
 fun find_local_may_false ctxt =
-  let
-    val local_facts = Proof_Context.facts_of ctxt
-    val outer_facts = try Local_Theory.target_of ctxt
-                   |> Option.map Proof_Context.facts_of
-                   |> the_list
-  in
-    Facts.dest_static false outer_facts local_facts
-    |> filter (fn (\<^unchecked_name>\<open>local.this\<close>, _) => false | _ => true)
-    |> get_first (fn (name0, ths) =>
-         get_first (fn th =>
-           let val th' = Thm.transfer' ctxt th
-           in if may_entail_false (Thm.prop_of th')
-              then SOME (Facts.extern ctxt local_facts name0, th')
-              else NONE
-           end) ths)
-  end
+  named_facts_of true ctxt
+  |> get_first (fn (name0, ths) =>
+       get_first (fn th =>
+         let val th' = Thm.transfer' ctxt th
+         in if may_entail_false (Thm.prop_of th')
+            then SOME (Facts.extern ctxt (Proof_Context.facts_of ctxt) name0, th')
+            else NONE
+         end) ths)
 
 (* Carries the search unit's (time, proof text) pair through, prefixing the
    text where it had to insert a locally-false fact first. *)
@@ -1233,13 +1255,7 @@ fun facts_as_mepo_lazy_facts local_only ctxt =
   let
     val transfer = Thm.transfer' ctxt
     val local_facts = Proof_Context.facts_of ctxt
-    val outer_facts =
-      if local_only
-      then try Local_Theory.target_of ctxt
-           |> Option.map Proof_Context.facts_of |> the_list
-      else []
-    val named_locals = Facts.dest_static false outer_facts local_facts
-                    |> filter (fn (\<^unchecked_name>\<open>local.this\<close>, _) => false | _ => true)
+    val named_locals = named_facts_of local_only ctxt
   in
     maps (fn (name0, ths) =>
       let val n = length ths
@@ -1322,7 +1338,7 @@ in
    sequent, the rendered Isar replay string, and the fastforce-only times as
    Phi_Proof_Store.timing measures them (NOT including MePo selection time, since
    the cache replay only re-runs fastforce, not MePo). On failure raises Auto_Fail.
-   lazy_facts: pool for MePo selection (empty = skip MePo).
+   lazy_facts: pool for MePo selection; may be empty, and MePo still runs (fact triggers may add facts).
    extra_pairs: user-provided (name, thm) pairs always included.
    del_pairs: user-provided del facts applied to base context. *)
 fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt i st =
@@ -1336,18 +1352,16 @@ fun run_mepo_and_render timeout max_facts lazy_facts extra_pairs del_pairs ctxt 
       handle TERM _ => c | THM _ => c) del_pairs ctxt
 
     val mepo_pairs =
-      if null lazy_facts then []
-      else
-        let
-          val goal_term = Logic.get_goal (Thm.prop_of st) i
-          val hyp_ts = Logic.strip_assums_hyp goal_term
-          val concl_t = Logic.strip_assums_concl goal_term
-          val selected = Sledgehammer_MePo.mepo_suggested_facts
-                           ctxt mepo_dummy_params max_facts NONE hyp_ts concl_t lazy_facts
-          val selected = if null selected
-                         then map Sledgehammer_Fact.fact_of_lazy_fact lazy_facts
-                         else selected
-        in map (fn ((name, _), th) => (name, th)) selected end
+      let
+        val goal_term = Logic.get_goal (Thm.prop_of st) i
+        val hyp_ts = Logic.strip_assums_hyp goal_term
+        val concl_t = Logic.strip_assums_concl goal_term
+        val selected = Sledgehammer_MePo.mepo_suggested_facts
+                         ctxt mepo_dummy_params max_facts NONE hyp_ts concl_t lazy_facts
+        val selected = if null selected
+                       then map Sledgehammer_Fact.fact_of_lazy_fact lazy_facts
+                       else selected
+      in map (fn ((name, _), th) => (name, th)) selected end
 
     val all_pairs =
       let val extra_thms = map snd extra_pairs
@@ -1508,7 +1522,7 @@ fun sledgehammer timeout_opt improved hasty kws override0 (ctxt,sequent) =
                         let val _ = tracing ("Sledgehammering on the " ^ string_of_int (N+1-j) ^
                                              "th goal (total " ^ Ns ^ ")")
                             fun do_iter () =
-                            case raw_sledgehammer timeout_opt override hasty s
+                            case sledgehammer_leading_subgoal timeout_opt override hasty s
                                             of NONE =>
                                   let val subgoal_raw = hd (Thm.prems_of (#goal (Proof.raw_goal s)))
                                       val params = Logic.strip_params subgoal_raw
@@ -1739,7 +1753,7 @@ fun auto'i {improved, fact_override, timeout} (ctxt, sequent) =
   in
     apsnd snd found   (*async_prove's `f` yields 'a * thm; drop the context*)
   end
-(* val proof = raw_sledgehammer stat *)
+(* val proof = sledgehammer_leading_subgoal stat *)
 
 type options = {improved      : bool,
                 async_mode    : async_mode,
@@ -1809,13 +1823,6 @@ fun after futs g =
                                 deps = map Future.task_of futs, pri = 0,
                                 interrupts = false})
          (fn () => g (joins_norm futs))
-
-(*Proof texts are stored with their own scope.  `[n]` is the real Isar combinator
-  Select_Goals, so the record says for itself which goals it speaks for instead
-  of depending on the reader to arrange the state.  It only attaches to a bare
-  method name or a PARENTHESISED group -- `auto [1]` parses as an argument to
-  auto -- hence the parentheses.*)
-fun scoped prf = "(" ^ prf ^ ")[1]"
 
 (*The lookup shared by auto and all_auto; k = how many leading subgoals the
   cached text must close (1, or all of them).  SOME on a hit that replays,
