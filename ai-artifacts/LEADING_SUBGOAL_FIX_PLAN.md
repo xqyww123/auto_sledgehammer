@@ -570,7 +570,9 @@ major（降为 minor）。
 
 `Test_Ground_Eval` 失败在第 43 行 `lemma "fact (6::nat) = 720" by auto_sledgehammer`（`Fail to prove the
 goal fact 6 = (720::'a)`：`fact` 的结果类型是多态的，目标在类型上不是 ground）。用 `git archive HEAD`
-导出的源码在 private tree 上跑同一测试，同一行同一报错，所以是原有的，与本方案无关；没有修。
+导出的源码在 private tree 上跑同一测试，同一行同一报错，所以是原有的，与本方案无关。作者 2026-11-18
+定：是测试本身的问题，改成 `fact (6::nat) = (720::nat)`；改后两棵树上都通过（`run_ground_private`、
+`run_ground_stock`）。
 
 实施时改正的测试本身的错误：检查 1 期望的子目标取自原状态（`tl (subgoals st3)`），因为原目标里 `xs`、
 `ys` 的类型变量不同，另写的 `\<^prop>` 对不上；检查 4 的事实见 4.2。检查 1 的状态用已导出的

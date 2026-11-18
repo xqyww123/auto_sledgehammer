@@ -40,7 +40,7 @@ text \<open>
 \<close>
 
 lemma "(123::nat) * 456 = 56088" by auto_sledgehammer
-lemma "fact (6::nat) = 720" by auto_sledgehammer
+lemma "fact (6::nat) = (720::nat)" by auto_sledgehammer
 lemma "(2::nat) ^ 10 = 1024" by auto_sledgehammer
 
 text \<open>Non-ground goals still flow through the ordinary backends.\<close>
